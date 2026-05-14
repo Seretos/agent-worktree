@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worktree_plugin"
+version = "0.0.0"
+description = "MCP server for git worktree lifecycle management. Create/list/remove worktrees with branch handling, run per-project setup scripts on creation, and detect uncommitted changes before destructive operations."
+requires-python = ">=3.11"
+authors = [{ name = "Arne von Appen" }]
+dependencies = [
+  "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.10",
+]
+test = [
+  "pytest>=8",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
