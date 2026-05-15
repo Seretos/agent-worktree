@@ -9,23 +9,45 @@ src/worktree_plugin/            # Python source (src-layout)
   server.py                       # FastMCP entry point, wires the tools
   __main__.py                     # python -m / PyInstaller entry
 
-tests/                          # pytest, runs on every push (test.yml)
-scripts/build.ps1               # PyInstaller wrapper + smoke test + optional packaging
-worktree.spec                   # PyInstaller config
+tests/                          # pytest, runs on every push (test.yml matrix: windows-latest + ubuntu-22.04)
+scripts/build.ps1               # cross-platform pwsh: PyInstaller wrapper + smoke test + staging
+worktree.spec                   # PyInstaller config (output extension picked by host OS)
 pyproject.toml                  # setuptools (package-dir = src/) + pytest config
-.claude-plugin/plugin.json      # plugin manifest, points at bin/worktree.exe
+.claude-plugin/plugin.json      # plugin manifest; command is the extensionless bin/worktree
 SECURITY.md                     # threat model — extend per tool surface
 
 .github/workflows/
-  test.yml                      # pytest on every push and PR (fetch-depth: 0 — tests run real git worktree ops)
-  release.yml                   # manual-dispatch full release flow
+  test.yml                      # pytest matrix on every push and PR (fetch-depth: 0 — real git worktree ops)
+  release.yml                   # manual-dispatch multi-OS release (stamp -> matrix-build -> assemble)
   dispatch.yml                  # manual recovery: re-send marketplace dispatch
 ```
+
+## OS_TARGETS = [windows, linux]
+
+Worktree management is built on local `git` operations that work identically on
+both platforms — no Win32 lock-in. The pipeline ships both binaries inside a
+single release zip:
+
+- `plugin.json`'s `command` is `${CLAUDE_PLUGIN_ROOT}/bin/worktree` (no
+  extension). On Windows the host OS resolves that to `worktree.exe`; on
+  Linux to `worktree`. One manifest serves both platforms.
+- `release.yml` is a three-stage pipeline:
+  1. **stamp** (Linux) — writes the version into `pyproject.toml` +
+     `.claude-plugin/plugin.json` and uploads them as an artifact so every
+     downstream job pulls the same stamped sources.
+  2. **build** (matrix `windows-latest` + `ubuntu-22.04`) — each runner
+     calls `scripts/build.ps1 -Clean -Package` and uploads its `bin/`
+     payload as `bin-<os>`.
+  3. **assemble** (Linux) — merges the per-OS bins into a single
+     `build/stage/agent-worktree/bin/` tree, builds the release zip with
+     correct Unix mode bits via Python's `zipfile`, force-pushes the
+     orphan `release` branch, creates the GitHub Release, and dispatches
+     to the marketplace.
 
 ## Branches
 
 - `main` — source of truth. All edits go here.
-- `release` — orphan branch, force-pushed by `release.yml`. Contains only install-ready files: `.claude-plugin/plugin.json`, `bin/worktree.exe`, `README.md`. Clients clone at the version tag (e.g. `agent-worktree--v0.0.1`).
+- `release` — orphan branch, force-pushed by `release.yml`. Contains only install-ready files: `.claude-plugin/plugin.json`, `bin/worktree.exe`, `bin/worktree`, `README.md`. Clients clone at the version tag (e.g. `agent-worktree--v0.0.1`).
 
 The release branch shares no history with main. Don't try to merge between them.
 
@@ -57,10 +79,18 @@ The workflow:
 
 ## Build conventions (`scripts/build.ps1`)
 
-- Compatible with **Windows PowerShell 5.1** (the system default) AND PowerShell 7.
+- Cross-platform: runs under **Windows PowerShell 5.1**, PowerShell 7 on
+  Windows, AND `pwsh` on Linux. PS 5.1 lacks the auto `$IsWindows` variable
+  so the script derives it from `$env:OS`.
+- Output filename: `bin/worktree.exe` on Windows, `bin/worktree` on Linux
+  (no extension). The Linux binary is explicitly `chmod +x`ed after copy.
 - No global `$ErrorActionPreference = 'Stop'` — PyInstaller writes heavily to stderr, which PS 5.1 wraps as ErrorRecord and would trip a global Stop.
-- Python discovery prefers `py.exe -3` locally and `python.exe` in `$env:CI` (so `actions/setup-python` is honored).
-- The smoke test runs an MCP `initialize` handshake against the freshly built `.exe`. The build fails if the handshake fails.
+- Python discovery: prefers `py.exe -3` on Windows locally, falls back to
+  `python` / `python3` (which is what `actions/setup-python` installs).
+- The smoke test runs an MCP `initialize` handshake against the freshly built binary. The build fails if the handshake fails.
+- `-Package` stages `build/stage/agent-worktree/` with this OS's binary
+  only — `release.yml`'s assembly job merges the per-OS stages into the
+  final zip.
 
 ## PyInstaller / src-layout notes
 
