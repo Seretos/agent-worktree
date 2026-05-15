@@ -10,6 +10,8 @@ requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
   "mcp>=1.2",
+  "pydantic>=2.6",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
