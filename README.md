@@ -11,7 +11,7 @@ MCP server for git worktree lifecycle management. Create/list/remove worktrees w
 /plugin install agent-worktree@agent-marketplace
 ```
 
-Self-contained `.exe` — no Python, no `pip install`, no dependencies.
+Self-contained binary (Windows `.exe` or Linux ELF) — no Python, no `pip install`, no dependencies. The release zip ships both binaries; the host OS auto-selects via the extensionless `command: bin/worktree` in `plugin.json`.
 
 ## Alternative installs
 
@@ -36,13 +36,16 @@ Then `/plugin install <cloned-path>` in Claude Code.
 
 ### Build from source
 
-Requires Python 3.11+ (standard python.org installer with the `py` launcher).
+Requires Python 3.11+ and PowerShell 7 (`pwsh`).
 
-```powershell
+```bash
 git clone https://github.com/Seretos/agent-worktree.git
 cd agent-worktree
-py -3 -m pip install -e ".[build]"
-.\scripts\build.ps1 -Clean -Package
+python -m pip install -e ".[build]"
+pwsh -File scripts/build.ps1 -Clean -Package
 ```
 
-Output: `bin/worktree.exe` plus `dist/agent-worktree-<version>.zip`. Then install via `/plugin install <path>`.
+Output: `bin/worktree` (Linux) or `bin/worktree.exe` (Windows), plus a
+`build/stage/agent-worktree/` payload for this OS. The official release zip
+is produced by `release.yml`'s matrix-then-assemble pipeline and merges
+both OS payloads into a single archive.

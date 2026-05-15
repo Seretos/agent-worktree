@@ -1,11 +1,12 @@
 name: tests
 
 # Runs pytest on every push to any branch and on every PR. Distinct from
-# release.yml, which is workflow_dispatch-driven and produces the .exe / zip.
+# release.yml, which is workflow_dispatch-driven and produces the OS-specific
+# binaries / release zip.
 #
-# fetch-depth: 0 is required here (unlike sibling plugins) because the test
-# suite exercises real `git worktree` operations against the checked-out repo
-# and needs full history / refs to do so.
+# OS_TARGETS for agent-worktree: [windows, linux]. The test suite exercises
+# real `git worktree` operations against the checked-out repo, which works
+# identically on both platforms — no Win32 lock-in.
 on:
   push:
     branches: ["**"]
@@ -16,13 +17,20 @@ permissions:
 
 jobs:
   pytest:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # fetch-depth: 0 is required (unlike sibling plugins) because the
+          # test suite exercises real `git worktree` operations and needs
+          # full history / refs.
           fetch-depth: 0
 
       - name: Setup Python 3.12
@@ -32,12 +40,18 @@ jobs:
           cache: "pip"
           cache-dependency-path: pyproject.toml
 
+      - name: Configure git identity (for worktree tests)
+        shell: bash
+        run: |
+          git config --global user.email "test@example.com"
+          git config --global user.name  "Worktree Tester"
+
       - name: Install plugin + test deps
-        shell: pwsh
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
 
       - name: Run pytest
-        shell: pwsh
+        shell: bash
         run: python -m pytest

@@ -5,7 +5,7 @@
   "author": { "name": "Arne von Appen" },
   "mcpServers": {
     "worktree": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/worktree.exe",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/worktree",
       "args": [],
       "env": {
         "WORKTREE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"
