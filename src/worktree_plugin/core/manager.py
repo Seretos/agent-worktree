@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,8 @@ from .state import InMemoryStateStore, StateStore, WorktreeRecord
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _DEFAULT_STORE_ROOT_ENV = "WORKTREE_STORE_ROOT"
 _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
+_GIT_TIMEOUT_ENV = "WORKTREE_GIT_TIMEOUT_SEC"
+_GIT_TIMEOUT_DEFAULT = 30.0
 
 
 class WorktreeError(RuntimeError):
@@ -48,6 +52,24 @@ class GitCommandError(WorktreeError):
         self.command = command
         self.returncode = returncode
         self.stderr = stderr
+
+
+class GitTimeoutError(WorktreeError):
+    """Raised when a ``git`` subprocess exceeds the configured timeout.
+
+    Ticket #19: the Windows PyInstaller binary was hanging because the spawned
+    ``git`` inherited the MCP client's stdin pipe and waited forever for input.
+    ``_run_git`` now closes stdin, runs via ``Popen.communicate(timeout=...)``,
+    and raises this on overrun so the MCP tool can surface a real error rather
+    than blocking the client forever.
+    """
+
+    def __init__(self, command: List[str], elapsed: float) -> None:
+        super().__init__(
+            f"git command timed out after {elapsed:.1f}s: {' '.join(command)}"
+        )
+        self.command = command
+        self.elapsed = elapsed
 
 
 @dataclass
@@ -85,17 +107,85 @@ def _short_uuid() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _resolve_git_timeout(explicit: Optional[float]) -> Optional[float]:
+    """Resolve the timeout for a single ``_run_git`` call.
+
+    Precedence: explicit kwarg > ``WORKTREE_GIT_TIMEOUT_SEC`` env > built-in
+    default of 30.0 s. ``None`` (either as kwarg or env value ``""``) disables
+    the timeout entirely; that path exists for diagnostics, not normal use.
+
+    Env is read on every call so that test fixtures and operators can change
+    the value without re-importing the module.
+    """
+
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(_GIT_TIMEOUT_ENV)
+    if raw is None:
+        return _GIT_TIMEOUT_DEFAULT
+    raw = raw.strip()
+    if not raw:
+        # Empty string is "no timeout", matching the explicit-None semantics.
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return _GIT_TIMEOUT_DEFAULT
+    return value if value > 0 else None
+
+
 def _run_git(
-    args: List[str], cwd: Optional[Path] = None
+    args: List[str],
+    cwd: Optional[Path] = None,
+    *,
+    timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        check=False,
+    """Run ``git <args>`` and return a ``CompletedProcess``.
+
+    Ticket #19 hardenings:
+    * ``stdin=DEVNULL`` so ``git`` can never inherit the MCP client's stdin
+      pipe and wedge waiting on input -- this was the Windows-exe hang root
+      cause.
+    * Explicit ``stdout=PIPE, stderr=PIPE`` (rather than ``capture_output``)
+      because we now drive a ``Popen`` directly to keep a clean kill path.
+    * On Windows: ``creationflags=CREATE_NO_WINDOW`` so packaged-exe runs
+      don't briefly flash a console window per git call.
+    * ``timeout`` defaults from ``WORKTREE_GIT_TIMEOUT_SEC`` (30 s if unset);
+      on overrun the process is killed and ``GitTimeoutError`` is raised.
+    """
+
+    effective_timeout = _resolve_git_timeout(timeout)
+
+    popen_kwargs: dict = {
+        "cwd": str(cwd) if cwd else None,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform == "win32":
+        # Suppress the brief console-window flash when the packaged worktree.exe
+        # spawns git from a GUI MCP host.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+    cmd = ["git", *args]
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=effective_timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        # Drain the pipes after kill so the child fully reaps; ignore output.
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        elapsed = time.monotonic() - start
+        raise GitTimeoutError(cmd, elapsed) from None
+
+    return subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr
     )
-    return proc
 
 
 class WorktreeManager:
@@ -229,6 +319,7 @@ __all__ = (
     "BranchNotFoundError",
     "DuplicateWorktreeError",
     "GitCommandError",
+    "GitTimeoutError",
     "ManagerConfig",
     "WorktreeError",
     "WorktreeManager",

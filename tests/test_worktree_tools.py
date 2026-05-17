@@ -13,12 +13,15 @@ from typing import Iterator
 
 import pytest
 
+from worktree_plugin.core import manager as manager_module
 from worktree_plugin.core.manager import (
     BranchNotFoundError,
     DuplicateWorktreeError,
+    GitTimeoutError,
     ManagerConfig,
     WorktreeManager,
     WorktreeNotFoundError,
+    _run_git,
 )
 from worktree_plugin.core.state import InMemoryStateStore
 
@@ -124,3 +127,100 @@ def test_worktree_paths_under_store_root(
     # store_root / repo_slug / id
     assert Path(rec.path).parent.parent == (tmp_path / "store").resolve()
     assert Path(rec.path).parent.name == "src-repo"
+
+
+# ---- Ticket #19: _run_git timeout + stdin handling ----
+
+
+def test_run_git_smoke_version_completes_quickly():
+    """Sanity check: ``git --version`` finishes well under 1 s with the new
+    Popen-based plumbing. Catches pipe/handle plumbing regressions on every
+    platform (Linux, Windows, packaged exe).
+    """
+
+    import time as _time
+
+    start = _time.monotonic()
+    proc = _run_git(["--version"])
+    elapsed = _time.monotonic() - start
+    assert proc.returncode == 0
+    assert proc.stdout.startswith("git version")
+    assert elapsed < 1.0, f"_run_git(['--version']) took {elapsed:.2f}s"
+
+
+def test_run_git_raises_timeout_when_subprocess_hangs(monkeypatch):
+    """Simulate a hanging git via a fake Popen, confirm GitTimeoutError fires
+    and the process gets killed (rather than the call blocking forever).
+    """
+
+    killed = {"value": False}
+
+    class _HangingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            # Always pretend the child is still running.
+            raise subprocess.TimeoutExpired(cmd=["git", "hang"], timeout=timeout)
+
+        def kill(self):
+            killed["value"] = True
+            self.returncode = -9
+
+    monkeypatch.setattr(manager_module.subprocess, "Popen", _HangingPopen)
+
+    with pytest.raises(GitTimeoutError) as excinfo:
+        _run_git(["status"], timeout=0.05)
+
+    assert killed["value"] is True
+    assert excinfo.value.command == ["git", "status"]
+    assert excinfo.value.elapsed >= 0.0
+
+
+def test_run_git_timeout_respects_env_override(monkeypatch):
+    """``WORKTREE_GIT_TIMEOUT_SEC`` overrides the built-in 30 s default
+    when no explicit timeout kwarg is passed.
+    """
+
+    captured = {"timeout": None}
+
+    class _CapturingPopen:
+        def __init__(self, *args, **kwargs):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            captured["timeout"] = timeout
+            return ("", "")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setenv("WORKTREE_GIT_TIMEOUT_SEC", "7.5")
+    monkeypatch.setattr(manager_module.subprocess, "Popen", _CapturingPopen)
+
+    _run_git(["--version"])
+    assert captured["timeout"] == 7.5
+
+
+def test_run_git_closes_stdin(monkeypatch):
+    """Regression guard: ``stdin=DEVNULL`` must always be passed so the spawned
+    git can never inherit the MCP client's stdin pipe (the Windows hang root
+    cause).
+    """
+
+    captured_kwargs: dict = {}
+
+    class _RecordingPopen:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
+    _run_git(["--version"])
+    assert captured_kwargs.get("stdin") is subprocess.DEVNULL
