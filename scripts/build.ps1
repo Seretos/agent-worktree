@@ -98,6 +98,27 @@ if ($IsWindows) {
     $venvPy = Join-Path $venvDir "bin/python"
 }
 
+# Detect cross-platform .venv contamination: a venv created under WSL/Linux
+# and then "touched" by a Windows build (or vice versa) leaves pyvenv.cfg
+# pointing at a foreign-OS interpreter while both Scripts/ and bin/ end up
+# coexisting. ensurepip then fails with a nonsense mixed path like
+# `/usr/bin\python.exe`. Purge the dir and rebuild fresh.
+$venvCfg = Join-Path $venvDir "pyvenv.cfg"
+if ((Test-Path $venvPy) -and (Test-Path $venvCfg)) {
+    $cfgExec = (Select-String -Path $venvCfg -Pattern '^executable\s*=\s*(.+)$' `
+                              -ErrorAction SilentlyContinue).Matches[0].Groups[1].Value
+    if ($cfgExec) {
+        $cfgExec = $cfgExec.Trim()
+        $cfgIsWindowsPath = $cfgExec -match '^[A-Za-z]:[\\/]' -or $cfgExec -like '*\*'
+        $cfgIsPosixPath   = $cfgExec.StartsWith('/')
+        if ( ($IsWindows -and $cfgIsPosixPath) -or
+             (-not $IsWindows -and $cfgIsWindowsPath) ) {
+            Write-Step "Existing .venv is from a foreign OS ($cfgExec) -- purging"
+            Remove-Item -Recurse -Force $venvDir -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 if (-not (Test-Path $venvPy)) {
     Write-Step "Creating virtualenv at .venv/"
     Invoke-Py -m venv $venvDir
@@ -121,7 +142,7 @@ Write-Host "    Using $venvPy"
 
 # Verify pip is present. On Ubuntu 24.04 without `python3.12-venv`
 # installed, `python3 -m venv` succeeds but ensurepip can't find its
-# bundled wheels — the resulting venv has no pip. Bootstrap it; if
+# bundled wheels -- the resulting venv has no pip. Bootstrap it; if
 # that also fails, surface the exact apt package to install.
 Invoke-Py -m pip --version > $null 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -230,7 +251,7 @@ if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"') {
 
 # 7. Optional: stage build/stage/agent-worktree/ for the assembly step in
 # release.yml. NOTE: -Package on its own emits a *partial* stage tree
-# containing only the binary for this OS — release.yml's assembly job merges
+# containing only the binary for this OS -- release.yml's assembly job merges
 # the per-OS stages and writes the final zip.
 if ($Package) {
     Write-Step "Staging install-ready files"
