@@ -93,6 +93,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stamped-source
+          # v4 excludes dotfiles/dotdirs by default; the build job needs
+          # .claude-plugin/ (and .github/, .gitattributes etc.) in the
+          # downloaded tree to run scripts/build.ps1 -Package.
+          include-hidden-files: true
           path: |
             .
             !.git
