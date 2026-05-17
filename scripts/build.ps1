@@ -84,6 +84,61 @@ function Invoke-Py {
     & $script:PyCmd @script:PyArgs @args
 }
 
+# 1b. Isolate plugin + build deps in a project-local virtualenv.
+# Modern Linux distros (Ubuntu 23.04+, Debian 12+, Fedora 38+) mark the
+# system Python as PEP 668 externally-managed, which blocks `pip install`
+# against it; a venv sidesteps that without the --break-system-packages
+# override. On Windows the marker doesn't exist, but a venv keeps the
+# build hermetic anyway. CI's actions/setup-python interpreter has no
+# PEP 668 marker either, so the extra venv-create step there is cheap.
+$venvDir = Join-Path $root ".venv"
+if ($IsWindows) {
+    $venvPy = Join-Path $venvDir "Scripts/python.exe"
+} else {
+    $venvPy = Join-Path $venvDir "bin/python"
+}
+
+if (-not (Test-Path $venvPy)) {
+    Write-Step "Creating virtualenv at .venv/"
+    Invoke-Py -m venv $venvDir
+    if ($LASTEXITCODE -ne 0) {
+        if (-not $IsWindows) {
+            Write-Host "    On Debian/Ubuntu, ensure python3-venv is installed:" -ForegroundColor Yellow
+            Write-Host "      sudo apt install python3-venv" -ForegroundColor Yellow
+        }
+        Fail "Failed to create virtualenv at $venvDir."
+    }
+    if (-not (Test-Path $venvPy)) {
+        Fail "venv was created but $venvPy is missing."
+    }
+}
+
+# Rebind Python launcher to the venv. All subsequent Invoke-Py calls
+# (pip install, PyInstaller) now run inside the venv.
+$script:PyCmd = $venvPy
+$script:PyArgs = @()
+Write-Host "    Using $venvPy"
+
+# Verify pip is present. On Ubuntu 24.04 without `python3.12-venv`
+# installed, `python3 -m venv` succeeds but ensurepip can't find its
+# bundled wheels — the resulting venv has no pip. Bootstrap it; if
+# that also fails, surface the exact apt package to install.
+Invoke-Py -m pip --version > $null 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Step "Bootstrapping pip in venv (ensurepip)"
+    Invoke-Py -m ensurepip --upgrade --default-pip
+    if ($LASTEXITCODE -ne 0) {
+        if (-not $IsWindows) {
+            Write-Host "    The venv has no pip and ensurepip cannot bootstrap it." -ForegroundColor Yellow
+            Write-Host "    On Debian/Ubuntu, install the per-version venv package, e.g.:" -ForegroundColor Yellow
+            Write-Host "      sudo apt install python3.12-venv python3-pip" -ForegroundColor Yellow
+            Write-Host "    Then remove the broken .venv/ and re-run:" -ForegroundColor Yellow
+            Write-Host "      rm -rf .venv && pwsh scripts/build.ps1" -ForegroundColor Yellow
+        }
+        Fail "venv has no pip and ensurepip failed."
+    }
+}
+
 # 2. Ensure plugin + build deps are installed.
 Write-Step "Ensuring dependencies (plugin + pyinstaller)"
 Invoke-Py -m pip install --quiet --disable-pip-version-check -e ".[build]"
