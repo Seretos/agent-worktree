@@ -27,6 +27,16 @@ _DEFAULT_STORE_DIR_NAME = "agent-worktree-store"
 _GIT_TIMEOUT_ENV = "WORKTREE_GIT_TIMEOUT_SEC"
 _GIT_TIMEOUT_DEFAULT = 30.0
 
+# Stable since git 2.5 (builtin/worktree.c). Captures branch + path from
+# the two variants git emits when refusing `worktree add` on a conflict:
+#   fatal: 'feature/x' is already checked out at '/path/to/wt'
+#   fatal: 'feature/x' is already used by worktree at '/path/to/wt'
+# The "used by worktree at" wording is what modern git (2.40+) emits in
+# practice; the older "checked out at" still appears in some code paths.
+_ALREADY_CHECKED_OUT_RE = re.compile(
+    r"fatal: '([^']+)' is already (?:checked out|used by worktree) at '([^']+)'"
+)
+
 
 class WorktreeError(RuntimeError):
     """Base class for ``WorktreeManager`` errors surfaced to MCP clients."""
@@ -34,6 +44,30 @@ class WorktreeError(RuntimeError):
 
 class BranchNotFoundError(WorktreeError):
     pass
+
+
+class BranchAlreadyCheckedOutError(WorktreeError):
+    """Raised when ``git worktree add`` refuses because the branch is checked
+    out in another worktree.
+
+    Ticket #18: the raw ``GitCommandError`` is opaque ("fatal: 'X' is already
+    checked out at '...'") and the MCP client cannot programmatically react.
+    This carries the parsed branch + path plus a ``prunable`` flag derived
+    from ``git worktree list --porcelain``, so callers can offer a "prune
+    and retry" affordance.
+    """
+
+    def __init__(
+        self, branch: str, path: str, prunable: Optional[bool]
+    ) -> None:
+        super().__init__(
+            f"branch_already_checked_out: '{branch}' is checked out at "
+            f"'{path}' (prunable={prunable}). "
+            f"Hint: 'git worktree prune' or 'git worktree remove {path}'."
+        )
+        self.branch = branch
+        self.path = path
+        self.prunable = prunable
 
 
 class DuplicateWorktreeError(WorktreeError):
@@ -188,6 +222,71 @@ def _run_git(
     )
 
 
+def _parse_already_checked_out(stderr: str) -> Optional[tuple[str, str]]:
+    """Return ``(branch, path)`` if stderr matches the git "already checked
+    out" error, else ``None``.
+
+    Ticket #18: stderr-parse is the primary path. We deliberately avoid a
+    pre-check (`git worktree list` before `git worktree add`) because that
+    would race with other processes; let git fail and read its verdict.
+    """
+
+    match = _ALREADY_CHECKED_OUT_RE.search(stderr or "")
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _is_path_prunable(repo_path: Path, target_path: str) -> Optional[bool]:
+    """Probe ``git worktree list --porcelain`` for whether ``target_path``
+    carries the ``prunable`` marker.
+
+    Returns ``True`` / ``False`` if the path is found, ``None`` if it isn't
+    listed at all (which itself usually means the worktree dir was wiped and
+    a ``git worktree prune`` will clear the stale ref). The probe itself is
+    best-effort: any failure returns ``None`` rather than masking the original
+    "already checked out" error.
+    """
+
+    try:
+        proc = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    except WorktreeError:
+        return None
+    if proc.returncode != 0:
+        return None
+
+    # Porcelain format: blocks separated by blank lines, each block starting
+    # with `worktree <path>`. A `prunable <reason>` line within the block
+    # marks it as removable.
+    target_norm = str(Path(target_path)).replace("\\", "/").lower()
+    current_path: Optional[str] = None
+    current_prunable = False
+    found: Optional[bool] = None
+
+    def _flush() -> None:
+        nonlocal found
+        if current_path is None:
+            return
+        if current_path.replace("\\", "/").lower() == target_norm:
+            found = current_prunable
+
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            _flush()
+            current_path = None
+            current_prunable = False
+            continue
+        if line.startswith("worktree "):
+            _flush()
+            current_path = line[len("worktree "):].strip()
+            current_prunable = False
+        elif line.startswith("prunable"):
+            current_prunable = True
+    _flush()
+    return found
+
+
 class WorktreeManager:
     """High-level facade used by the FastMCP tools.
 
@@ -250,6 +349,19 @@ class WorktreeManager:
 
         proc = _run_git(git_args, cwd=repo_path)
         if proc.returncode != 0:
+            # Ticket #18: surface the specific "branch already checked out
+            # elsewhere" condition as a structured error so callers can offer
+            # prune/remove affordances. Falls through to GitCommandError for
+            # any other failure.
+            parsed = _parse_already_checked_out(proc.stderr)
+            if parsed is not None:
+                conflict_branch, conflict_path = parsed
+                prunable = _is_path_prunable(repo_path, conflict_path)
+                raise BranchAlreadyCheckedOutError(
+                    branch=conflict_branch,
+                    path=conflict_path,
+                    prunable=prunable,
+                )
             raise GitCommandError(["git", *git_args], proc.returncode, proc.stderr)
 
         record = WorktreeRecord(
@@ -316,6 +428,7 @@ class WorktreeManager:
 
 
 __all__ = (
+    "BranchAlreadyCheckedOutError",
     "BranchNotFoundError",
     "DuplicateWorktreeError",
     "GitCommandError",

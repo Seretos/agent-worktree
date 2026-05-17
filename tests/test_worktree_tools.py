@@ -15,6 +15,7 @@ import pytest
 
 from worktree_plugin.core import manager as manager_module
 from worktree_plugin.core.manager import (
+    BranchAlreadyCheckedOutError,
     BranchNotFoundError,
     DuplicateWorktreeError,
     GitTimeoutError,
@@ -224,3 +225,70 @@ def test_run_git_closes_stdin(monkeypatch):
     monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
     _run_git(["--version"])
     assert captured_kwargs.get("stdin") is subprocess.DEVNULL
+
+
+# ---- Ticket #18: structured error for "branch already checked out elsewhere" ----
+
+
+def test_create_branch_already_checked_out_elsewhere(
+    manager: WorktreeManager, temp_repo: Path, tmp_path: Path
+):
+    """Creating a worktree for a branch that is already checked out in
+    another worktree (tracked by a different state store, so the in-memory
+    duplicate-check shortcut at manager.py:133 doesn't fire) must surface as
+    a structured ``BranchAlreadyCheckedOutError`` with branch + path attrs.
+    """
+
+    # First state store creates worktree A for feature/alpha.
+    first = manager.create(str(temp_repo), "feature/alpha")
+    assert Path(first.path).exists()
+
+    # Fresh manager + fresh state store simulates a second client session
+    # that doesn't know about worktree A yet -- now the duplicate-check at
+    # manager.py:133 falls through and we reach the actual `git worktree add`.
+    other = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store2"),
+        state=InMemoryStateStore(),
+    )
+
+    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
+        other.create(str(temp_repo), "feature/alpha")
+
+    err = excinfo.value
+    assert err.branch == "feature/alpha"
+    assert Path(err.path).resolve() == Path(first.path).resolve()
+    # Existing dir -> not prunable.
+    assert err.prunable is False
+    # Message contract matches the format used by tools/worktree.py callers.
+    msg = str(err)
+    assert "branch_already_checked_out" in msg
+    assert "'feature/alpha'" in msg
+    assert "git worktree prune" in msg
+
+
+def test_already_checked_out_reports_prunable_after_dir_removed(
+    manager: WorktreeManager, temp_repo: Path, tmp_path: Path
+):
+    """If the worktree directory is gone but git still has the registration,
+    the structured error must report ``prunable is True`` so the caller can
+    suggest ``git worktree prune``.
+    """
+
+    import shutil
+
+    first = manager.create(str(temp_repo), "feature/alpha")
+    # Wipe the worktree dir behind git's back so its registration goes stale.
+    shutil.rmtree(first.path)
+
+    other = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store2"),
+        state=InMemoryStateStore(),
+    )
+
+    with pytest.raises(BranchAlreadyCheckedOutError) as excinfo:
+        other.create(str(temp_repo), "feature/alpha")
+
+    err = excinfo.value
+    assert err.branch == "feature/alpha"
+    assert err.prunable is True
+    assert "prunable=True" in str(err)
