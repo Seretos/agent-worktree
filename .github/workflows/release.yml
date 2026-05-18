@@ -305,7 +305,11 @@ jobs:
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
         run: |
-          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
+          # The orphan-checkout step above wiped `stamped/` via
+          # `git clean -fdx`, then restored the release-branch
+          # contents into the worktree -- so plugin.json lives at
+          # `.claude-plugin/plugin.json` from here on.
+          DESC=$(jq -r '.description' .claude-plugin/plugin.json)
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
