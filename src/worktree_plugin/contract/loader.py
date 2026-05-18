@@ -1,8 +1,11 @@
-"""File-IO + error formatting for `.worktree-setup.yml`.
+"""File-IO + error formatting for the worktree contract.
 
-D2 (Option B): a missing file is treated as an implicit ``isolation: none``
-contract with no setup/teardown/ports. Callers who want hard errors can
-check ``Path.exists()`` themselves before calling.
+The contract lives at ``<repo-root>/.seretos/worktree-setup.yml`` —
+aligning with the ``.seretos/`` convention used across the Seretos
+plugin family. A missing file is treated as an implicit
+``isolation: none`` contract with no setup/teardown/ports. Callers
+who want hard errors can check ``Path.exists()`` themselves before
+calling.
 """
 
 from __future__ import annotations
@@ -16,7 +19,10 @@ from pydantic import ValidationError
 from worktree_plugin.contract.schema import WorktreeContract
 
 
-CONTRACT_FILENAME = ".worktree-setup.yml"
+# Relative path (NOT just a filename) below the worktree root. Callers
+# compose this with ``Path(worktree_root) / CONTRACT_FILENAME`` — the
+# ``/`` operator on Path handles the embedded directory segment.
+CONTRACT_FILENAME = ".seretos/worktree-setup.yml"
 
 
 class ContractError(Exception):
@@ -51,9 +57,10 @@ def _implicit_none_contract() -> WorktreeContract:
 
 
 def load(path: Union[str, Path]) -> WorktreeContract:
-    """Load and validate a `.worktree-setup.yml` from ``path``.
+    """Load and validate a worktree contract from ``path`` (typically
+    ``<repo-root>/.seretos/worktree-setup.yml``).
 
-    Missing files become an implicit ``isolation: none`` contract (D2).
+    Missing files become an implicit ``isolation: none`` contract.
     Parse errors become ``ContractError``; schema errors become
     ``ContractValidationError`` with a structured path-prefixed message.
     """

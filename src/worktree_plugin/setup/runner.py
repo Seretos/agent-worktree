@@ -1,6 +1,7 @@
 """Setup-script runner (W5).
 
-Executes the ``setup:`` steps from a `.worktree-setup.yml` contract right after
+Executes the ``setup:`` steps from the worktree contract
+(``<repo-root>/.seretos/worktree-setup.yml``) right after
 ``worktree_create`` succeeds. Sequential, abort-on-error, with injected
 ``WORKTREE_*`` env vars and structured per-step logs.
 

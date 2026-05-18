@@ -1,4 +1,5 @@
-"""Pydantic v2 schema for `.worktree-setup.yml`.
+"""Pydantic v2 schema for the worktree contract (lives at
+``<repo-root>/.seretos/worktree-setup.yml``).
 
 D1 (Option B): PyYAML for parsing + pydantic v2 for validation.
 """
@@ -53,7 +54,7 @@ class PortSlot(_StrictModel):
 
 
 class WorktreeContract(_StrictModel):
-    """Top-level `.worktree-setup.yml` shape.
+    """Top-level shape of `.seretos/worktree-setup.yml`.
 
     - `version`: load-bearing for future migrations; currently must be 1.
     - `isolation`: full/partial/none; `none` forbids setup/teardown/ports.

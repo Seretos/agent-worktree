@@ -1,14 +1,17 @@
-"""Contract module: parser + schema for `.worktree-setup.yml`.
+"""Contract module: parser + schema for the worktree contract at
+``<repo-root>/.seretos/worktree-setup.yml``.
 
 Public surface:
 - ``WorktreeContract`` — the validated top-level model.
 - ``load`` / ``load_text`` — file/string loaders.
+- ``CONTRACT_FILENAME`` — relative path below the repo root.
 - ``ContractError`` / ``ContractValidationError`` — typed errors.
 """
 
 from __future__ import annotations
 
 from worktree_plugin.contract.loader import (
+    CONTRACT_FILENAME,
     ContractError,
     ContractValidationError,
     load,
@@ -22,6 +25,7 @@ from worktree_plugin.contract.schema import (
 )
 
 __all__ = (
+    "CONTRACT_FILENAME",
     "ContractError",
     "ContractValidationError",
     "Isolation",

@@ -1,4 +1,7 @@
-"""Unit tests for `.worktree-setup.yml` parsing + validation (W3)."""
+"""Unit tests for worktree-contract parsing + validation (W3).
+
+Contract lives at ``<repo-root>/.seretos/worktree-setup.yml``.
+"""
 
 from __future__ import annotations
 
@@ -118,10 +121,19 @@ def test_load_missing_file_returns_implicit_none(tmp_path: Path):
 
 
 def test_load_existing_file(tmp_path: Path):
-    p = tmp_path / ".worktree-setup.yml"
+    # Exercise the canonical layout: contract at <repo>/.seretos/worktree-setup.yml.
+    p = tmp_path / ".seretos" / "worktree-setup.yml"
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("version: 1\nisolation: full\n", encoding="utf-8")
     c = load(p)
     assert c.isolation == "full"
+
+
+def test_contract_filename_is_seretos_relative():
+    """CONTRACT_FILENAME must point under `.seretos/` so callers
+    composing `<repo>/CONTRACT_FILENAME` land in the right place."""
+    from worktree_plugin.contract import CONTRACT_FILENAME
+    assert CONTRACT_FILENAME == ".seretos/worktree-setup.yml"
 
 
 def test_invalid_yaml_raises_contract_error():
