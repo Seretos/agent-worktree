@@ -66,19 +66,22 @@ jobs:
             exit 1
           fi
 
-      - name: Stamp version into pyproject.toml + plugin.json
+      - name: Stamp version into pyproject.toml + plugin manifests
         shell: bash
         run: |
           V="${{ inputs.version }}"
           # pyproject.toml
           sed -i -E "0,/^version[[:space:]]*=[[:space:]]*\"[^\"]*\"/s//version = \"$V\"/" pyproject.toml
-          # .claude-plugin/plugin.json
-          tmp=$(mktemp)
-          jq --arg v "$V" '.version = $v' .claude-plugin/plugin.json > "$tmp"
-          mv "$tmp" .claude-plugin/plugin.json
+          # Both plugin manifests get the same version.
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            tmp=$(mktemp)
+            jq --arg v "$V" '.version = $v' "$manifest" > "$tmp"
+            mv "$tmp" "$manifest"
+          done
           echo "Stamped version $V"
           grep '^version' pyproject.toml
           grep '"version"' .claude-plugin/plugin.json
+          grep '"version"' .codex-plugin/plugin.json
 
       - name: Export plugin metadata
         id: meta
@@ -178,8 +181,10 @@ jobs:
 
           # Copy the install-ready, non-binary parts from the stamped tree.
           cp -a stamped/.claude-plugin "$STAGE/"
-          [ -f stamped/README.md ] && cp -a stamped/README.md "$STAGE/" || true
-          [ -f stamped/LICENSE   ] && cp -a stamped/LICENSE   "$STAGE/" || true
+          [ -d stamped/.codex-plugin ] && cp -a stamped/.codex-plugin "$STAGE/" || true
+          [ -f stamped/.mcp.json     ] && cp -a stamped/.mcp.json     "$STAGE/" || true
+          [ -f stamped/README.md     ] && cp -a stamped/README.md     "$STAGE/" || true
+          [ -f stamped/LICENSE       ] && cp -a stamped/LICENSE       "$STAGE/" || true
           if [ -d stamped/skills ]; then
             cp -a stamped/skills "$STAGE/"
           fi
