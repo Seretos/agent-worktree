@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from worktree_plugin.contract import (
+from lib_python_worktree import (
     ContractError,
     ContractValidationError,
     WorktreeContract,
@@ -132,7 +132,7 @@ def test_load_existing_file(tmp_path: Path):
 def test_contract_filename_is_seretos_relative():
     """CONTRACT_FILENAME must point under `.seretos/` so callers
     composing `<repo>/CONTRACT_FILENAME` land in the right place."""
-    from worktree_plugin.contract import CONTRACT_FILENAME
+    from lib_python_worktree import CONTRACT_FILENAME
     assert CONTRACT_FILENAME == ".seretos/worktree-setup.yml"
 
 

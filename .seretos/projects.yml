@@ -1,0 +1,30 @@
+version: 1
+
+projects:
+  - id: agent-worktree
+    description: ""
+    provider: github
+    path: Seretos/agent-worktree
+    token_env: GITHUB_TOKEN
+    permissions:
+      issues:
+        create: true
+        modify: true
+      pulls:
+        create: true
+        modify: true
+        merge: false
+
+  - id: lib-python-worktree
+    description: ""
+    provider: github
+    path: Seretos/lib-python-worktree
+    token_env: GITHUB_TOKEN
+    permissions:
+      issues:
+        create: true
+        modify: true
+      pulls:
+        create: false
+        modify: false
+        merge: false

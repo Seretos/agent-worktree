@@ -11,8 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from worktree_plugin.core.manager import WorktreeError, WorktreeManager
-from worktree_plugin.core.state import WorktreeRecord
+from lib_python_worktree import WorktreeError, WorktreeManager, WorktreeRecord
 
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:

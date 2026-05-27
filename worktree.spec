@@ -31,6 +31,9 @@ extra_hidden = [
     "starlette",
 ]
 extra_hidden += collect_submodules("worktree_plugin")
+extra_hidden += collect_submodules("lib_python_worktree")
+extra_hidden += collect_submodules("lib_python_config")
+extra_hidden += ["ruamel.yaml", "ruamel.yaml.comments", "ruamel.yaml.reader"]
 
 a = Analysis(
     ["src/worktree_plugin/__main__.py"],

@@ -13,18 +13,18 @@ from typing import Iterator
 
 import pytest
 
-from worktree_plugin.core import manager as manager_module
-from worktree_plugin.core.manager import (
+import lib_python_worktree.core.manager as manager_module
+from lib_python_worktree import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
     DuplicateWorktreeError,
     GitTimeoutError,
+    InMemoryStateStore,
     ManagerConfig,
     WorktreeManager,
     WorktreeNotFoundError,
-    _run_git,
 )
-from worktree_plugin.core.state import InMemoryStateStore
+from lib_python_worktree.core.manager import _run_git
 
 
 def _git(*args: str, cwd: Path) -> None:
