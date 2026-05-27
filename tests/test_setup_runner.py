@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import pytest
 
-from worktree_plugin.setup.runner import (
+from lib_python_worktree.setup.runner import (
     DEFAULT_LOG_ROOT,
     LOG_ROOT_ENV,
     SetupFailedError,

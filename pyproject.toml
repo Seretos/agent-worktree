@@ -12,6 +12,8 @@ dependencies = [
   "mcp>=1.2",
   "pydantic>=2.6",
   "PyYAML>=6.0",
+  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.0.2",
+  "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.1",
 ]
 
 [project.optional-dependencies]
