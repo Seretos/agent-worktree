@@ -1,0 +1,19 @@
+{
+  "name": "agent-worktree",
+  "version": "0.1.0",
+  "description": "MCP server for git worktree lifecycle management on Codex. Create/list/remove worktrees with branch handling, run per-project setup scripts on creation, and detect uncommitted changes before destructive operations.",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "repository": "https://github.com/Seretos/agent-worktree",
+  "mcpServers": {
+    "worktree": {
+      "command": "${PLUGIN_ROOT}/bin/worktree",
+      "args": []
+    }
+  },
+  "interface": {
+    "displayName": "Agent Worktree",
+    "shortDescription": "Git worktree lifecycle management as a Codex MCP server."
+  }
+}
