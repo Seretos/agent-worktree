@@ -318,3 +318,209 @@ def test_already_checked_out_reports_prunable_after_dir_removed(
     assert err.branch == "feature/alpha"
     assert err.prunable is True
     assert "prunable=True" in str(err)
+
+
+# ---- Ticket #25: tool-surface clarity ----
+
+
+def _make_tool_fixtures(tmp_path: Path):
+    """Return (mgr, fn_map) for tool-layer tests."""
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    store_root = tmp_path / "store"
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fns = {name: t.fn for name, t in mcp._tool_manager._tools.items()}
+    return mgr, fns
+
+
+def test_create_reroot_emits_warning(tmp_path: Path):
+    """worktree_create must emit a 'warning' key when repo_root is re-rooted
+    (e.g. a subdirectory of the repo is passed instead of the repo root)."""
+    # Create a real repo so git rev-parse works.
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    # feature/wt is not the currently-checked-out branch, so git allows
+    # creating a worktree for it.
+    _git("branch", "feature/wt", cwd=repo)
+
+    # Create a subdirectory inside the repo.
+    subdir = repo / "subdir"
+    subdir.mkdir()
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(subdir), branch="feature/wt")
+
+    assert "warning" in result, f"Expected 'warning' key, got: {result}"
+    assert str(subdir) in result["warning"] or "subdir" in result["warning"], (
+        f"Expected original subdir path in warning, got: {result['warning']}"
+    )
+    assert str(repo.resolve()) in result["warning"] or result["warning"].endswith(
+        str(repo.resolve())
+    ), f"Expected resolved repo root in warning, got: {result['warning']}"
+
+
+def test_create_no_reroot_warning_when_paths_match(tmp_path: Path):
+    """worktree_create must NOT emit a 'warning' key when the passed repo_root
+    is already the actual git repository root."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    # feature/wt is not the currently-checked-out branch, so git allows
+    # creating a worktree for it.
+    _git("branch", "feature/wt", cwd=repo)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+
+    assert "warning" not in result, (
+        f"Unexpected 'warning' key in result: {result.get('warning')}"
+    )
+
+
+def test_tool_worktree_get_returns_record(tmp_path: Path, temp_repo: Path):
+    """worktree_get must return the correct record for a known id."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    # Create via the manager directly so we have a known record.
+    rec = mgr.create(str(temp_repo), "feature/alpha")
+
+    result = fns["worktree_get"](worktree_id=rec.id)
+
+    assert result["id"] == rec.id
+    assert result["branch"] == rec.branch
+    assert result["path"] == rec.path
+    assert result["repo_root"] == rec.repo_root
+    assert "error" not in result
+
+
+def test_tool_worktree_get_unknown_id_returns_soft_error(tmp_path: Path):
+    """worktree_get with an unknown id must return a soft-error dict
+    ({"error": "..."}) rather than raising, mirroring worktree_remove."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    unknown_id = "definitely-unknown-id-99999"
+    result = fns["worktree_get"](worktree_id=unknown_id)
+
+    assert isinstance(result, dict), f"Expected dict, got: {type(result)}"
+    assert "error" in result, f"Expected 'error' key, got: {result}"
+    assert unknown_id in result["error"], (
+        f"Expected unknown_id in error message, got: {result['error']}"
+    )
+
+
+def test_tool_worktree_get_empty_store(tmp_path: Path):
+    """worktree_get on a fresh (empty) manager must return a soft-error dict."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_get"](worktree_id="any-id-12345678")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+
+
+def test_tool_worktree_list_filters_by_repo_root(tmp_path: Path):
+    """worktree_list(repo_root=...) must return only records for that repo;
+    omitting repo_root returns all worktrees across all repos."""
+    # Build two separate repos, each with a non-checked-out branch so git
+    # allows adding a worktree for it.
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo1)
+    _git("config", "user.email", "test@example.com", cwd=repo1)
+    _git("config", "user.name", "Test", cwd=repo1)
+    (repo1 / "README.md").write_text("r1\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo1)
+    _git("commit", "-q", "-m", "init", cwd=repo1)
+    _git("branch", "feature/wt1", cwd=repo1)
+
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo2)
+    _git("config", "user.email", "test@example.com", cwd=repo2)
+    _git("config", "user.name", "Test", cwd=repo2)
+    (repo2 / "README.md").write_text("r2\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo2)
+    _git("commit", "-q", "-m", "init", cwd=repo2)
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+
+    # Filtered to repo1 only.
+    filtered = fns["worktree_list"](repo_root=str(repo1))
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == rec1.id
+
+    # Unfiltered returns both.
+    all_records = fns["worktree_list"]()
+    assert len(all_records) == 2
+    ids = {r["id"] for r in all_records}
+    assert rec1.id in ids
+    assert rec2.id in ids
+
+
+def test_tool_worktree_list_filter_resolves_subdir(tmp_path: Path):
+    """worktree_list filter uses Path.resolve() for comparison. A symlink
+    pointing directly at the repo root resolves to the same path as
+    record.repo_root and therefore matches. A plain subdirectory does NOT
+    match — the filter is an exact-path comparison after resolve(), not a
+    git-root traversal.
+
+    This test verifies the symlink case on platforms where symlinks are
+    available, and falls back to verifying the non-match case for plain
+    subdirectories.
+    """
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    # feature/wt is not the currently-checked-out branch.
+    _git("branch", "feature/wt", cwd=repo)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(repo), "feature/wt")
+
+    # A plain subdirectory does NOT match (filter is exact path after resolve).
+    subdir = repo / "subdir"
+    subdir.mkdir()
+    filtered_subdir = fns["worktree_list"](repo_root=str(subdir))
+    assert filtered_subdir == [], (
+        "Plain subdirectory should not match; filter is exact-path, not git-root traversal"
+    )
+
+    # A symlink pointing at the repo root DOES match because resolve() follows
+    # the symlink to the same canonical path as record.repo_root.
+    symlink = tmp_path / "repo-symlink"
+    try:
+        symlink.symlink_to(repo, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        # Symlinks may require elevated privileges on Windows — skip that half.
+        return
+
+    filtered_sym = fns["worktree_list"](repo_root=str(symlink))
+    assert len(filtered_sym) == 1, (
+        f"Symlink pointing at repo root should match; got: {filtered_sym}"
+    )
+    assert filtered_sym[0]["id"] == rec.id
