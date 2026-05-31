@@ -12,7 +12,15 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from lib_python_worktree import WorktreeError, WorktreeManager, WorktreeNotFoundError, WorktreeRecord
+from lib_python_worktree import (
+    ProcessAlreadyRunningError,
+    ProcessLifecycleError,
+    ProcessNotRunningError,
+    WorktreeError,
+    WorktreeManager,
+    WorktreeNotFoundError,
+    WorktreeRecord,
+)
 
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
@@ -121,6 +129,111 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         except WorktreeNotFoundError:
             return {"error": f"worktree_id '{worktree_id}' not found"}
         except WorktreeError as exc:
+            raise ValueError(str(exc)) from exc
+        return _record_to_dict(record)
+
+    @mcp.tool()
+    def worktree_start(
+        worktree_id: str,
+        role: str = "main",
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Start a detached process for a tracked worktree.
+
+        The command to run is **not** supplied by the caller — it is read from
+        the worktree contract's ``start:`` field in ``.seretos/worktree-setup.yml``
+        inside the worktree. Exactly one ``start:`` step must be configured;
+        a missing or ambiguous ``start:`` surfaces as a ``ValueError``.
+
+        Parameters
+        ----------
+        worktree_id:
+            The id of the worktree (as returned by ``worktree_create`` or
+            ``worktree_list``).
+        role:
+            Logical role name for the process; defaults to ``"main"``. Multiple
+            processes can be attached to one worktree under different roles.
+        cwd:
+            Working directory for the spawned process. When omitted the worktree
+            path is used by the underlying engine.
+
+        The operation is idempotent in the sense that if a process is already
+        running under the given ``role``, this tool returns a soft error dict
+        ``{"error": "..."}`` rather than raising, so callers can treat the
+        already-running case gracefully.
+
+        On success returns the canonical worktree record dict. Fields of note:
+
+        - ``status``: ``"running"`` when the process started successfully.
+        - ``pids``: a dict mapping role name to PID (e.g. ``{"main": 12345}``).
+        - ``ports``: a dict mapping port name to host port number; empty dict
+          ``{}`` before port setup runs.
+
+        If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
+        of raising, so callers can treat not-found as a soft/idempotent
+        condition.
+        """
+
+        try:
+            record = manager.start(worktree_id, role=role, cwd=cwd)
+        except WorktreeNotFoundError:
+            return {"error": f"worktree_id '{worktree_id}' not found"}
+        except ProcessAlreadyRunningError as exc:
+            return {"error": str(exc)}
+        except (WorktreeError, ProcessLifecycleError) as exc:
+            raise ValueError(str(exc)) from exc
+        return _record_to_dict(record)
+
+    @mcp.tool()
+    def worktree_stop(
+        worktree_id: str,
+        role: str = "main",
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Stop the process running under a given role for a tracked worktree.
+
+        Parameters
+        ----------
+        worktree_id:
+            The id of the worktree (as returned by ``worktree_create`` or
+            ``worktree_list``).
+        role:
+            Logical role name of the process to stop; defaults to ``"main"``.
+        timeout:
+            Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before
+            the process is forcibly killed (SIGKILL/TerminateProcess). Defaults
+            to ``10.0``.
+
+        Any contract ``stop:`` steps defined in ``.seretos/worktree-setup.yml``
+        are executed best-effort before the graceful SIGTERM/CtrlBreak signal is
+        sent; failures in those steps are logged but do not prevent the process
+        from being stopped.
+
+        The operation is idempotent in the sense that if no process is running
+        under the given ``role``, this tool returns a soft error dict
+        ``{"error": "..."}`` rather than raising, so callers can treat the
+        already-stopped case gracefully.
+
+        On success returns the canonical worktree record dict. Fields of note:
+
+        - ``status``: ``"stopped"`` after the process has been terminated.
+        - ``pids``: a dict mapping role name to PID; the stopped role's entry
+          is removed once the process exits.
+        - ``ports``: a dict mapping port name to host port number; empty dict
+          ``{}`` for worktrees with no port setup.
+
+        If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
+        of raising, so callers can treat not-found as a soft/idempotent
+        condition.
+        """
+
+        try:
+            record = manager.stop(worktree_id, role=role, timeout=timeout)
+        except WorktreeNotFoundError:
+            return {"error": f"worktree_id '{worktree_id}' not found"}
+        except ProcessNotRunningError as exc:
+            return {"error": str(exc)}
+        except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
 
