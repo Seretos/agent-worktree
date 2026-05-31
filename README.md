@@ -2,6 +2,34 @@
 
 MCP server for git worktree lifecycle management. Create/list/remove worktrees with branch handling, run per-project setup scripts on creation, and detect uncommitted changes before destructive operations.
 
+## What it does
+
+A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Ships as a self-contained frozen binary — no Python needed on the host. Manages git worktree lifecycle (create, list, get, remove, start, stop) via six MCP tools.
+
+## Quickstart
+
+1. **Install** — see [Quick install](#quick-install) below.
+2. **MCP config** — the plugin manifest wires this automatically after install, but if you need a manual entry the server key and shape are:
+   ```json
+   {
+     "mcpServers": {
+       "worktree": {
+         "command": "/path/to/plugin/bin/worktree",
+         "args": []
+       }
+     }
+   }
+   ```
+   The `command` value is extensionless (`bin/worktree`); the host OS resolves it to `bin/worktree.exe` on Windows and `bin/worktree` on Linux — one config entry serves both platforms.
+3. **First `.seretos/worktree-setup.yml`** — place this file at the root of your repository. The following is an illustrative shape (valid contract with `isolation: full` and a `setup:` step):
+   ```yaml
+   version: 1
+   isolation: full
+   setup:
+     - run: npm install
+   ```
+   An `isolation: none` contract is simply `version: 1` + `isolation: none` with no `setup:`, `teardown:`, or `ports:` blocks. For full contract documentation and working examples, see the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+
 ## Quick install
 
 **Claude Code:**
@@ -49,3 +77,17 @@ Output: `bin/worktree` (Linux) or `bin/worktree.exe` (Windows), plus a
 `build/stage/agent-worktree/` payload for this OS. The official release zip
 is produced by `release.yml`'s matrix-then-assemble pipeline and merges
 both OS payloads into a single archive.
+
+## Troubleshooting
+
+**Setup script fails on create**
+
+The executed command comes from the `setup:` steps defined in `.seretos/worktree-setup.yml` inside the worktree — it is never supplied by the tool caller. Confirm that a `setup:` block is present and correctly configured, that `isolation: full` is set (required for `setup:` steps), and that the file is present at the repository root of the newly created worktree.
+
+**Port leak after crash / restart**
+
+The server's in-memory state does not survive a restart — after restarting, `worktree_list` returns empty and `worktree_remove` is a no-op. In-memory tracking is therefore already cleared. If an OS port remains bound after a crash (process did not exit cleanly), resolve it at the OS level: identify the process holding the port (e.g. `netstat -ano | findstr <port>` on Windows, `lsof -i :<port>` on Linux) and terminate it.
+
+**Orphan worktree on disk**
+
+Call `worktree_get <id>` to inspect the record first. If the worktree is safe to discard, call `worktree_remove <id> force=true` to remove it even if it contains uncommitted changes.

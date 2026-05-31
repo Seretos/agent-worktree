@@ -1,99 +1,152 @@
 # agent-worktree
 
-MCP server that ships as a self-contained Windows `.exe` (PyInstaller-frozen Python). End users don't need a Python toolchain.
+A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Use the tools below to manage git worktrees from any MCP client. Engine internals and contract schema are documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme) and are not duplicated here.
 
-## Layout
+## Tool reference
 
-```
-src/worktree_plugin/            # Python source (src-layout)
-  server.py                       # FastMCP entry point, wires the tools
-  __main__.py                     # python -m / PyInstaller entry
-
-tests/                          # pytest, runs on every push (test.yml matrix: windows-latest + ubuntu-22.04)
-scripts/build.ps1               # cross-platform pwsh: PyInstaller wrapper + smoke test + staging
-worktree.spec                   # PyInstaller config (output extension picked by host OS)
-pyproject.toml                  # setuptools (package-dir = src/) + pytest config
-.claude-plugin/plugin.json      # plugin manifest; command is the extensionless bin/worktree
-SECURITY.md                     # threat model — extend per tool surface
-
-.github/workflows/
-  test.yml                      # pytest matrix on every push and PR (fetch-depth: 0 — real git worktree ops)
-  release.yml                   # manual-dispatch multi-OS release (stamp -> matrix-build -> assemble)
-  dispatch.yml                  # manual recovery: re-send marketplace dispatch
-```
-
-## OS_TARGETS = [windows, linux]
-
-Worktree management is built on local `git` operations that work identically on
-both platforms — no Win32 lock-in. The pipeline ships both binaries inside a
-single release zip:
-
-- `plugin.json`'s `command` is `${CLAUDE_PLUGIN_ROOT}/bin/worktree` (no
-  extension). On Windows the host OS resolves that to `worktree.exe`; on
-  Linux to `worktree`. One manifest serves both platforms.
-- `release.yml` is a three-stage pipeline:
-  1. **stamp** (Linux) — writes the version into `pyproject.toml` +
-     `.claude-plugin/plugin.json` and uploads them as an artifact so every
-     downstream job pulls the same stamped sources.
-  2. **build** (matrix `windows-latest` + `ubuntu-22.04`) — each runner
-     calls `scripts/build.ps1 -Clean -Package` and uploads its `bin/`
-     payload as `bin-<os>`.
-  3. **assemble** (Linux) — merges the per-OS bins into a single
-     `build/stage/agent-worktree/bin/` tree, builds the release zip with
-     correct Unix mode bits via Python's `zipfile`, force-pushes the
-     orphan `release` branch, creates the GitHub Release, and dispatches
-     to the marketplace.
-
-## Branches
-
-- `main` — source of truth. All edits go here.
-- `release` — orphan branch, force-pushed by `release.yml`. Contains only install-ready files: `.claude-plugin/plugin.json`, `bin/worktree.exe`, `bin/worktree`, `README.md`. Clients clone at the version tag (e.g. `agent-worktree--v0.0.1`).
-
-The release branch shares no history with main. Don't try to merge between them.
-
-## Release flow
-
-Triggered manually:
+### worktree_create
 
 ```
-Actions → release → Run workflow → version=X.Y.Z
+worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 ```
 
-or `gh workflow run release.yml -f version=X.Y.Z`.
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `repo_root` | `str` | Yes | Path to the git repository root. If a subdirectory is passed, it is silently re-rooted to the actual repository root and a `warning` field is added to the result. |
+| `branch` | `str` | Yes | Name of the branch to check out in the new worktree. |
+| `base` | `str` | No | Name of an existing local branch to create `branch` from. Must be a local branch name — not a SHA, `HEAD`, or remote ref. Omit when `branch` already exists. |
 
-The workflow:
-1. Validates `X.Y.Z` is semver.
-2. Fails if tag `agent-worktree--vX.Y.Z` already exists.
-3. Stamps the version into `pyproject.toml` and `.claude-plugin/plugin.json` (CI checkout only — never pushed back to main).
-4. Runs `scripts/build.ps1 -Clean -Package` (PyInstaller → smoke test → ZIP).
-5. Stashes the ZIP outside the working tree (needed because step 6 wipes it).
-6. Force-pushes the orphan `release` branch from the staged install-ready tree.
-7. Creates the `agent-worktree--vX.Y.Z` tag on that commit and a GitHub Release with the ZIP attached.
-8. POSTs to `Seretos/agent-marketplace/dispatches` with the plugin metadata, using `MARKETPLACE_DISPATCH_TOKEN`.
+**Returns** the canonical worktree record dict. Fields of note:
 
-`pyproject.toml`'s `version` field is **not** load-bearing for releases. The workflow input drives everything.
+- `id` — follows the pattern `<repo-slug>-<branch-slug>-<8-hex>` where slugs are lower-case ASCII with non-alphanumeric runs collapsed to `-`; ids are not stable across remove/re-create cycles.
+- `path` — absolute checkout location under `<store_root>/<repo_slug>/<id>/` where `store_root` defaults to `~/agent-worktree-store` or the value of `$WORKTREE_STORE_ROOT`.
+- `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
+- `warning` (optional) — present when `repo_root` was silently re-rooted; contains the original and resolved paths.
 
-## Required secret
+**Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures.
 
-- `MARKETPLACE_DISPATCH_TOKEN` — fine-grained PAT with `Contents: Read and write` + `Pull requests: Read and write` on `Seretos/agent-marketplace` only.
+---
 
-## Build conventions (`scripts/build.ps1`)
+### worktree_list
 
-- Cross-platform: runs under **Windows PowerShell 5.1**, PowerShell 7 on
-  Windows, AND `pwsh` on Linux. PS 5.1 lacks the auto `$IsWindows` variable
-  so the script derives it from `$env:OS`.
-- Output filename: `bin/worktree.exe` on Windows, `bin/worktree` on Linux
-  (no extension). The Linux binary is explicitly `chmod +x`ed after copy.
-- No global `$ErrorActionPreference = 'Stop'` — PyInstaller writes heavily to stderr, which PS 5.1 wraps as ErrorRecord and would trip a global Stop.
-- Python discovery: prefers `py.exe -3` on Windows locally, falls back to
-  `python` / `python3` (which is what `actions/setup-python` installs).
-- The smoke test runs an MCP `initialize` handshake against the freshly built binary. The build fails if the handshake fails.
-- `-Package` stages `build/stage/agent-worktree/` with this OS's binary
-  only — `release.yml`'s assembly job merges the per-OS stages into the
-  final zip.
+```
+worktree_list(repo_root: Optional[str] = None) -> list[dict]
+```
 
-## PyInstaller / src-layout notes
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `repo_root` | `str` | No | When provided, only worktrees whose `repo_root` resolves to the same directory are returned (resolved via `Path.resolve()` before comparison). Omit to return all worktrees across all repos. |
 
-- The Python package is `worktree_plugin` under `src/`. `pyproject.toml` declares `package-dir = { "" = "src" }` and `[tool.pytest.ini_options] pythonpath = ["src"]`.
-- `worktree.spec` references `src/worktree_plugin/__main__.py` as the entry and `pathex=[ROOT / "src"]`. Adjust both if the layout ever moves.
-- If you add native-binding dependencies (e.g. `pyvda`, `pywin32`, `comtypes`), use `collect_all(...)` for them in `worktree.spec` so PyInstaller picks up lazy-generated submodules.
+**Returns** a list of canonical worktree record dicts. Each entry mirrors a `WorktreeRecord`. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
+
+**Note:** state is process-scoped and does not survive a server restart.
+
+---
+
+### worktree_remove
+
+```
+worktree_remove(worktree_id: str, force: bool = False) -> dict
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worktree_id` | `str` | Yes | The id of the worktree to remove (as returned by `worktree_create` or `worktree_list`). |
+| `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
+
+**Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
+
+**Soft error:** if `worktree_id` is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition.
+
+**Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`).
+
+---
+
+### worktree_start
+
+```
+worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None) -> dict
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
+| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one worktree under different roles. |
+| `cwd` | `str` | No | Working directory for the spawned process. When omitted, the worktree path is used by the underlying engine. |
+
+**The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` inside the worktree.** Exactly one start step must be configured; a missing or ambiguous step surfaces as a `ValueError`.
+
+**Returns** the canonical worktree record dict on success. Fields of note:
+
+- `status` — `"running"` when the process started successfully.
+- `pids` — dict mapping role name to PID (e.g. `{"main": 12345}`).
+- `ports` — dict mapping port name to host port number; `{}` before port setup runs.
+
+**Soft errors:** if `worktree_id` is not found, or if a process is already running under the given `role`, returns `{"error": "..."}` instead of raising.
+
+**Errors:** raises `ValueError` for `WorktreeError` or `ProcessLifecycleError` conditions (e.g. bad contract configuration).
+
+---
+
+### worktree_stop
+
+```
+worktree_stop(worktree_id: str, role: str = "main", timeout: float = 10.0) -> dict
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
+| `role` | `str` | No | Logical role name of the process to stop. Defaults to `"main"`. |
+| `timeout` | `float` | No | Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before the process is forcibly killed (SIGKILL/TerminateProcess). Defaults to `10.0`. |
+
+Any contract `stop:` steps defined in `.seretos/worktree-setup.yml` are executed best-effort before the graceful SIGTERM/CtrlBreak signal is sent; failures in those steps are logged but do not prevent the process from being stopped.
+
+**Returns** the canonical worktree record dict on success. Fields of note:
+
+- `status` — `"stopped"` after the process has been terminated.
+- `pids` — dict mapping role name to PID; the stopped role's entry is removed once the process exits.
+- `ports` — dict mapping port name to host port number; `{}` for worktrees with no port setup.
+
+**Soft errors:** if `worktree_id` is not found, or if no process is running under the given `role`, returns `{"error": "..."}` instead of raising.
+
+**Errors:** raises `ValueError` for `WorktreeError` or `ProcessLifecycleError` conditions.
+
+---
+
+### worktree_get
+
+```
+worktree_get(worktree_id: str) -> dict
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worktree_id` | `str` | Yes | The id of the worktree to retrieve (as returned by `worktree_create` or `worktree_list`). |
+
+**Returns** the canonical worktree record dict without removing it. Fields of note:
+
+- `id` — follows the pattern `<repo-slug>-<branch-slug>-<8-hex>` where slugs are lower-case ASCII with non-alphanumeric runs collapsed to `-`; ids are not stable across remove/re-create cycles.
+- `path` — absolute checkout location under `<store_root>/<repo_slug>/<id>/` where `store_root` defaults to `~/agent-worktree-store` or the value of `$WORKTREE_STORE_ROOT`.
+- `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
+
+**Soft error:** if `worktree_id` is not found, returns `{"error": "..."}` instead of raising.
+
+---
+
+## Cross-platform binary note
+
+The plugin ships two binaries inside a single release zip:
+
+- `bin/worktree.exe` on Windows
+- `bin/worktree` (no extension) on Linux
+
+No Python installation is required on the host. The plugin manifest uses the extensionless `bin/worktree` as the command value; the host OS resolves the correct binary automatically. There are no behavioural differences between platforms.
+
+## State store, contract schema, and architecture
+
+The server's in-memory state is process-scoped and does not survive a restart. The contract schema (`.seretos/worktree-setup.yml`), the store layout, and the underlying engine are all documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+
+## Security
+
+Setup scripts run with the user's own OS privileges — see `SECURITY.md` for the full threat model.
