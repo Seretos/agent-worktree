@@ -21,8 +21,13 @@ from lib_python_worktree import (
     GitTimeoutError,
     InMemoryStateStore,
     ManagerConfig,
+    ProcessAlreadyRunningError,
+    ProcessLifecycleError,
+    ProcessNotRunningError,
+    WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
+    WorktreeRecord,
 )
 from lib_python_worktree.core.manager import _run_git
 
@@ -524,3 +529,215 @@ def test_tool_worktree_list_filter_resolves_subdir(tmp_path: Path):
         f"Symlink pointing at repo root should match; got: {filtered_sym}"
     )
     assert filtered_sym[0]["id"] == rec.id
+
+
+# ---- Ticket #6: worktree_start and worktree_stop MCP tools ----
+
+
+def _make_running_record(worktree_id: str = "wt-id") -> WorktreeRecord:
+    """Return a minimal WorktreeRecord with status='running' and a pid."""
+    return WorktreeRecord(
+        id=worktree_id,
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status="running",
+        pids={"main": 12345},
+    )
+
+
+def _make_stopped_record(worktree_id: str = "wt-id") -> WorktreeRecord:
+    """Return a minimal WorktreeRecord with status='stopped' and no pids."""
+    return WorktreeRecord(
+        id=worktree_id,
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status="stopped",
+        pids={},
+    )
+
+
+def test_worktree_start_stop_tools_registered(tmp_path: Path):
+    """Both worktree_start and worktree_stop must be registered as MCP tools."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    assert "worktree_start" in fns, "worktree_start not registered"
+    assert "worktree_stop" in fns, "worktree_stop not registered"
+
+
+def test_tool_worktree_start_returns_record(tmp_path: Path):
+    """Happy path: worktree_start returns a dict with status='running' and pids set."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_running_record()
+    mgr.start = MagicMock(return_value=record)
+
+    result = fns["worktree_start"](worktree_id="wt-id")
+
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert result["status"] == "running"
+    assert result["pids"] == {"main": 12345}
+    mgr.start.assert_called_once_with("wt-id", role="main", cwd=None)
+
+
+def test_tool_worktree_start_unknown_id_returns_soft_error(tmp_path: Path):
+    """worktree_start with an unknown id must return a soft-error dict, not raise."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
+
+    result = fns["worktree_start"](worktree_id="wt-missing")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "wt-missing" in result["error"]
+
+
+def test_tool_worktree_start_already_running_returns_soft_error(tmp_path: Path):
+    """worktree_start when already running must return soft-error dict, not raise."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(
+        side_effect=ProcessAlreadyRunningError("wt-id", "main", 99)
+    )
+
+    result = fns["worktree_start"](worktree_id="wt-id")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    # Must not raise; soft error only.
+
+
+def test_tool_worktree_start_engine_error_raises_valueerror(tmp_path: Path):
+    """worktree_start on a generic ProcessLifecycleError must raise ValueError."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(side_effect=ProcessLifecycleError("engine failure"))
+
+    with pytest.raises(ValueError):
+        fns["worktree_start"](worktree_id="wt-id")
+
+
+def test_tool_worktree_stop_returns_record(tmp_path: Path):
+    """Happy path: worktree_stop returns a dict with status='stopped'."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=record)
+
+    result = fns["worktree_stop"](worktree_id="wt-id")
+
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert result["status"] == "stopped"
+    assert result["pids"] == {}
+    mgr.stop.assert_called_once_with("wt-id", role="main", timeout=10.0)
+
+
+def test_tool_worktree_stop_unknown_id_returns_soft_error(tmp_path: Path):
+    """worktree_stop with an unknown id must return a soft-error dict, not raise."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.stop = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
+
+    result = fns["worktree_stop"](worktree_id="wt-missing")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "wt-missing" in result["error"]
+
+
+def test_tool_worktree_stop_not_running_returns_soft_error(tmp_path: Path):
+    """worktree_stop when no process is running must return soft-error dict, not raise."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.stop = MagicMock(
+        side_effect=ProcessNotRunningError("wt-id", "main")
+    )
+
+    result = fns["worktree_stop"](worktree_id="wt-id")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    # Must not raise; soft error only.
+
+
+def test_tool_worktree_stop_engine_error_raises_valueerror(tmp_path: Path):
+    """worktree_stop on a generic ProcessLifecycleError must raise ValueError."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.stop = MagicMock(side_effect=ProcessLifecycleError("engine failure"))
+
+    with pytest.raises(ValueError):
+        fns["worktree_stop"](worktree_id="wt-id")
+
+
+def test_tool_worktree_start_custom_role_and_cwd_forwarded(tmp_path: Path):
+    """worktree_start must forward custom role and cwd to manager.start (no cmd)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = WorktreeRecord(
+        id="wt-id", repo_root="/r", branch="b", path="/p",
+        status="running", pids={"worker": 42},
+    )
+    mgr.start = MagicMock(return_value=record)
+
+    fns["worktree_start"](
+        worktree_id="wt-id",
+        role="worker",
+        cwd="/custom/cwd",
+    )
+
+    call_args = mgr.start.call_args
+    # Only worktree_id as positional; role and cwd as kwargs; no cmd anywhere.
+    assert call_args.args == ("wt-id",)
+    assert call_args.kwargs == {"role": "worker", "cwd": "/custom/cwd"}
+    # Confirm no command list was passed.
+    all_args = list(call_args.args) + list(call_args.kwargs.values())
+    assert not any(isinstance(a, list) for a in all_args), (
+        "No command list should be forwarded to manager.start"
+    )
+
+
+def test_tool_worktree_start_no_start_configured_raises_valueerror(tmp_path: Path):
+    """worktree_start raises ValueError when the contract has no start: command.
+
+    This is the regression test covering the config-error path that replaces
+    the old caller-supplied-cmd path. The lib raises WorktreeError when the
+    contract's start: field is missing or ambiguous; the tool must surface it
+    as a ValueError so MCP reports a hard error.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(
+        side_effect=WorktreeError(
+            "no start: command configured in contract for worktree 'wt-id'"
+        )
+    )
+
+    with pytest.raises(ValueError, match="no start: command configured"):
+        fns["worktree_start"](worktree_id="wt-id")
+
+
+def test_tool_worktree_stop_custom_role_and_timeout_forwarded(tmp_path: Path):
+    """worktree_stop must forward custom role and timeout to manager.stop."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=record)
+
+    fns["worktree_stop"](worktree_id="wt-id", role="worker", timeout=5.0)
+
+    mgr.stop.assert_called_once_with("wt-id", role="worker", timeout=5.0)
