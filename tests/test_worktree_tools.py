@@ -107,6 +107,32 @@ def test_remove_unknown_id_fails(manager: WorktreeManager):
         manager.remove("nope-nope-12345678")
 
 
+def test_tool_remove_unknown_id_returns_soft_error(tmp_path: Path):
+    """Tool layer: worktree_remove with an unknown id must return a soft-error
+    dict ({"error": "..."}) rather than raising an exception."""
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    store_root = tmp_path / "store"
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+
+    unknown_id = "definitely-unknown-id-99999"
+    fn = mcp._tool_manager._tools["worktree_remove"].fn
+
+    result = fn(worktree_id=unknown_id)
+
+    assert isinstance(result, dict), "Expected a dict, not an exception"
+    assert "error" in result, f"Expected 'error' key in result, got: {result}"
+    assert unknown_id in result["error"], (
+        f"Expected unknown_id '{unknown_id}' in error message, got: {result['error']}"
+    )
+
+
 def test_store_root_from_env(tmp_path: Path, monkeypatch):
     target = tmp_path / "custom-store"
     monkeypatch.setenv("WORKTREE_STORE_ROOT", str(target))
