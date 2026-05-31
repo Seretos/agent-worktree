@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from lib_python_worktree import WorktreeError, WorktreeManager, WorktreeRecord
+from lib_python_worktree import WorktreeError, WorktreeManager, WorktreeNotFoundError, WorktreeRecord
 
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
@@ -29,8 +29,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     ) -> Dict[str, Any]:
         """Create a git worktree for ``branch`` rooted at ``repo_root``.
 
-        If ``branch`` does not exist yet, pass ``base`` (an existing branch or
-        commit-ish) to create it. Returns the canonical worktree record.
+        ``base`` is required when ``branch`` does not already exist (pass an
+        existing branch name or commit-ish to create it from); ignored when
+        ``branch`` already exists.
+
+        Returns the canonical worktree record. The ``ports`` field is a list of
+        named port reservations declared in setup config — populated after setup
+        runs, empty (``[]``) for isolation ``none`` worktrees or before setup
+        has executed; agents read it to discover which host ports the worktree's
+        services are bound to.
         """
 
         try:
@@ -41,7 +48,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
     @mcp.tool()
     def worktree_list() -> List[Dict[str, Any]]:
-        """List all worktrees currently tracked by this MCP session."""
+        """List all worktrees currently tracked in the server's in-memory state
+        (process-scoped; does not survive a server restart).
+
+        Each entry mirrors a ``WorktreeRecord``. The ``ports`` field is a list
+        of named port reservations declared in setup config — populated after
+        setup runs, empty (``[]``) for isolation ``none`` worktrees or before
+        setup has executed; agents read it to discover which host ports the
+        worktree's services are bound to.
+        """
 
         return [_record_to_dict(r) for r in manager.list()]
 
@@ -51,10 +66,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         Passes through to the manager's teardown hook (W8 will extend this
         with full teardown semantics).
+
+        Returns the removed worktree record on success. The ``ports`` field is
+        a list of named port reservations declared in setup config — populated
+        after setup runs, empty (``[]``) for isolation ``none`` worktrees or
+        before setup has executed; agents read it to discover which host ports
+        the worktree's services are bound to.
+
+        If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
+        of raising, so callers can treat not-found as a soft/idempotent
+        condition.
         """
 
         try:
             record = manager.remove(worktree_id, force=force)
+        except WorktreeNotFoundError:
+            return {"error": f"worktree_id '{worktree_id}' not found"}
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
