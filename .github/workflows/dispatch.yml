@@ -75,7 +75,8 @@ jobs:
               "repo":        "${{ github.repository }}",
               "category":    "mcp",
               "version":     "${VERSION}",
-              "ref":         "${TAG}"
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png"
             }
           }
           EOF
