@@ -188,6 +188,7 @@ jobs:
           if [ -d stamped/skills ]; then
             cp -a stamped/skills "$STAGE/"
           fi
+          [ -d stamped/assets ] && cp -a stamped/assets "$STAGE/" || true
 
           # Merge every per-OS bin payload. Both jobs upload to bins/bin-<os>/
           # which contains a `worktree` or `worktree.exe`.
@@ -328,7 +329,8 @@ jobs:
               "repo":        "${{ github.repository }}",
               "category":    "mcp",
               "version":     "${VERSION}",
-              "ref":         "${TAG}"
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png"
             }
           }
           EOF
