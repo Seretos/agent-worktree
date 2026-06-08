@@ -52,19 +52,20 @@ worktree_list(repo_root: Optional[str] = None) -> list[dict]
 ### worktree_remove
 
 ```
-worktree_remove(worktree_id: str, force: bool = False) -> dict
+worktree_remove(worktree_id: str, force: bool = False, kill_blocking_processes: bool = False) -> dict
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `worktree_id` | `str` | Yes | The id of the worktree to remove (as returned by `worktree_create` or `worktree_list`). |
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
+| `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
 
-**Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
+**Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs. The response also includes a `killed_pids` list (may be empty); each entry is a dict with `pid` (int), `name` (str), and `cmdline` (list of str) describing a process that was terminated to unblock removal.
 
 **Soft error:** if `worktree_id` is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition.
 
-**Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`).
+**Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
 
 ---
 

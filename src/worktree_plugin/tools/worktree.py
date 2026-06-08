@@ -13,9 +13,11 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 
 from lib_python_worktree import (
+    KilledProcessInfo,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
@@ -108,26 +110,59 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         return [_record_to_dict(r) for r in records]
 
     @mcp.tool()
-    def worktree_remove(worktree_id: str, force: bool = False) -> Dict[str, Any]:
+    def worktree_remove(
+        worktree_id: str,
+        force: bool = False,
+        kill_blocking_processes: bool = False,
+    ) -> Dict[str, Any]:
         """Remove a tracked worktree by id.
 
         Passes through to the manager's teardown hook (W8 will extend this
         with full teardown semantics).
+
+        Parameters
+        ----------
+        worktree_id:
+            The id of the worktree to remove (as returned by
+            ``worktree_create`` or ``worktree_list``).
+        force:
+            When ``True``, removes the worktree even if it contains
+            uncommitted changes. Defaults to ``False``.
+        kill_blocking_processes:
+            When ``True``, attempts to terminate foreign processes whose
+            current working directory is inside the worktree directory before
+            removal. This is an opt-in safety valve, primarily relevant on
+            Windows where open handles prevent directory deletion. Defaults
+            to ``False`` (no-op when nothing is blocking).
 
         Returns the removed worktree record on success. The ``ports`` field is
         a dict mapping port name to host port number; empty dict ``{}`` for
         ``isolation: none`` worktrees or before setup runs. Agents read it to
         discover which host ports the worktree's services are bound to.
 
+        The response includes a ``killed_pids`` list (may be empty). Each entry
+        is a dict with ``pid`` (int), ``name`` (str), and ``cmdline`` (list of
+        str) describing a process that was terminated to unblock removal.
+
         If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
         of raising, so callers can treat not-found as a soft/idempotent
         condition.
+
+        Raises ``ValueError`` (mapped from ``WorktreeDirLockedError``) when the
+        worktree directory is still locked after attempting to kill blocking
+        processes.
         """
 
         try:
-            record = manager.remove(worktree_id, force=force)
+            record = manager.remove(
+                worktree_id,
+                force=force,
+                kill_blocking_processes=kill_blocking_processes,
+            )
         except WorktreeNotFoundError:
             return {"error": f"worktree_id '{worktree_id}' not found"}
+        except WorktreeDirLockedError as exc:
+            raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)

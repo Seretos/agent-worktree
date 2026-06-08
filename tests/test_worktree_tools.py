@@ -20,10 +20,12 @@ from lib_python_worktree import (
     DuplicateWorktreeError,
     GitTimeoutError,
     InMemoryStateStore,
+    KilledProcessInfo,
     ManagerConfig,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
@@ -741,3 +743,122 @@ def test_tool_worktree_stop_custom_role_and_timeout_forwarded(tmp_path: Path):
     fns["worktree_stop"](worktree_id="wt-id", role="worker", timeout=5.0)
 
     mgr.stop.assert_called_once_with("wt-id", role="worker", timeout=5.0)
+
+
+# ---- Ticket #44: worktree_remove kill_blocking_processes parameter ----
+
+
+def _make_removed_record(worktree_id: str = "wt-id", killed_pids=None) -> WorktreeRecord:
+    """Return a minimal WorktreeRecord as returned by manager.remove."""
+    if killed_pids is None:
+        killed_pids = []
+    return WorktreeRecord(
+        id=worktree_id,
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status="removed",
+        pids={},
+        killed_pids=killed_pids,
+    )
+
+
+def test_tool_worktree_remove_kill_blocking_processes_forwarded(tmp_path: Path):
+    """worktree_remove with kill_blocking_processes=True must forward that flag
+    to manager.remove."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_removed_record()
+    mgr.remove = MagicMock(return_value=record)
+
+    fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+
+    mgr.remove.assert_called_once_with(
+        "wt-id", force=False, kill_blocking_processes=True
+    )
+
+
+def test_tool_worktree_remove_default_kill_false_forwarded(tmp_path: Path):
+    """worktree_remove without kill_blocking_processes must forward False to
+    manager.remove (the default must not silently drop the kwarg)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_removed_record()
+    mgr.remove = MagicMock(return_value=record)
+
+    fns["worktree_remove"](worktree_id="wt-id")
+
+    mgr.remove.assert_called_once_with(
+        "wt-id", force=False, kill_blocking_processes=False
+    )
+
+
+def test_tool_worktree_remove_killed_pids_in_response(tmp_path: Path):
+    """When manager.remove returns a record with killed_pids, the response
+    dict must include a non-empty killed_pids list with correct fields."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    killed = [KilledProcessInfo(pid=1234, name="devenv.exe", cmdline=["devenv.exe", "/x"])]
+    record = _make_removed_record(killed_pids=killed)
+    mgr.remove = MagicMock(return_value=record)
+
+    result = fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert "killed_pids" in result
+    assert len(result["killed_pids"]) == 1
+    entry = result["killed_pids"][0]
+    assert entry["pid"] == 1234
+    assert entry["name"] == "devenv.exe"
+    assert isinstance(entry["cmdline"], list)
+
+
+def test_tool_worktree_remove_default_empty_killed_pids(tmp_path: Path):
+    """When no processes were killed, killed_pids must be present and equal []
+    (not absent, not None)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_removed_record(killed_pids=[])
+    mgr.remove = MagicMock(return_value=record)
+
+    result = fns["worktree_remove"](worktree_id="wt-id")
+
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert "killed_pids" in result
+    assert result["killed_pids"] == []
+
+
+def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
+    """When manager.remove raises WorktreeDirLockedError (directory still
+    locked after kill attempt), the tool must raise ValueError."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(
+        side_effect=WorktreeDirLockedError("wt-id", killed=[])
+    )
+
+    with pytest.raises(ValueError):
+        fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+
+
+def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
+    """Adding kill_blocking_processes must not break the existing soft-error
+    path: WorktreeNotFoundError must still return {"error": ...} dict."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
+
+    result = fns["worktree_remove"](
+        worktree_id="wt-missing", kill_blocking_processes=True
+    )
+
+    assert isinstance(result, dict)
+    assert "error" in result

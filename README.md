@@ -88,6 +88,16 @@ The executed command comes from the `setup:` steps defined in `.seretos/worktree
 
 The server's in-memory state does not survive a restart — after restarting, `worktree_list` returns empty and `worktree_remove` is a no-op. In-memory tracking is therefore already cleared. If an OS port remains bound after a crash (process did not exit cleanly), resolve it at the OS level: identify the process holding the port (e.g. `netstat -ano | findstr <port>` on Windows, `lsof -i :<port>` on Linux) and terminate it.
 
+**Worktree directory locked by a foreign process (Windows)**
+
+On Windows, processes whose working directory is set to a path inside the worktree can prevent directory deletion. Pass `kill_blocking_processes=True` to `worktree_remove` to have the tool automatically terminate those foreign processes before removal:
+
+```
+worktree_remove(<id>, kill_blocking_processes=True)
+```
+
+The response's `killed_pids` field lists every process that was terminated (pid, name, cmdline). If the directory is still locked after the kill attempt, the tool raises an error — you can then resolve the remaining lock at the OS level and retry.
+
 **Orphan worktree on disk**
 
 Call `worktree_get <id>` to inspect the record first. If the worktree is safe to discard, call `worktree_remove <id> force=true` to remove it even if it contains uncommitted changes.
