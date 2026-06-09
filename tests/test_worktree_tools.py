@@ -862,3 +862,78 @@ def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
 
     assert isinstance(result, dict)
     assert "error" in result
+
+
+# ---- Ticket #48: worktree_remove teardown-before-remove ----
+
+
+def test_tool_worktree_remove_teardown_before_remove_wrapper_contract(tmp_path: Path):
+    """Regression test for #48: worktree_remove must return the full record dict
+    produced by _record_to_dict (all fields present, no 'error' key) after the
+    v0.0.8 bump.
+
+    This asserts the return-value shape — fields id, status, branch, repo_root,
+    path, pids, killed_pids — which the existing
+    test_tool_worktree_remove_default_kill_false_forwarded does NOT check.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_removed_record(worktree_id="wt-48")
+    mgr.remove = MagicMock(return_value=record)
+
+    result = fns["worktree_remove"](worktree_id="wt-48")
+
+    # Must return a plain dict without an 'error' key.
+    assert isinstance(result, dict)
+    assert "error" not in result
+    # All fields from _record_to_dict(record) must be present with correct values.
+    assert result["id"] == "wt-48"
+    assert result["status"] == "removed"
+    assert result["branch"] == "b"
+    assert result["repo_root"] == "/r"
+    assert result["path"] == "/p"
+    assert result["pids"] == {}
+    assert result["killed_pids"] == []
+
+
+def test_tool_worktree_remove_teardown_before_remove_force_forwarded(tmp_path: Path):
+    """Regression test for #48: force=True must be forwarded to manager.remove,
+    ensuring root-owned file cleanup (teardown) runs before the forced git
+    worktree removal in v0.0.8.
+
+    This is the only test that exercises the force=True path end-to-end;
+    it asserts both the call contract AND the return-value (id, status).
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_removed_record(worktree_id="wt-48-force")
+    mgr.remove = MagicMock(return_value=record)
+
+    result = fns["worktree_remove"](worktree_id="wt-48-force", force=True)
+
+    # Call contract: force=True forwarded correctly.
+    mgr.remove.assert_called_once_with(
+        "wt-48-force", force=True, kill_blocking_processes=False
+    )
+    # Return-value contract: must be the removed record, not a soft-error.
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert result["id"] == "wt-48-force"
+    assert result["status"] == "removed"
+
+
+def test_tool_worktree_remove_teardown_before_remove_not_found_soft_error(tmp_path: Path):
+    """Regression test for #48: the soft-error path must still return
+    {"error": ...} after the v0.0.8 bump (no regression from teardown change)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(side_effect=WorktreeNotFoundError("wt-48-missing"))
+
+    result = fns["worktree_remove"](worktree_id="wt-48-missing")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "wt-48-missing" in result["error"]
