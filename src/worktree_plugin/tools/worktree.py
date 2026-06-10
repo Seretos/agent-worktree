@@ -81,8 +81,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
     @mcp.tool()
     def worktree_list(repo_root: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List worktrees currently tracked in the server's in-memory state
-        (process-scoped; does not survive a server restart).
+        """List worktrees reflected in the persistent, disk-backed worktree state
+        (survives server restarts; reconciled on startup).
 
         Parameters
         ----------
@@ -172,13 +172,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         worktree_id: str,
         role: str = "main",
         cwd: Optional[str] = None,
+        variant: str = "default",
+        env: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Start a detached process for a tracked worktree.
 
         The command to run is **not** supplied by the caller — it is read from
-        the worktree contract's ``start:`` field in ``.seretos/worktree-setup.yml``
-        inside the worktree. Exactly one ``start:`` step must be configured;
-        a missing or ambiguous ``start:`` surfaces as a ``ValueError``.
+        the worktree contract's ``start:`` steps in ``.seretos/worktree-setup.yml``
+        inside the worktree. Multiple named ``start:`` steps are supported;
+        ``variant`` selects the step by its ``name`` (default ``"default"``
+        resolves to the lone unnamed step for back-compat). An unknown variant
+        surfaces as a ``ValueError``.
 
         Parameters
         ----------
@@ -191,6 +195,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         cwd:
             Working directory for the spawned process. When omitted the worktree
             path is used by the underlying engine.
+        variant:
+            Selects which named ``start:`` step to run. Defaults to
+            ``"default"``, which resolves to the lone unnamed step for
+            back-compat. When multiple named steps exist, pass the step's
+            ``name`` here. An unknown variant raises ``ValueError`` listing
+            the available names.
+        env:
+            Optional dict of extra environment variables merged into the process
+            environment by the engine. Omit (or pass ``None``) to inherit the
+            current environment unchanged.
 
         The operation is idempotent in the sense that if a process is already
         running under the given ``role``, this tool returns a soft error dict
@@ -210,7 +224,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         """
 
         try:
-            record = manager.start(worktree_id, role=role, cwd=cwd)
+            record = manager.start(worktree_id, role=role, env=env, cwd=cwd, variant=variant)
         except WorktreeNotFoundError:
             return {"error": f"worktree_id '{worktree_id}' not found"}
         except ProcessAlreadyRunningError as exc:
@@ -224,6 +238,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         worktree_id: str,
         role: str = "main",
         timeout: float = 10.0,
+        kill_orphans: bool = False,
     ) -> Dict[str, Any]:
         """Stop the process running under a given role for a tracked worktree.
 
@@ -238,6 +253,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before
             the process is forcibly killed (SIGKILL/TerminateProcess). Defaults
             to ``10.0``.
+        kill_orphans:
+            When ``True``, after the primary stop signal a cwd/open-file scan
+            terminates orphaned grandchild processes that were reparented away
+            from the tracked shell wrapper (e.g. a detached GUI started via
+            ``Start-Process -PassThru``). Defaults to ``False``
+            (backward-compatible).
 
         Any contract ``stop:`` steps defined in ``.seretos/worktree-setup.yml``
         are executed best-effort before the graceful SIGTERM/CtrlBreak signal is
@@ -263,7 +284,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         """
 
         try:
-            record = manager.stop(worktree_id, role=role, timeout=timeout)
+            record = manager.stop(worktree_id, role=role, timeout=timeout, kill_orphans=kill_orphans)
         except WorktreeNotFoundError:
             return {"error": f"worktree_id '{worktree_id}' not found"}
         except ProcessNotRunningError as exc:
