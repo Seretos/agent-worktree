@@ -581,7 +581,7 @@ def test_tool_worktree_start_returns_record(tmp_path: Path):
     assert "error" not in result
     assert result["status"] == "running"
     assert result["pids"] == {"main": 12345}
-    mgr.start.assert_called_once_with("wt-id", role="main", cwd=None)
+    mgr.start.assert_called_once_with("wt-id", role="main", env=None, cwd=None, variant="default")
 
 
 def test_tool_worktree_start_unknown_id_returns_soft_error(tmp_path: Path):
@@ -639,7 +639,7 @@ def test_tool_worktree_stop_returns_record(tmp_path: Path):
     assert "error" not in result
     assert result["status"] == "stopped"
     assert result["pids"] == {}
-    mgr.stop.assert_called_once_with("wt-id", role="main", timeout=10.0)
+    mgr.stop.assert_called_once_with("wt-id", role="main", timeout=10.0, kill_orphans=False)
 
 
 def test_tool_worktree_stop_unknown_id_returns_soft_error(tmp_path: Path):
@@ -703,7 +703,7 @@ def test_tool_worktree_start_custom_role_and_cwd_forwarded(tmp_path: Path):
     call_args = mgr.start.call_args
     # Only worktree_id as positional; role and cwd as kwargs; no cmd anywhere.
     assert call_args.args == ("wt-id",)
-    assert call_args.kwargs == {"role": "worker", "cwd": "/custom/cwd"}
+    assert call_args.kwargs == {"role": "worker", "env": None, "cwd": "/custom/cwd", "variant": "default"}
     # Confirm no command list was passed.
     all_args = list(call_args.args) + list(call_args.kwargs.values())
     assert not any(isinstance(a, list) for a in all_args), (
@@ -742,7 +742,94 @@ def test_tool_worktree_stop_custom_role_and_timeout_forwarded(tmp_path: Path):
 
     fns["worktree_stop"](worktree_id="wt-id", role="worker", timeout=5.0)
 
-    mgr.stop.assert_called_once_with("wt-id", role="worker", timeout=5.0)
+    mgr.stop.assert_called_once_with("wt-id", role="worker", timeout=5.0, kill_orphans=False)
+
+
+# ---- Ticket #51: worktree_start variant + env, worktree_stop kill_orphans ----
+
+
+def test_tool_worktree_start_variant_forwarded(tmp_path: Path):
+    """worktree_start must forward variant='unity-gui' to manager.start."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_running_record()
+    mgr.start = MagicMock(return_value=record)
+
+    fns["worktree_start"](worktree_id="wt-id", variant="unity-gui")
+
+    call_args = mgr.start.call_args
+    assert call_args.kwargs["variant"] == "unity-gui"
+
+
+def test_tool_worktree_start_env_forwarded(tmp_path: Path):
+    """worktree_start must forward env dict to manager.start."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_running_record()
+    mgr.start = MagicMock(return_value=record)
+
+    fns["worktree_start"](worktree_id="wt-id", env={"K": "v"})
+
+    call_args = mgr.start.call_args
+    assert call_args.kwargs["env"] == {"K": "v"}
+
+
+def test_tool_worktree_start_default_forwards_variant_and_env_explicitly(tmp_path: Path):
+    """Default worktree_start call must pass variant='default' and env=None explicitly."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_running_record()
+    mgr.start = MagicMock(return_value=record)
+
+    fns["worktree_start"](worktree_id="wt-id")
+
+    call_args = mgr.start.call_args
+    assert call_args.kwargs["variant"] == "default"
+    assert call_args.kwargs["env"] is None
+
+
+def test_tool_worktree_start_unknown_variant_raises_valueerror(tmp_path: Path):
+    """worktree_start raises ValueError when manager raises WorktreeError for unknown variant."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(
+        side_effect=WorktreeError("no start: step named 'bogus' found ...")
+    )
+
+    with pytest.raises(ValueError, match="no start: step named 'bogus'"):
+        fns["worktree_start"](worktree_id="wt-id", variant="bogus")
+
+
+def test_tool_worktree_stop_kill_orphans_forwarded(tmp_path: Path):
+    """worktree_stop with kill_orphans=True must forward that flag to manager.stop."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=record)
+
+    fns["worktree_stop"](worktree_id="wt-id", kill_orphans=True)
+
+    call_args = mgr.stop.call_args
+    assert call_args.kwargs["kill_orphans"] is True
+
+
+def test_tool_worktree_stop_default_forwards_kill_orphans_false(tmp_path: Path):
+    """Default worktree_stop call must pass kill_orphans=False explicitly."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=record)
+
+    fns["worktree_stop"](worktree_id="wt-id")
+
+    call_args = mgr.stop.call_args
+    assert call_args.kwargs["kill_orphans"] is False
 
 
 # ---- Ticket #44: worktree_remove kill_blocking_processes parameter ----

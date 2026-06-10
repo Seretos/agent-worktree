@@ -45,7 +45,7 @@ worktree_list(repo_root: Optional[str] = None) -> list[dict]
 
 **Returns** a list of canonical worktree record dicts. Each entry mirrors a `WorktreeRecord`. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
 
-**Note:** state is process-scoped and does not survive a server restart.
+**Note:** state is persistent and disk-backed (`~/.agent-worktree/state.yaml`); it survives server restarts and is reconciled on startup.
 
 ---
 
@@ -72,7 +72,7 @@ worktree_remove(worktree_id: str, force: bool = False, kill_blocking_processes: 
 ### worktree_start
 
 ```
-worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None) -> dict
+worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None, variant: str = "default", env: Optional[Dict[str, str]] = None) -> dict
 ```
 
 | Parameter | Type | Required | Description |
@@ -80,8 +80,10 @@ worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None) 
 | `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
 | `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one worktree under different roles. |
 | `cwd` | `str` | No | Working directory for the spawned process. When omitted, the worktree path is used by the underlying engine. |
+| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. |
+| `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
-**The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` inside the worktree.** Exactly one start step must be configured; a missing or ambiguous step surfaces as a `ValueError`.
+**The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` inside the worktree.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
 
 **Returns** the canonical worktree record dict on success. Fields of note:
 
@@ -98,7 +100,7 @@ worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None) 
 ### worktree_stop
 
 ```
-worktree_stop(worktree_id: str, role: str = "main", timeout: float = 10.0) -> dict
+worktree_stop(worktree_id: str, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False) -> dict
 ```
 
 | Parameter | Type | Required | Description |
@@ -106,6 +108,7 @@ worktree_stop(worktree_id: str, role: str = "main", timeout: float = 10.0) -> di
 | `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
 | `role` | `str` | No | Logical role name of the process to stop. Defaults to `"main"`. |
 | `timeout` | `float` | No | Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before the process is forcibly killed (SIGKILL/TerminateProcess). Defaults to `10.0`. |
+| `kill_orphans` | `bool` | No | When `True`, after the primary stop signal a cwd/open-file scan terminates orphaned grandchild processes that were reparented away from the tracked shell wrapper (e.g. a detached GUI started via `Start-Process -PassThru`). Defaults to `False` (backward-compatible). |
 
 Any contract `stop:` steps defined in `.seretos/worktree-setup.yml` are executed best-effort before the graceful SIGTERM/CtrlBreak signal is sent; failures in those steps are logged but do not prevent the process from being stopped.
 
@@ -152,7 +155,7 @@ No Python installation is required on the host. The plugin manifest uses the ext
 
 ## State store, contract schema, and architecture
 
-The server's in-memory state is process-scoped and does not survive a restart. The contract schema (`.seretos/worktree-setup.yml`), the store layout, and the underlying engine are all documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+The server uses a persistent, disk-backed state store (`~/.agent-worktree/state.yaml`) that survives server restarts and is reconciled on startup. The contract schema (`.seretos/worktree-setup.yml`), the store layout, and the underlying engine are all documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
 
 ## Security
 
