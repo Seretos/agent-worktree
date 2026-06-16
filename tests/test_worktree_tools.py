@@ -1024,3 +1024,64 @@ def test_tool_worktree_remove_teardown_before_remove_not_found_soft_error(tmp_pa
     assert isinstance(result, dict)
     assert "error" in result
     assert "wt-48-missing" in result["error"]
+
+
+# ---- Ticket #59: untracked contract provisioning ----
+
+
+def test_create_copies_contract_dir_when_untracked(tmp_path: Path):
+    """When .seretos/ exists in repo_root but is absent from the new worktree
+    (e.g. excluded via .git/info/exclude), worktree_create must copy it
+    into the worktree path so setup can find the contract."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    # Place .seretos/ in the repo root but do NOT git-add it (untracked).
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+
+    assert "error" not in result
+    wt_contract = Path(result["path"]) / ".seretos" / "worktree-setup.yml"
+    assert wt_contract.exists(), (
+        f".seretos/worktree-setup.yml not found in worktree at {result['path']}"
+    )
+
+
+def test_create_does_not_overwrite_existing_contract_dir(tmp_path: Path):
+    """When .seretos/ already exists in the worktree (tracked), worktree_create
+    must not attempt a second copy (idempotency guard)."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    # Track .seretos/ so git copies it into the worktree automatically.
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+
+    assert "error" not in result
+    wt_contract = Path(result["path"]) / ".seretos" / "worktree-setup.yml"
+    assert wt_contract.exists(), "Tracked .seretos/ must still be present after create"

@@ -6,6 +6,7 @@ plain-dict payloads.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 
 from lib_python_worktree import (
+    CONTRACT_FILENAME,
     KilledProcessInfo,
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
@@ -67,6 +69,21 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             raise ValueError(str(exc)) from exc
 
         result = _record_to_dict(record)
+
+        # If .seretos/ exists in the repo root but was not copied into the new
+        # worktree by git (common when the directory is excluded from tracking
+        # via .git/info/exclude), copy it now so setup can find the contract.
+        contract_dir_name = Path(CONTRACT_FILENAME).parts[0]  # ".seretos"
+        src_contract_dir = Path(record.repo_root) / contract_dir_name
+        dst_contract_dir = Path(record.path) / contract_dir_name
+        if src_contract_dir.is_dir() and not dst_contract_dir.exists():
+            try:
+                shutil.copytree(src_contract_dir, dst_contract_dir)
+            except OSError as exc:
+                raise ValueError(
+                    f"Worktree created at '{record.path}' but failed to copy"
+                    f" contract directory '{src_contract_dir}' into it: {exc}"
+                ) from exc
 
         # Emit a warning when the caller's repo_root was silently re-rooted to
         # the actual git repository root (e.g. a subdirectory was passed).
