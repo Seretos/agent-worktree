@@ -1085,3 +1085,244 @@ def test_create_does_not_overwrite_existing_contract_dir(tmp_path: Path):
     assert "error" not in result
     wt_contract = Path(result["path"]) / ".seretos" / "worktree-setup.yml"
     assert wt_contract.exists(), "Tracked .seretos/ must still be present after create"
+
+
+# ---- Ticket #60: env passthrough and variant selection verification ----
+
+
+def _write_contract(path: Path, content: str) -> None:
+    """Write content to .seretos/worktree-setup.yml under path."""
+    seretos = path / ".seretos"
+    seretos.mkdir(parents=True, exist_ok=True)
+    (seretos / "worktree-setup.yml").write_text(content, encoding="utf-8")
+
+
+def test_tool_worktree_start_env_vars_reach_child(tmp_path: Path):
+    """Verify that _lifecycle_start receives WORKTREE_* env vars built from
+    the WorktreeRecord (id, path, and port slots) when worktree_start is called.
+
+    Patch target: lib_python_worktree.core.manager._lifecycle_start
+    (the function imported into manager.py as the actual process-spawn call).
+    The patch intercepts the call after WorktreeManager.start has called
+    _build_worktree_env(record, caller_env) so we can inspect the full env.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    # Prepare a fake worktree path under tmp_path that has a contract file.
+    wt_path = tmp_path / "store" / "repo" / "wt-env-test-12345678"
+    wt_path.mkdir(parents=True)
+    # Repo root dir with a minimal contract having a single unnamed start step.
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+    )
+
+    worktree_id = "wt-env-test-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/env-test",
+        path=str(wt_path),
+        status="created",
+        ports={"web": 8080, "db": 5432},
+    )
+
+    state = InMemoryStateStore()
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+
+    captured: dict = {}
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+        captured["env"] = env
+        # Return the record with status updated to "running" so the tool succeeds.
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        fn(worktree_id=worktree_id)
+
+    assert "env" in captured, "_lifecycle_start was not called"
+    env = captured["env"]
+    assert env.get("WORKTREE_ID") == worktree_id, (
+        f"Expected WORKTREE_ID=={worktree_id!r}, got {env.get('WORKTREE_ID')!r}"
+    )
+    assert env.get("WORKTREE_PATH") == str(wt_path), (
+        f"Expected WORKTREE_PATH=={str(wt_path)!r}, got {env.get('WORKTREE_PATH')!r}"
+    )
+    assert env.get("WORKTREE_PORT_WEB") == "8080", (
+        f"Expected WORKTREE_PORT_WEB=='8080', got {env.get('WORKTREE_PORT_WEB')!r}"
+    )
+    assert env.get("WORKTREE_PORT_DB") == "5432", (
+        f"Expected WORKTREE_PORT_DB=='5432', got {env.get('WORKTREE_PORT_DB')!r}"
+    )
+
+
+def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
+    """Verify that passing variant='worker' to worktree_start causes _lifecycle_start
+    to receive a cmd that references start-worker.sh and not start-web.sh.
+
+    Patch target: lib_python_worktree.core.manager._lifecycle_start
+    """
+    from unittest.mock import patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    wt_path = tmp_path / "store" / "repo" / "wt-variant-test-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        (
+            "version: 1\n"
+            "isolation: partial\n"
+            "start:\n"
+            "  - name: web\n"
+            "    run: start-web.sh\n"
+            "  - name: worker\n"
+            "    run: start-worker.sh\n"
+        ),
+    )
+
+    worktree_id = "wt-variant-test-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/variant-test",
+        path=str(wt_path),
+        status="created",
+    )
+
+    state = InMemoryStateStore()
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+
+    captured: dict = {}
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+        captured["cmd"] = cmd
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        fn(worktree_id=worktree_id, variant="worker")
+
+    assert "cmd" in captured, "_lifecycle_start was not called"
+    cmd_str = " ".join(captured["cmd"])
+    assert "start-worker.sh" in cmd_str, (
+        f"Expected 'start-worker.sh' in cmd, got: {captured['cmd']!r}"
+    )
+    assert "start-web.sh" not in cmd_str, (
+        f"Expected 'start-web.sh' NOT in cmd when variant='worker', got: {captured['cmd']!r}"
+    )
+
+
+# ---- Ticket #60: worktree_get setup_status enrichment ----
+
+
+@pytest.mark.parametrize(
+    "status,expected_setup_status",
+    [
+        ("running", "running"),
+        ("ready", "ready"),
+        ("stopped", "unknown"),
+        ("created", "unknown"),
+    ],
+)
+def test_worktree_get_setup_status_derived_from_status(
+    tmp_path: Path, status: str, expected_setup_status: str
+):
+    """worktree_get must derive setup_status from the record's status field.
+
+    Covers: running->running, ready->ready, stopped->unknown, created->unknown.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    store_root = tmp_path / "store"
+    state = InMemoryStateStore()
+    record = WorktreeRecord(
+        id="wt-get-status-test",
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status=status,
+    )
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_get"].fn
+
+    result = fn(worktree_id="wt-get-status-test")
+
+    assert "error" not in result, f"Unexpected error: {result}"
+    assert result.get("setup_status") == expected_setup_status, (
+        f"For status={status!r}: expected setup_status={expected_setup_status!r}, "
+        f"got {result.get('setup_status')!r}"
+    )
+
+
+def test_worktree_get_setup_status_present_in_result(tmp_path: Path):
+    """setup_status key must always be present in the worktree_get result dict
+    (not absent for any record, regardless of status value)."""
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    store_root = tmp_path / "store"
+    state = InMemoryStateStore()
+    record = WorktreeRecord(
+        id="wt-always-has-setup-status",
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status="created",
+    )
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=store_root),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_get"].fn
+
+    result = fn(worktree_id="wt-always-has-setup-status")
+
+    assert "setup_status" in result, (
+        f"'setup_status' key missing from worktree_get result: {result!r}"
+    )

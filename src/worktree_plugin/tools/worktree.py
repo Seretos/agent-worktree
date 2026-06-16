@@ -31,6 +31,22 @@ def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
     return asdict(record)
 
 
+def _derive_setup_status(status: str) -> str:
+    """Map a WorktreeRecord status to a coarse setup-health signal.
+
+    ``"ready"``   -- no managed process; worktree is usable (no-op start).
+    ``"running"`` -- managed process is alive.
+    ``"unknown"`` -- process not yet started or has been stopped; no failure
+                     signal is available from WorktreeRecord in the current
+                     library version.
+    """
+    if status == "ready":
+        return "ready"
+    if status == "running":
+        return "running"
+    return "unknown"
+
+
 def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     """Register the W2 tools against the given FastMCP server."""
 
@@ -324,6 +340,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           ``~/agent-worktree-store`` or the value of ``$WORKTREE_STORE_ROOT``.
         - ``ports``: a dict mapping port name to host port number; empty dict
           ``{}`` for ``isolation: none`` worktrees or before setup runs.
+        - ``setup_status``: coarse setup-health signal derived from the
+          worktree's ``status`` field. One of:
+
+          - ``"ready"`` -- no managed process; worktree is usable (no-op start).
+          - ``"running"`` -- managed process is alive.
+          - ``"unknown"`` -- process not yet started or has been stopped; no
+            failure signal is available from WorktreeRecord in the current
+            library version.
 
         If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
         of raising, so callers can treat not-found as a soft/idempotent
@@ -333,7 +357,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         record = manager.state.get(worktree_id)
         if record is None:
             return {"error": f"worktree_id '{worktree_id}' not found"}
-        return _record_to_dict(record)
+        result = _record_to_dict(record)
+        result["setup_status"] = _derive_setup_status(record.status)
+        return result
 
 
 __all__ = ("register",)
