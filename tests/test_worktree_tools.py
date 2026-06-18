@@ -25,6 +25,7 @@ from lib_python_worktree import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    SetupFailedError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
@@ -1256,6 +1257,7 @@ def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
         ("ready", "ready"),
         ("stopped", "unknown"),
         ("created", "unknown"),
+        ("setup_failed", "failed"),
     ],
 )
 def test_worktree_get_setup_status_derived_from_status(
@@ -1263,7 +1265,7 @@ def test_worktree_get_setup_status_derived_from_status(
 ):
     """worktree_get must derive setup_status from the record's status field.
 
-    Covers: running->running, ready->ready, stopped->unknown, created->unknown.
+    Covers: running->running, ready->ready, stopped->unknown, created->unknown, setup_failed->failed.
     """
     from mcp.server.fastmcp import FastMCP
     from worktree_plugin.tools.worktree import register
@@ -1326,3 +1328,39 @@ def test_worktree_get_setup_status_present_in_result(tmp_path: Path):
     assert "setup_status" in result, (
         f"'setup_status' key missing from worktree_get result: {result!r}"
     )
+
+
+# ---- Ticket #66: SetupFailedError from worktree_create is caught as ValueError ----
+
+
+def test_worktree_create_setup_failed_raises_valueerror_not_runtimeerror(
+    tmp_path: Path,
+):
+    """Regression: worktree_create must raise ValueError (not raw RuntimeError)
+    when manager.create raises SetupFailedError.
+
+    SetupFailedError inherits from RuntimeError (not WorktreeError), so an
+    uncaught SetupFailedError would leak as RuntimeError. The explicit
+    except-SetupFailedError clause must intercept it first and wrap it as
+    ValueError so MCP callers receive a well-typed error.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    exc = SetupFailedError(
+        worktree_id="wt-setup-fail-12345678",
+        step_index=0,
+        step_name="build",
+        log_path=Path("/tmp/setup.log"),
+        returncode=1,
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="feature/x")
+
+    # Must be ValueError, not RuntimeError
+    assert not isinstance(exc_info.value, RuntimeError)
+    # The error message must mention the failure context
+    assert "Setup failed" in str(exc_info.value) or "setup" in str(exc_info.value).lower()

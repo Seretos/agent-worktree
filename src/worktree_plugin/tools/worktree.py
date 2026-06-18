@@ -19,6 +19,7 @@ from lib_python_worktree import (
     ProcessAlreadyRunningError,
     ProcessLifecycleError,
     ProcessNotRunningError,
+    SetupFailedError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
@@ -36,14 +37,16 @@ def _derive_setup_status(status: str) -> str:
 
     ``"ready"``   -- no managed process; worktree is usable (no-op start).
     ``"running"`` -- managed process is alive.
-    ``"unknown"`` -- process not yet started or has been stopped; no failure
-                     signal is available from WorktreeRecord in the current
-                     library version.
+    ``"failed"``  -- setup: steps ran and at least one step exited non-zero;
+                     the worktree directory is left intact for inspection.
+    ``"unknown"`` -- process not yet started or has been stopped.
     """
     if status == "ready":
         return "ready"
     if status == "running":
         return "running"
+    if status == "setup_failed":
+        return "failed"
     return "unknown"
 
 
@@ -81,6 +84,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         try:
             record = manager.create(repo_root=repo_root, branch=branch, base=base)
+        except SetupFailedError as exc:
+            raise ValueError(
+                f"Setup failed for worktree (left intact at path for inspection): {exc}"
+            ) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -345,9 +352,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
           - ``"ready"`` -- no managed process; worktree is usable (no-op start).
           - ``"running"`` -- managed process is alive.
-          - ``"unknown"`` -- process not yet started or has been stopped; no
-            failure signal is available from WorktreeRecord in the current
-            library version.
+          - ``"failed"`` -- setup: steps ran and at least one step exited
+            non-zero; the worktree directory is left intact for inspection.
+          - ``"unknown"`` -- process not yet started or has been stopped.
 
         If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
         of raising, so callers can treat not-found as a soft/idempotent
