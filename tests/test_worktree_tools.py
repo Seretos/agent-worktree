@@ -89,7 +89,7 @@ def test_create_unknown_branch_without_base(
 def test_create_unknown_branch_with_base(
     manager: WorktreeManager, temp_repo: Path
 ):
-    rec = manager.create(str(temp_repo), "feature/new", base="main")
+    rec = manager.create(str(temp_repo), "feature/new", base="main", fetch=False)
     assert rec.branch == "feature/new"
     assert Path(rec.path).exists()
     proc = subprocess.run(
