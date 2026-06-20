@@ -61,8 +61,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     ) -> Dict[str, Any]:
         """Create a git worktree for ``branch`` rooted at ``repo_root``.
 
-        ``base`` must be the name of an existing local branch (not a SHA,
-        ``HEAD``, or remote ref); omit when ``branch`` already exists.
+        ``base`` is the name of a local branch to base the new worktree on;
+        the tool fetches the latest commits from ``origin`` automatically so
+        the new worktree always starts from an up-to-date remote state.
+        Omit ``base`` when ``branch`` already exists.
 
         The ``ports`` field is a dict mapping port name to host port number;
         empty dict ``{}`` for ``isolation: none`` worktrees or before setup

@@ -89,6 +89,9 @@ def test_create_unknown_branch_without_base(
 def test_create_unknown_branch_with_base(
     manager: WorktreeManager, temp_repo: Path
 ):
+    # Pass fetch=False because the temp repo has no origin remote.
+    # The fetch behaviour (v0.1.7+) is exercised separately by the library's
+    # own suite; here we only want to verify the tool-layer plumbing.
     rec = manager.create(str(temp_repo), "feature/new", base="main", fetch=False)
     assert rec.branch == "feature/new"
     assert Path(rec.path).exists()
