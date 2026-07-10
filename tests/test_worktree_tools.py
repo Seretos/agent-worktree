@@ -1370,20 +1370,30 @@ def test_worktree_create_setup_failed_raises_valueerror_not_runtimeerror(
     assert "Setup failed" in str(exc_info.value) or "setup" in str(exc_info.value).lower()
 
 
-# ---- Ticket #75: v0.1.8 install_enabled_plugins() integration coverage ----
+# ---- Ticket #77: v0.1.9 install_enabled_plugins() integration coverage ----
 #
-# The v0.1.7 -> v0.1.8 bump of lib-python-worktree rewired
-# WorktreeManager.create() to install a worktree's `.claude/settings.json`
-# enabledPlugins via `claude plugin install <key> --scope project` (primary
-# mechanism, ticket #62 upstream), falling back to the older
-# seed_plugin_registry() registry-clone only when the `claude` CLI itself
-# cannot be resolved on PATH. This repo's own `.claude/settings.json` has 3
+# The v0.1.8 -> v0.1.9 bump of lib-python-worktree (ticket #64 upstream)
+# inverted the install strategy for a worktree's `.claude/settings.json`
+# enabledPlugins: it is now **clone-first** -- for each enabled key,
+# WorktreeManager.create() looks for any existing, structurally-valid
+# registry entry (any scope/projectPath; validity means
+# `<installPath>/.claude-plugin/plugin.json` exists and parses) and clones
+# it under a lock into a new `scope: "project"` entry for the worktree. This
+# never shells out, so it is the primary mechanism now. Only when no valid
+# clone source exists does it fall back to
+# `claude plugin install <key> --scope project` (with a second clone
+# attempt if that CLI invocation itself fails, in case it partially
+# populated the registry). The old `seed_plugin_registry()` registry-clone
+# fallback (ticket #39) is no longer wired from `manager.py` as of #64 --
+# clone-first supersedes it. This repo's own `.claude/settings.json` has 3
 # enabledPlugins keys, so every real `worktree_create()` call against this
 # exact repo now exercises that path. The tests below mirror that shape
 # using WorktreeManager's dedicated test seams (`_plugin_install_which`,
-# `_plugin_install_runner`, `_plugin_install_config_dir`,
-# `_plugin_seed_config_dir`) so nothing shells out to a real `claude`
-# process or touches the developer's actual `~/.claude` registry.
+# `_plugin_install_runner`, `_plugin_install_config_dir`) so nothing shells
+# out to a real `claude` process or touches the developer's actual
+# `~/.claude` registry. `_plugin_seed_config_dir` is still accepted by the
+# constructor for backward compatibility but is no longer read by
+# `create()`, so it is not used below.
 
 
 def _write_claude_settings(repo: Path, enabled_plugins: dict) -> None:
@@ -1418,19 +1428,107 @@ def _make_plugin_repo(tmp_path: Path, name: str = "src-repo") -> Path:
     return repo
 
 
+def test_create_with_enabled_plugins_clone_first_uses_existing_registry_without_cli(
+    tmp_path: Path, monkeypatch
+):
+    """Primary path introduced by the v0.1.8 -> v0.1.9 bump (ticket #64
+    upstream, consumed here via ticket #77): when a structurally-valid
+    registry entry already exists for an enabledPlugins key (any scope),
+    WorktreeManager.create() clones it into a new project-scoped entry for
+    the worktree instead of shelling out to `claude plugin install` -- even
+    though the `claude` CLI is resolvable. The CLI is only a fallback (see
+    the two tests below) when no valid clone source exists.
+
+    Grounded directly in lib_python_worktree.core.plugin_install:
+    `_find_clone_source()` accepts any structurally-valid entry (validity
+    per `_is_structurally_valid()`: `<installPath>/.claude-plugin/plugin.json`
+    exists and parses as JSON), and `_clone_entry_to_worktree()` writes the
+    clone into `installed_plugins.json` under a portalocker lock.
+    """
+    monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
+    repo = _make_plugin_repo(tmp_path, name="src-repo3")
+
+    # Seed a fake ~/.claude registry with one pre-existing, structurally
+    # valid install per enabledPlugins key, registered at a scope/path
+    # unrelated to this worktree -- any scope is an acceptable clone source.
+    config_dir = tmp_path / "claude-clone-cfg"
+    plugins_dir = config_dir / "plugins"
+    plugins_dir.mkdir(parents=True)
+
+    registry = {"version": 2, "plugins": {}}
+    for key in _REPO_ENABLED_PLUGINS:
+        install_dir = plugins_dir / "cache" / key.replace("/", "_").replace("@", "_")
+        (install_dir / ".claude-plugin").mkdir(parents=True)
+        (install_dir / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": key.split("@")[0]}), encoding="utf-8"
+        )
+        registry["plugins"][key] = [
+            {
+                "scope": "user",
+                "projectPath": None,
+                "installPath": str(install_dir),
+                "installedAt": "2026-01-01T00:00:00Z",
+                "resolvedVersion": "1.0.0",
+            }
+        ]
+    (plugins_dir / "installed_plugins.json").write_text(
+        json.dumps(registry), encoding="utf-8"
+    )
+
+    calls = []
+
+    def _boom_runner(cmd, *, cwd, timeout):
+        # If clone-first is working, this must never be called: a valid
+        # clone source exists for every key.
+        calls.append((tuple(cmd), cwd, timeout))
+        return type("_FailProc", (), {"returncode": 1, "stdout": "", "stderr": "unused"})()
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=InMemoryStateStore(),
+        _plugin_install_which=lambda name: "claude",  # resolvable, but must go unused
+        _plugin_install_runner=_boom_runner,
+        _plugin_install_config_dir=config_dir,
+    )
+
+    rec = mgr.create(str(repo), "feature/alpha")
+
+    assert rec.branch == "feature/alpha"
+    assert Path(rec.path).exists()
+    # The CLI fallback must never be reached: a valid clone source existed
+    # for every key up front.
+    assert calls == []
+
+    # Every key now has a NEW project-scoped registry entry cloned for this
+    # worktree's path, alongside the original source entry.
+    updated = json.loads(
+        (plugins_dir / "installed_plugins.json").read_text(encoding="utf-8")
+    )
+    for key in _REPO_ENABLED_PLUGINS:
+        project_entries = [
+            e for e in updated["plugins"][key] if e.get("scope") == "project"
+        ]
+        assert len(project_entries) == 1
+        assert os.path.normcase(
+            str(Path(project_entries[0]["projectPath"]))
+        ) == os.path.normcase(str(Path(rec.path)))
+
+
 def test_create_with_enabled_plugins_claude_unavailable_falls_back_and_does_not_hang(
     tmp_path: Path, monkeypatch
 ):
     """When enabledPlugins is set (mirroring this repo's own
-    .claude/settings.json) and the `claude` CLI can't be resolved on PATH,
-    WorktreeManager.create() must fall back to seed_plugin_registry() and
-    still return a normal record -- without hanging and without spawning any
-    real subprocess.
+    .claude/settings.json), no valid clone source exists in the registry,
+    and the `claude` CLI can't be resolved on PATH either,
+    WorktreeManager.create() must record every key as failed (best-effort)
+    and still return a normal record -- without hanging and without
+    spawning any real subprocess.
 
-    Regression guard for the v0.1.8 rewrite (ticket #75 review finding):
-    prior to this test, no fixture in this suite had a populated
-    .claude/settings.json, so this new code path was completely untested by
-    the 109-passed baseline.
+    Regression guard originally added for the v0.1.8 rewrite (ticket #75
+    review finding) and re-verified against v0.1.9's clone-first mechanism
+    (ticket #77): prior to the original test, no fixture in this suite had
+    a populated .claude/settings.json, so this code path was completely
+    untested.
     """
     import time as _time
 
@@ -1442,7 +1540,6 @@ def test_create_with_enabled_plugins_claude_unavailable_falls_back_and_does_not_
         state=InMemoryStateStore(),
         _plugin_install_which=lambda name: None,  # simulate claude not on PATH
         _plugin_install_config_dir=tmp_path / "claude-install-cfg",
-        _plugin_seed_config_dir=tmp_path / "claude-seed-cfg",
     )
 
     start = _time.monotonic()
@@ -1451,10 +1548,12 @@ def test_create_with_enabled_plugins_claude_unavailable_falls_back_and_does_not_
 
     assert rec.branch == "feature/alpha"
     assert Path(rec.path).exists()
-    # Hermetic: neither config dir has a registry file, so
-    # seed_plugin_registry's early-return means this completes almost
-    # instantly -- well under the 60s default subprocess-install timeout
-    # that would apply on the real (non-test) path.
+    # Hermetic: the config dir has no registry file at all, so
+    # _find_clone_source() has nothing to offer (no clone source) and, with
+    # claude unavailable too, install_enabled_plugins() records every key as
+    # failed and returns immediately -- well under the 60s default
+    # subprocess-install timeout that would apply on the real (non-test)
+    # path.
     assert elapsed < 5.0, (
         f"create() took {elapsed:.2f}s; expected a fast no-op fallback, not a hang"
     )
@@ -1463,12 +1562,15 @@ def test_create_with_enabled_plugins_claude_unavailable_falls_back_and_does_not_
 def test_create_with_enabled_plugins_install_subprocess_failure_does_not_raise(
     tmp_path: Path, monkeypatch
 ):
-    """When `claude` IS resolvable but every `claude plugin install`
-    invocation fails (nonzero exit), create() must still succeed -- failures
-    are best-effort and swallowed by the bare except in manager.py. This
-    also verifies the real subprocess is never invoked (the fake `runner`
-    seam intercepts every call) and that all 3 enabledPlugins keys from
-    .claude/settings.json were actually attempted.
+    """When no valid clone source exists (the fake config dir has no
+    registry file, so `_find_clone_source()` always returns None) and
+    `claude` IS resolvable but every `claude plugin install` invocation
+    fails (nonzero exit) and the post-failure recovery clone also finds
+    nothing to clone, create() must still succeed -- failures are
+    best-effort and swallowed by the bare except in manager.py. This also
+    verifies the real subprocess is never invoked (the fake `runner` seam
+    intercepts every call) and that all 3 enabledPlugins keys from
+    .claude/settings.json were actually attempted via the CLI fallback.
     """
     monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
     repo = _make_plugin_repo(tmp_path, name="src-repo2")
@@ -1515,11 +1617,11 @@ def test_create_without_claude_settings_skips_install_entirely(
 ):
     """Sanity check: repos without .claude/settings.json (the existing
     fixtures used throughout the rest of this suite) never reach
-    install_enabled_plugins' subprocess branch at all --
+    install_enabled_plugins' clone-first or subprocess branches at all --
     `_read_enabled_plugins` returns [] and the function returns immediately.
-    Confirms the new v0.1.8 code path is opt-in (gated on enabledPlugins
-    being present) rather than a universal regression for every
-    worktree_create call.
+    Confirms the install_enabled_plugins() code path (unchanged by the
+    v0.1.8 -> v0.1.9 bump) is opt-in, gated on enabledPlugins being present,
+    rather than a universal regression for every worktree_create call.
     """
     monkeypatch.setenv("WORKTREE_LOG_ROOT", str(tmp_path / "logs"))
 
