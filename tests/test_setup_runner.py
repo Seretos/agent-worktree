@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,9 +26,11 @@ class _FakeProc:
     stdout: str = ""
     stderr: str = ""
 
+    def communicate(self, timeout=None):
+        return (self.stdout, self.stderr)
 
-def _real_runner(*args, **kwargs):
-    return subprocess.run(*args, **kwargs)
+    def kill(self):
+        pass
 
 
 def _native_echo(message: str) -> str:
@@ -134,7 +135,7 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
     calls: List[List[str]] = []
     seen_env: List[dict] = []
 
-    def fake_run(cmd, *, cwd, env, capture_output, text, check):
+    def fake_run(cmd, *, cwd, env):
         calls.append(list(cmd))
         seen_env.append(dict(env))
         return _FakeProc(returncode=0, stdout="ok", stderr="")
