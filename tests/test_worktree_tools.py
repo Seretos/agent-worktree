@@ -1771,3 +1771,117 @@ def test_worktree_stop_docstring_documents_step_schema():
     assert "stop-web.sh" in doc, (
         "worktree_stop docstring must include a concrete example step (e.g. stop-web.sh)"
     )
+
+
+# ---- Ticket #87: worktree_start/worktree_stop docstrings correct the false
+# claim that the contract is read "inside the worktree" -- the engine reads
+# `.seretos/worktree-setup.yml` from `repo_root` (the original clone), not
+# the worktree checkout. A contract placed only in the worktree yields the
+# same silent {"status":"ready","pids":{}} no-op as "no contract configured"
+# (ticket #41). The docstrings must also document the required `version`/
+# `isolation` top-level keys and that `isolation: none` forbids
+# `start:`/`stop:`/`ports:`. ----
+
+
+def test_worktree_start_docstring_documents_repo_root_contract_location():
+    """The registered worktree_start tool's docstring must not claim the
+    contract is read "inside the worktree" -- it must instead state that
+    the engine reads `.seretos/worktree-setup.yml` from `repo_root` (the
+    original repository clone the worktree was created from), and must
+    warn that placing the contract only in the worktree checkout produces
+    a silent no-op indistinguishable from "no contract configured".
+
+    Prior to the docs fix, the docstring said the contract is read
+    "inside the worktree", which is false -- so this assertion fails
+    against the unfixed docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+    doc = fn.__doc__ or ""
+
+    assert "inside the worktree" not in doc, (
+        "worktree_start docstring must not claim the contract is read "
+        "inside the worktree -- it is read from repo_root"
+    )
+    assert "repo_root" in doc, (
+        "worktree_start docstring must name repo_root as the authoritative "
+        "contract read location"
+    )
+    assert "no-op" in doc or "no op" in doc, (
+        "worktree_start docstring must warn about the silent ready/no-op "
+        "outcome when the contract is placed in the wrong location"
+    )
+
+
+def test_worktree_start_docstring_shows_version_and_isolation():
+    """The registered worktree_start tool's docstring example must lead with
+    the required `version:` and `isolation:` top-level keys, and must
+    document that `isolation: none` forbids `start:`/`stop:`/`ports:`.
+
+    Prior to the docs fix, the YAML example only showed `start:` steps
+    with no `version`/`isolation` keys -- so this assertion fails against
+    the unfixed docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+    doc = fn.__doc__ or ""
+
+    assert "version:" in doc, "worktree_start docstring must show the required version: key"
+    assert "isolation:" in doc, "worktree_start docstring must show the required isolation: key"
+    assert "isolation: none" in doc and (
+        "forbids" in doc or "forbidden" in doc or "not allowed" in doc
+    ), (
+        "worktree_start docstring must document that isolation: none forbids "
+        "start:/stop:/ports:"
+    )
+
+
+def test_worktree_stop_docstring_documents_repo_root_contract_location():
+    """The registered worktree_stop tool's docstring must state that
+    `.seretos/worktree-setup.yml` is read from `repo_root` (the original
+    clone), not the worktree checkout, and must document that
+    `isolation: none` forbids `start:`/`stop:`/`ports:`.
+
+    Prior to the docs fix, the docstring named the contract file without
+    any location, leaving the false "inside the worktree" impression from
+    worktree_start uncorrected here -- so this assertion fails against the
+    unfixed docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_stop"].fn
+    doc = fn.__doc__ or ""
+
+    assert "repo_root" in doc, (
+        "worktree_stop docstring must name repo_root as the authoritative "
+        "contract read location"
+    )
+    assert "isolation: none" in doc and (
+        "forbids" in doc or "forbidden" in doc or "not allowed" in doc
+    ), (
+        "worktree_stop docstring must document that isolation: none forbids "
+        "start:/stop:/ports:"
+    )
