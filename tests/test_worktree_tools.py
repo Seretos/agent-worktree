@@ -1092,6 +1092,76 @@ def test_create_does_not_overwrite_existing_contract_dir(tmp_path: Path):
     assert wt_contract.exists(), "Tracked .seretos/ must still be present after create"
 
 
+# ---- Ticket #84: UX polish (path style, id-instability visibility) ----
+
+
+def test_worktree_create_contract_copy_error_uses_forward_slashes(
+    tmp_path: Path, monkeypatch
+):
+    """When copying an untracked .seretos/ into the new worktree fails, the
+    raised error message must render the source contract-dir path with
+    forward slashes -- consistent with the forward-slash-normalized paths in
+    success responses -- instead of leaking native Windows backslashes.
+
+    NOTE: on POSIX, pathlib already renders forward slashes for plain string
+    interpolation, so this assertion holds even pre-fix there; its RED state
+    is Windows-conditional. That is expected and acceptable.
+    """
+    import worktree_plugin.tools.worktree as worktree_tools_module
+
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    # Place .seretos/ in the repo root but do NOT git-add it (untracked), so
+    # worktree_create takes the copytree path.
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(worktree_tools_module.shutil, "copytree", _boom)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+
+    message = str(excinfo.value)
+    assert "contract directory" in message
+    assert "\\" not in message, (
+        f"Expected forward-slash-only error message, got: {message!r}"
+    )
+
+
+def test_id_instability_caution_prominent_in_docstrings(tmp_path: Path):
+    """The 'id is not stable across remove/re-create cycles' caveat must be
+    surfaced as a prominent standalone CAUTION callout in both
+    worktree_create and worktree_get docstrings, not buried in a trailing
+    clause of the id-pattern bullet."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    for name in ("worktree_create", "worktree_get"):
+        doc = fns[name].__doc__ or ""
+        assert "CAUTION:" in doc, f"{name} docstring missing prominent CAUTION callout"
+        assert "not stable" in doc.lower(), (
+            f"{name} docstring missing 'not stable' caveat text"
+        )
+        assert "worktree_list" in doc and "worktree_get" in doc, (
+            f"{name} docstring should direct callers to re-fetch the current "
+            "id via worktree_list/worktree_get"
+        )
+
+
 # ---- Ticket #60: env passthrough and variant selection verification ----
 
 
@@ -1637,3 +1707,67 @@ def test_create_without_claude_settings_skips_install_entirely(
 
     rec = mgr.create(str(temp_repo), "feature/alpha")
     assert rec.branch == "feature/alpha"
+
+
+# ---- Ticket #83: worktree_start/worktree_stop docstrings document the
+# per-step `.seretos/worktree-setup.yml` schema (`run:` required, `name:`
+# optional) ----
+
+
+def test_worktree_start_docstring_documents_step_schema():
+    """The registered worktree_start tool's docstring must explain the
+    per-step schema of `start:` entries in `.seretos/worktree-setup.yml`:
+    a required `run:` key (the shell command) and an optional `name:` key
+    used by `variant` to select the step. It must also include a concrete
+    example so callers can see the shape rather than infer it.
+
+    Prior to the docs fix, the docstring described `variant` selecting a
+    step by `name`, but never named the `run:` key that carries the actual
+    command -- so this assertion fails against the unfixed docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+    doc = fn.__doc__ or ""
+
+    assert "run:" in doc, "worktree_start docstring must document the `run:` step key"
+    assert "name:" in doc, "worktree_start docstring must document the optional `name:` step key"
+    assert "start-web.sh" in doc, (
+        "worktree_start docstring must include a concrete example step (e.g. start-web.sh)"
+    )
+
+
+def test_worktree_stop_docstring_documents_step_schema():
+    """The registered worktree_stop tool's docstring must explain that
+    `stop:` steps in `.seretos/worktree-setup.yml` share the same per-step
+    shape as `start:` steps (`run:` required, `name:` optional), with a
+    concrete example.
+
+    Prior to the docs fix, the docstring mentioned `stop:` steps running
+    best-effort before the shutdown signal, but never named the `run:` key
+    or showed an example -- so this assertion fails against the unfixed
+    docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_stop"].fn
+    doc = fn.__doc__ or ""
+
+    assert "run:" in doc, "worktree_stop docstring must document the `run:` step key"
+    assert "stop-web.sh" in doc, (
+        "worktree_stop docstring must include a concrete example step (e.g. stop-web.sh)"
+    )
