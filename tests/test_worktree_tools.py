@@ -1092,6 +1092,76 @@ def test_create_does_not_overwrite_existing_contract_dir(tmp_path: Path):
     assert wt_contract.exists(), "Tracked .seretos/ must still be present after create"
 
 
+# ---- Ticket #84: UX polish (path style, id-instability visibility) ----
+
+
+def test_worktree_create_contract_copy_error_uses_forward_slashes(
+    tmp_path: Path, monkeypatch
+):
+    """When copying an untracked .seretos/ into the new worktree fails, the
+    raised error message must render the source contract-dir path with
+    forward slashes -- consistent with the forward-slash-normalized paths in
+    success responses -- instead of leaking native Windows backslashes.
+
+    NOTE: on POSIX, pathlib already renders forward slashes for plain string
+    interpolation, so this assertion holds even pre-fix there; its RED state
+    is Windows-conditional. That is expected and acceptable.
+    """
+    import worktree_plugin.tools.worktree as worktree_tools_module
+
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    # Place .seretos/ in the repo root but do NOT git-add it (untracked), so
+    # worktree_create takes the copytree path.
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(worktree_tools_module.shutil, "copytree", _boom)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+
+    message = str(excinfo.value)
+    assert "contract directory" in message
+    assert "\\" not in message, (
+        f"Expected forward-slash-only error message, got: {message!r}"
+    )
+
+
+def test_id_instability_caution_prominent_in_docstrings(tmp_path: Path):
+    """The 'id is not stable across remove/re-create cycles' caveat must be
+    surfaced as a prominent standalone CAUTION callout in both
+    worktree_create and worktree_get docstrings, not buried in a trailing
+    clause of the id-pattern bullet."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    for name in ("worktree_create", "worktree_get"):
+        doc = fns[name].__doc__ or ""
+        assert "CAUTION:" in doc, f"{name} docstring missing prominent CAUTION callout"
+        assert "not stable" in doc.lower(), (
+            f"{name} docstring missing 'not stable' caveat text"
+        )
+        assert "worktree_list" in doc and "worktree_get" in doc, (
+            f"{name} docstring should direct callers to re-fetch the current "
+            "id via worktree_list/worktree_get"
+        )
+
+
 # ---- Ticket #60: env passthrough and variant selection verification ----
 
 

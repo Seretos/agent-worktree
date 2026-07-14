@@ -71,11 +71,19 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         runs. Agents read it to discover which host ports the worktree's
         services are bound to.
 
-        Returns the canonical worktree record. Fields of note:
+        Returns the canonical worktree record.
+
+        CAUTION: A worktree's ``id`` is NOT stable across a remove + re-create
+        cycle. Do not cache an ``id`` and reuse it after the worktree has been
+        removed and re-created -- always re-fetch the current id via
+        ``worktree_list`` or ``worktree_get``. A stale id will not resolve to
+        the new worktree.
+
+        Fields of note:
 
         - ``id``: follows the pattern ``<repo-slug>-<branch-slug>-<8-hex>``
           where slugs are lower-case ASCII with non-alphanumeric runs collapsed
-          to ``-``; ids are not stable across remove/re-create cycles.
+          to ``-``.
         - ``path``: absolute checkout location under
           ``<store_root>/<repo_slug>/<id>/`` where ``store_root`` defaults to
           ``~/agent-worktree-store`` or the value of ``$WORKTREE_STORE_ROOT``.
@@ -107,7 +115,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             except OSError as exc:
                 raise ValueError(
                     f"Worktree created at '{record.path}' but failed to copy"
-                    f" contract directory '{src_contract_dir}' into it: {exc}"
+                    f" contract directory '{src_contract_dir.as_posix()}' into it: {exc}"
                 ) from exc
 
         # Emit a warning when the caller's repo_root was silently re-rooted to
@@ -359,11 +367,19 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     def worktree_get(worktree_id: str) -> Dict[str, Any]:
         """Retrieve a single tracked worktree by id without removing it.
 
-        Returns the canonical worktree record on success. Fields of note:
+        Returns the canonical worktree record on success.
+
+        CAUTION: A worktree's ``id`` is NOT stable across a remove + re-create
+        cycle. Do not cache an ``id`` and reuse it after the worktree has been
+        removed and re-created -- always re-fetch the current id via
+        ``worktree_list`` or ``worktree_get``. A stale id will not resolve to
+        the new worktree.
+
+        Fields of note:
 
         - ``id``: follows the pattern ``<repo-slug>-<branch-slug>-<8-hex>``
           where slugs are lower-case ASCII with non-alphanumeric runs collapsed
-          to ``-``; ids are not stable across remove/re-create cycles.
+          to ``-``.
         - ``path``: absolute checkout location under
           ``<store_root>/<repo_slug>/<id>/`` where ``store_root`` defaults to
           ``~/agent-worktree-store`` or the value of ``$WORKTREE_STORE_ROOT``.
