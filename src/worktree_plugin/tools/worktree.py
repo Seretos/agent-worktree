@@ -228,17 +228,34 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         """Start a detached process for a tracked worktree.
 
         The command to run is **not** supplied by the caller — it is read from
-        the worktree contract's ``start:`` steps in ``.seretos/worktree-setup.yml``
-        inside the worktree. Multiple named ``start:`` steps are supported;
-        ``variant`` selects the step by its ``name`` (default ``"default"``
-        resolves to the lone unnamed step for back-compat). An unknown variant
-        surfaces as a ``ValueError``.
+        the worktree contract's ``start:`` steps in ``.seretos/worktree-setup.yml``.
+        The engine reads this file from ``repo_root`` — the original repository
+        clone the worktree was created from — **not** from the worktree
+        checkout itself. ``worktree_create`` copies ``.seretos/`` into the
+        worktree as a create-time convenience, but that copy is not what the
+        engine reads.
+
+        CAUTION: placing the contract only in the worktree checkout (and not at
+        ``<repo_root>/.seretos/worktree-setup.yml``) produces a silent
+        ``{"status": "ready", "pids": {}}`` no-op — indistinguishable from "no
+        contract configured" — with no error to indicate the misplacement.
+
+        Multiple named ``start:`` steps are supported; ``variant`` selects the
+        step by its ``name`` (default ``"default"`` resolves to the lone unnamed
+        step for back-compat). An unknown variant surfaces as a ``ValueError``.
 
         Step schema: each ``start:`` entry is a YAML mapping with a required
         ``run:`` key (the shell command to execute) and an optional ``name:``
         key (used by ``variant`` to select that step). A single unnamed step
-        is the ``"default"`` variant, for back-compat. Example::
+        is the ``"default"`` variant, for back-compat.
 
+        The contract file also requires two top-level keys: ``version`` (an
+        int) and ``isolation`` (one of ``full``, ``partial``, or ``none``).
+        When ``isolation: none`` is set, ``start:``, ``stop:``, and ``ports:``
+        are forbidden in the contract. Example::
+
+            version: 1
+            isolation: full
             start:
               - name: web
                 run: start-web.sh
@@ -324,13 +341,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         Any contract ``stop:`` steps defined in ``.seretos/worktree-setup.yml``
         are executed best-effort before the graceful SIGTERM/CtrlBreak signal is
         sent; failures in those steps are logged but do not prevent the process
-        from being stopped.
+        from being stopped. As with ``worktree_start``, the engine reads this
+        file from ``repo_root`` — the original repository clone the worktree
+        was created from — not from the worktree checkout itself; a contract
+        placed only in the worktree checkout is silently ignored.
 
         Step schema: ``stop:`` steps share the same per-step shape as
         ``start:`` steps — each entry is a YAML mapping with a required
         ``run:`` key (the shell command to execute) and an optional ``name:``
-        key. Example::
+        key. The contract also requires top-level ``version`` (int) and
+        ``isolation`` (``full``/``partial``/``none``) keys; ``isolation: none``
+        forbids ``start:``, ``stop:``, and ``ports:``. Example::
 
+            version: 1
+            isolation: full
             stop:
               - name: web
                 run: stop-web.sh
