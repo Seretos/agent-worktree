@@ -28,7 +28,18 @@ A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib
    setup:
      - run: npm install
    ```
-   An `isolation: none` contract is simply `version: 1` + `isolation: none` with no `setup:`, `teardown:`, or `ports:` blocks. For full contract documentation and working examples, see the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+   An `isolation: none` contract is simply `version: 1` + `isolation: none` with no `setup:`, `teardown:`, or `ports:` blocks. Optional `start:`/`stop:` steps (used by `worktree_start`/`worktree_stop`) follow the same per-step shape — a required `run:` (the shell command) and an optional `name:` (selects the step via `worktree_start`'s `variant` parameter):
+   ```yaml
+   start:
+     - name: web
+       run: start-web.sh
+     - name: worker
+       run: start-worker.sh
+   stop:
+     - name: web
+       run: stop-web.sh
+   ```
+   For full contract documentation and working examples, see the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
 
 ## Quick install
 
