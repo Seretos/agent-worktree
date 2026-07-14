@@ -226,6 +226,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         resolves to the lone unnamed step for back-compat). An unknown variant
         surfaces as a ``ValueError``.
 
+        Step schema: each ``start:`` entry is a YAML mapping with a required
+        ``run:`` key (the shell command to execute) and an optional ``name:``
+        key (used by ``variant`` to select that step). A single unnamed step
+        is the ``"default"`` variant, for back-compat. Example::
+
+            start:
+              - name: web
+                run: start-web.sh
+              - name: worker
+                run: start-worker.sh
+
         Parameters
         ----------
         worktree_id:
@@ -306,6 +317,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         are executed best-effort before the graceful SIGTERM/CtrlBreak signal is
         sent; failures in those steps are logged but do not prevent the process
         from being stopped.
+
+        Step schema: ``stop:`` steps share the same per-step shape as
+        ``start:`` steps — each entry is a YAML mapping with a required
+        ``run:`` key (the shell command to execute) and an optional ``name:``
+        key. Example::
+
+            stop:
+              - name: web
+                run: stop-web.sh
 
         The operation is idempotent in the sense that if no process is running
         under the given ``role``, this tool returns a soft error dict

@@ -1637,3 +1637,67 @@ def test_create_without_claude_settings_skips_install_entirely(
 
     rec = mgr.create(str(temp_repo), "feature/alpha")
     assert rec.branch == "feature/alpha"
+
+
+# ---- Ticket #83: worktree_start/worktree_stop docstrings document the
+# per-step `.seretos/worktree-setup.yml` schema (`run:` required, `name:`
+# optional) ----
+
+
+def test_worktree_start_docstring_documents_step_schema():
+    """The registered worktree_start tool's docstring must explain the
+    per-step schema of `start:` entries in `.seretos/worktree-setup.yml`:
+    a required `run:` key (the shell command) and an optional `name:` key
+    used by `variant` to select the step. It must also include a concrete
+    example so callers can see the shape rather than infer it.
+
+    Prior to the docs fix, the docstring described `variant` selecting a
+    step by `name`, but never named the `run:` key that carries the actual
+    command -- so this assertion fails against the unfixed docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+    doc = fn.__doc__ or ""
+
+    assert "run:" in doc, "worktree_start docstring must document the `run:` step key"
+    assert "name:" in doc, "worktree_start docstring must document the optional `name:` step key"
+    assert "start-web.sh" in doc, (
+        "worktree_start docstring must include a concrete example step (e.g. start-web.sh)"
+    )
+
+
+def test_worktree_stop_docstring_documents_step_schema():
+    """The registered worktree_stop tool's docstring must explain that
+    `stop:` steps in `.seretos/worktree-setup.yml` share the same per-step
+    shape as `start:` steps (`run:` required, `name:` optional), with a
+    concrete example.
+
+    Prior to the docs fix, the docstring mentioned `stop:` steps running
+    best-effort before the shutdown signal, but never named the `run:` key
+    or showed an example -- so this assertion fails against the unfixed
+    docstring.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=Path("unused-store")),
+        state=InMemoryStateStore(),
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_stop"].fn
+    doc = fn.__doc__ or ""
+
+    assert "run:" in doc, "worktree_stop docstring must document the `run:` step key"
+    assert "stop-web.sh" in doc, (
+        "worktree_stop docstring must include a concrete example step (e.g. stop-web.sh)"
+    )
