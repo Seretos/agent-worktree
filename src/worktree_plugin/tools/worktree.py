@@ -295,6 +295,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``pids``: a dict mapping role name to PID (e.g. ``{"main": 12345}``).
         - ``ports``: a dict mapping port name to host port number; empty dict
           ``{}`` before port setup runs.
+        - ``start_log_path``: filesystem path to the engine's captured
+          startup log for the spawned process; useful for diagnosing a
+          process that exits immediately. May be absent/``null`` on a no-op
+          ``"ready"`` start where nothing was spawned.
 
         If ``worktree_id`` is not found, returns ``{"error": "..."}`` instead
         of raising, so callers can treat not-found as a soft/idempotent

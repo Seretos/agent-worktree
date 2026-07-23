@@ -1321,6 +1321,148 @@ def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
     )
 
 
+# ---- Ticket #93: default cwd falls back to the worktree path ----
+
+
+def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: Path):
+    """Omitting ``cwd`` must not silently forward ``cwd=None`` to the OS spawn
+    call (which makes the child inherit the host's directory instead of the
+    worktree on Windows). The engine is responsible for defaulting ``cwd`` to
+    the worktree path before it ever reaches ``_spawn_detached``.
+
+    Patch target: lib_python_worktree.core.process_lifecycle._spawn_detached
+    (the true spawn seam), so the test proves the *engine's* default applies
+    rather than something the wrapper itself papers over.
+    """
+    from unittest.mock import patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    wt_path = tmp_path / "store" / "repo" / "wt-cwd-test-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+    )
+
+    worktree_id = "wt-cwd-test-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/cwd-test",
+        path=str(wt_path),
+        status="created",
+    )
+
+    state = InMemoryStateStore()
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+
+    captured: dict = {}
+
+    class _FakeProc:
+        """Minimal Popen-alike: process_lifecycle.start() calls .wait() on
+        the return value to detect an early exit, then reads .pid/.returncode.
+        Raising TimeoutExpired simulates a still-running process.
+        """
+
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+
+    def _fake_spawn(cmd, *, env=None, cwd=None, **_ignored):
+        captured["cwd"] = cwd
+        return _FakeProc(4242)
+
+    with patch(
+        "lib_python_worktree.core.process_lifecycle._spawn_detached",
+        side_effect=_fake_spawn,
+    ):
+        fn(worktree_id=worktree_id)
+
+    assert captured["cwd"] == str(wt_path), (
+        f"Expected omitted cwd to default to the worktree path {str(wt_path)!r}, "
+        f"got {captured.get('cwd')!r}"
+    )
+
+    # Regression: an explicit cwd must still reach _spawn_detached unchanged.
+    explicit_dir = tmp_path / "explicit-cwd"
+    explicit_dir.mkdir()
+
+    with patch(
+        "lib_python_worktree.core.process_lifecycle._spawn_detached",
+        side_effect=_fake_spawn,
+    ):
+        fn(worktree_id=worktree_id, role="secondary", cwd=str(explicit_dir))
+
+    assert captured["cwd"] == str(explicit_dir), (
+        f"Expected explicit cwd {str(explicit_dir)!r} to pass through unchanged, "
+        f"got {captured.get('cwd')!r}"
+    )
+
+
+def test_tool_worktree_start_surfaces_start_log_path(tmp_path: Path):
+    """The engine's ``start_log_path`` diagnostic field (path to the captured
+    startup log for the spawned process) must flow through to the tool's
+    response dict so callers can inspect it when a process exits immediately.
+    """
+    from unittest.mock import patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    wt_path = tmp_path / "store" / "repo" / "wt-log-test-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+
+    worktree_id = "wt-log-test-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/log-test",
+        path=str(wt_path),
+        status="running",
+        pids={"main": 4242},
+    )
+    # Set post-construction (not a constructor kwarg) so this test doesn't
+    # error at collection/call time before the dependency is bumped and
+    # ``start_log_path`` becomes a real dataclass field.
+    record.start_log_path = "/logs/start-main.log"
+
+    state = InMemoryStateStore()
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["worktree_start"].fn
+
+    with patch.object(mgr, "start", return_value=record):
+        result = fn(worktree_id=worktree_id)
+
+    assert result.get("start_log_path") == "/logs/start-main.log", (
+        f"Expected start_log_path to flow through to the response dict, "
+        f"got {result.get('start_log_path')!r}"
+    )
+
+
 # ---- Ticket #60: worktree_get setup_status enrichment ----
 
 
