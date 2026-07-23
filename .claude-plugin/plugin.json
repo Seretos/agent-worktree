@@ -1,0 +1,15 @@
+{
+  "name": "agent-worktree",
+  "description": "MCP server for git worktree lifecycle management. Create/list/remove worktrees with branch handling, run per-project setup scripts on creation, and detect uncommitted changes before destructive operations.",
+  "version": "0.1.15",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "skills": "./skills",
+  "mcpServers": {
+    "worktree": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/worktree",
+      "args": []
+    }
+  }
+}
