@@ -9,10 +9,10 @@ description = "MCP server for git worktree lifecycle management. Create/list/rem
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
-  "mcp>=1.2",
+  "mcp>=1.2,<2",
   "pydantic>=2.6",
   "PyYAML>=6.0",
-  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.2.4",
+  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.0",
   "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.1",
 ]
 
