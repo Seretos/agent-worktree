@@ -136,7 +136,7 @@ def test_tool_remove_unknown_id_returns_soft_error(tmp_path: Path):
     unknown_id = "definitely-unknown-id-99999"
     fn = mcp._tool_manager._tools["worktree_remove"].fn
 
-    result = fn(worktree_id=unknown_id)
+    result = fn(environment_id=unknown_id)
 
     assert isinstance(result, dict), "Expected a dict, not an exception"
     assert "error" in result, f"Expected 'error' key in result, got: {result}"
@@ -406,138 +406,6 @@ def test_create_no_reroot_warning_when_paths_match(tmp_path: Path):
     )
 
 
-def test_tool_worktree_get_returns_record(tmp_path: Path, temp_repo: Path):
-    """worktree_get must return the correct record for a known id."""
-    mgr, fns = _make_tool_fixtures(tmp_path)
-
-    # Create via the manager directly so we have a known record.
-    rec = mgr.create(str(temp_repo), "feature/alpha")
-
-    result = fns["worktree_get"](worktree_id=rec.id)
-
-    assert result["id"] == rec.id
-    assert result["branch"] == rec.branch
-    assert result["path"] == rec.path
-    assert result["repo_root"] == rec.repo_root
-    assert "error" not in result
-
-
-def test_tool_worktree_get_unknown_id_returns_soft_error(tmp_path: Path):
-    """worktree_get with an unknown id must return a soft-error dict
-    ({"error": "..."}) rather than raising, mirroring worktree_remove."""
-    mgr, fns = _make_tool_fixtures(tmp_path)
-
-    unknown_id = "definitely-unknown-id-99999"
-    result = fns["worktree_get"](worktree_id=unknown_id)
-
-    assert isinstance(result, dict), f"Expected dict, got: {type(result)}"
-    assert "error" in result, f"Expected 'error' key, got: {result}"
-    assert unknown_id in result["error"], (
-        f"Expected unknown_id in error message, got: {result['error']}"
-    )
-
-
-def test_tool_worktree_get_empty_store(tmp_path: Path):
-    """worktree_get on a fresh (empty) manager must return a soft-error dict."""
-    mgr, fns = _make_tool_fixtures(tmp_path)
-
-    result = fns["worktree_get"](worktree_id="any-id-12345678")
-
-    assert isinstance(result, dict)
-    assert "error" in result
-
-
-def test_tool_worktree_list_filters_by_repo_root(tmp_path: Path):
-    """worktree_list(repo_root=...) must return only records for that repo;
-    omitting repo_root returns all worktrees across all repos."""
-    # Build two separate repos, each with a non-checked-out branch so git
-    # allows adding a worktree for it.
-    repo1 = tmp_path / "repo1"
-    repo1.mkdir()
-    _git("init", "-q", "-b", "main", cwd=repo1)
-    _git("config", "user.email", "test@example.com", cwd=repo1)
-    _git("config", "user.name", "Test", cwd=repo1)
-    (repo1 / "README.md").write_text("r1\n", encoding="utf-8")
-    _git("add", "-A", cwd=repo1)
-    _git("commit", "-q", "-m", "init", cwd=repo1)
-    _git("branch", "feature/wt1", cwd=repo1)
-
-    repo2 = tmp_path / "repo2"
-    repo2.mkdir()
-    _git("init", "-q", "-b", "main", cwd=repo2)
-    _git("config", "user.email", "test@example.com", cwd=repo2)
-    _git("config", "user.name", "Test", cwd=repo2)
-    (repo2 / "README.md").write_text("r2\n", encoding="utf-8")
-    _git("add", "-A", cwd=repo2)
-    _git("commit", "-q", "-m", "init", cwd=repo2)
-    _git("branch", "feature/wt2", cwd=repo2)
-
-    mgr, fns = _make_tool_fixtures(tmp_path)
-    rec1 = mgr.create(str(repo1), "feature/wt1")
-    rec2 = mgr.create(str(repo2), "feature/wt2")
-
-    # Filtered to repo1 only.
-    filtered = fns["worktree_list"](repo_root=str(repo1))
-    assert len(filtered) == 1
-    assert filtered[0]["id"] == rec1.id
-
-    # Unfiltered returns both.
-    all_records = fns["worktree_list"]()
-    assert len(all_records) == 2
-    ids = {r["id"] for r in all_records}
-    assert rec1.id in ids
-    assert rec2.id in ids
-
-
-def test_tool_worktree_list_filter_resolves_subdir(tmp_path: Path):
-    """worktree_list filter uses Path.resolve() for comparison. A symlink
-    pointing directly at the repo root resolves to the same path as
-    record.repo_root and therefore matches. A plain subdirectory does NOT
-    match — the filter is an exact-path comparison after resolve(), not a
-    git-root traversal.
-
-    This test verifies the symlink case on platforms where symlinks are
-    available, and falls back to verifying the non-match case for plain
-    subdirectories.
-    """
-    repo = tmp_path / "src-repo"
-    repo.mkdir()
-    _git("init", "-q", "-b", "main", cwd=repo)
-    _git("config", "user.email", "test@example.com", cwd=repo)
-    _git("config", "user.name", "Test", cwd=repo)
-    (repo / "README.md").write_text("hello\n", encoding="utf-8")
-    _git("add", "-A", cwd=repo)
-    _git("commit", "-q", "-m", "init", cwd=repo)
-    # feature/wt is not the currently-checked-out branch.
-    _git("branch", "feature/wt", cwd=repo)
-
-    mgr, fns = _make_tool_fixtures(tmp_path)
-    rec = mgr.create(str(repo), "feature/wt")
-
-    # A plain subdirectory does NOT match (filter is exact path after resolve).
-    subdir = repo / "subdir"
-    subdir.mkdir()
-    filtered_subdir = fns["worktree_list"](repo_root=str(subdir))
-    assert filtered_subdir == [], (
-        "Plain subdirectory should not match; filter is exact-path, not git-root traversal"
-    )
-
-    # A symlink pointing at the repo root DOES match because resolve() follows
-    # the symlink to the same canonical path as record.repo_root.
-    symlink = tmp_path / "repo-symlink"
-    try:
-        symlink.symlink_to(repo, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        # Symlinks may require elevated privileges on Windows — skip that half.
-        return
-
-    filtered_sym = fns["worktree_list"](repo_root=str(symlink))
-    assert len(filtered_sym) == 1, (
-        f"Symlink pointing at repo root should match; got: {filtered_sym}"
-    )
-    assert filtered_sym[0]["id"] == rec.id
-
-
 # ---- Ticket #6: worktree_start and worktree_stop MCP tools ----
 
 
@@ -565,46 +433,48 @@ def _make_stopped_record(worktree_id: str = "wt-id") -> WorktreeRecord:
     )
 
 
-def test_worktree_start_stop_tools_registered(tmp_path: Path):
-    """Both worktree_start and worktree_stop must be registered as MCP tools."""
+def test_environment_start_stop_tools_registered(tmp_path: Path):
+    """Both environment_start and environment_stop must be registered as MCP tools."""
     mgr, fns = _make_tool_fixtures(tmp_path)
-    assert "worktree_start" in fns, "worktree_start not registered"
-    assert "worktree_stop" in fns, "worktree_stop not registered"
+    assert "environment_start" in fns, "environment_start not registered"
+    assert "environment_stop" in fns, "environment_stop not registered"
 
 
-def test_tool_worktree_start_returns_record(tmp_path: Path):
-    """Happy path: worktree_start returns a dict with status='running' and pids set."""
+def test_tool_environment_start_returns_record(tmp_path: Path):
+    """Happy path: environment_start returns a dict with status='running' and pids set."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_running_record()
     mgr.start = MagicMock(return_value=record)
 
-    result = fns["worktree_start"](worktree_id="wt-id")
+    result = fns["environment_start"](environment_id="wt-id")
 
     assert isinstance(result, dict)
     assert "error" not in result
     assert result["status"] == "running"
     assert result["pids"] == {"main": 12345}
-    mgr.start.assert_called_once_with("wt-id", role="main", env=None, cwd=None, variant="default")
+    mgr.start.assert_called_once_with(
+        "wt-id", checkout_path=None, role="main", env=None, cwd=None, variant="default"
+    )
 
 
-def test_tool_worktree_start_unknown_id_returns_soft_error(tmp_path: Path):
-    """worktree_start with an unknown id must return a soft-error dict, not raise."""
+def test_tool_environment_start_unknown_id_returns_soft_error(tmp_path: Path):
+    """environment_start with an unknown id must return a soft-error dict, not raise."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     mgr.start = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
 
-    result = fns["worktree_start"](worktree_id="wt-missing")
+    result = fns["environment_start"](environment_id="wt-missing")
 
     assert isinstance(result, dict)
     assert "error" in result
     assert "wt-missing" in result["error"]
 
 
-def test_tool_worktree_start_already_running_returns_soft_error(tmp_path: Path):
-    """worktree_start when already running must return soft-error dict, not raise."""
+def test_tool_environment_start_already_running_returns_soft_error(tmp_path: Path):
+    """environment_start when already running must return soft-error dict, not raise."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
@@ -612,57 +482,59 @@ def test_tool_worktree_start_already_running_returns_soft_error(tmp_path: Path):
         side_effect=ProcessAlreadyRunningError("wt-id", "main", 99)
     )
 
-    result = fns["worktree_start"](worktree_id="wt-id")
+    result = fns["environment_start"](environment_id="wt-id")
 
     assert isinstance(result, dict)
     assert "error" in result
     # Must not raise; soft error only.
 
 
-def test_tool_worktree_start_engine_error_raises_valueerror(tmp_path: Path):
-    """worktree_start on a generic ProcessLifecycleError must raise ValueError."""
+def test_tool_environment_start_engine_error_raises_valueerror(tmp_path: Path):
+    """environment_start on a generic ProcessLifecycleError must raise ValueError."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     mgr.start = MagicMock(side_effect=ProcessLifecycleError("engine failure"))
 
     with pytest.raises(ValueError):
-        fns["worktree_start"](worktree_id="wt-id")
+        fns["environment_start"](environment_id="wt-id")
 
 
-def test_tool_worktree_stop_returns_record(tmp_path: Path):
-    """Happy path: worktree_stop returns a dict with status='stopped'."""
+def test_tool_environment_stop_returns_record(tmp_path: Path):
+    """Happy path: environment_stop returns a dict with status='stopped'."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_stopped_record()
     mgr.stop = MagicMock(return_value=record)
 
-    result = fns["worktree_stop"](worktree_id="wt-id")
+    result = fns["environment_stop"](environment_id="wt-id")
 
     assert isinstance(result, dict)
     assert "error" not in result
     assert result["status"] == "stopped"
     assert result["pids"] == {}
-    mgr.stop.assert_called_once_with("wt-id", role="main", timeout=10.0, kill_orphans=False)
+    mgr.stop.assert_called_once_with(
+        "wt-id", checkout_path=None, role="main", timeout=10.0, kill_orphans=False
+    )
 
 
-def test_tool_worktree_stop_unknown_id_returns_soft_error(tmp_path: Path):
-    """worktree_stop with an unknown id must return a soft-error dict, not raise."""
+def test_tool_environment_stop_unknown_id_returns_soft_error(tmp_path: Path):
+    """environment_stop with an unknown id must return a soft-error dict, not raise."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     mgr.stop = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
 
-    result = fns["worktree_stop"](worktree_id="wt-missing")
+    result = fns["environment_stop"](environment_id="wt-missing")
 
     assert isinstance(result, dict)
     assert "error" in result
     assert "wt-missing" in result["error"]
 
 
-def test_tool_worktree_stop_not_running_returns_soft_error(tmp_path: Path):
-    """worktree_stop when no process is running must return soft-error dict, not raise."""
+def test_tool_environment_stop_not_running_returns_soft_error(tmp_path: Path):
+    """environment_stop when no process is running must return soft-error dict, not raise."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
@@ -670,26 +542,26 @@ def test_tool_worktree_stop_not_running_returns_soft_error(tmp_path: Path):
         side_effect=ProcessNotRunningError("wt-id", "main")
     )
 
-    result = fns["worktree_stop"](worktree_id="wt-id")
+    result = fns["environment_stop"](environment_id="wt-id")
 
     assert isinstance(result, dict)
     assert "error" in result
     # Must not raise; soft error only.
 
 
-def test_tool_worktree_stop_engine_error_raises_valueerror(tmp_path: Path):
-    """worktree_stop on a generic ProcessLifecycleError must raise ValueError."""
+def test_tool_environment_stop_engine_error_raises_valueerror(tmp_path: Path):
+    """environment_stop on a generic ProcessLifecycleError must raise ValueError."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     mgr.stop = MagicMock(side_effect=ProcessLifecycleError("engine failure"))
 
     with pytest.raises(ValueError):
-        fns["worktree_stop"](worktree_id="wt-id")
+        fns["environment_stop"](environment_id="wt-id")
 
 
-def test_tool_worktree_start_custom_role_and_cwd_forwarded(tmp_path: Path):
-    """worktree_start must forward custom role and cwd to manager.start (no cmd)."""
+def test_tool_environment_start_custom_role_and_cwd_forwarded(tmp_path: Path):
+    """environment_start must forward custom role and cwd to manager.start (no cmd)."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
@@ -699,16 +571,22 @@ def test_tool_worktree_start_custom_role_and_cwd_forwarded(tmp_path: Path):
     )
     mgr.start = MagicMock(return_value=record)
 
-    fns["worktree_start"](
-        worktree_id="wt-id",
+    fns["environment_start"](
+        environment_id="wt-id",
         role="worker",
         cwd="/custom/cwd",
     )
 
     call_args = mgr.start.call_args
-    # Only worktree_id as positional; role and cwd as kwargs; no cmd anywhere.
+    # Only the id as positional; checkout_path/role/cwd/variant as kwargs; no cmd anywhere.
     assert call_args.args == ("wt-id",)
-    assert call_args.kwargs == {"role": "worker", "env": None, "cwd": "/custom/cwd", "variant": "default"}
+    assert call_args.kwargs == {
+        "checkout_path": None,
+        "role": "worker",
+        "env": None,
+        "cwd": "/custom/cwd",
+        "variant": "default",
+    }
     # Confirm no command list was passed.
     all_args = list(call_args.args) + list(call_args.kwargs.values())
     assert not any(isinstance(a, list) for a in all_args), (
@@ -716,8 +594,8 @@ def test_tool_worktree_start_custom_role_and_cwd_forwarded(tmp_path: Path):
     )
 
 
-def test_tool_worktree_start_no_start_configured_raises_valueerror(tmp_path: Path):
-    """worktree_start raises ValueError when the contract has no start: command.
+def test_tool_environment_start_no_start_configured_raises_valueerror(tmp_path: Path):
+    """environment_start raises ValueError when the contract has no start: command.
 
     This is the regression test covering the config-error path that replaces
     the old caller-supplied-cmd path. The lib raises WorktreeError when the
@@ -734,70 +612,72 @@ def test_tool_worktree_start_no_start_configured_raises_valueerror(tmp_path: Pat
     )
 
     with pytest.raises(ValueError, match="no start: command configured"):
-        fns["worktree_start"](worktree_id="wt-id")
+        fns["environment_start"](environment_id="wt-id")
 
 
-def test_tool_worktree_stop_custom_role_and_timeout_forwarded(tmp_path: Path):
-    """worktree_stop must forward custom role and timeout to manager.stop."""
+def test_tool_environment_stop_custom_role_and_timeout_forwarded(tmp_path: Path):
+    """environment_stop must forward custom role and timeout to manager.stop."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_stopped_record()
     mgr.stop = MagicMock(return_value=record)
 
-    fns["worktree_stop"](worktree_id="wt-id", role="worker", timeout=5.0)
+    fns["environment_stop"](environment_id="wt-id", role="worker", timeout=5.0)
 
-    mgr.stop.assert_called_once_with("wt-id", role="worker", timeout=5.0, kill_orphans=False)
+    mgr.stop.assert_called_once_with(
+        "wt-id", checkout_path=None, role="worker", timeout=5.0, kill_orphans=False
+    )
 
 
-# ---- Ticket #51: worktree_start variant + env, worktree_stop kill_orphans ----
+# ---- Ticket #51: environment_start variant + env, environment_stop kill_orphans ----
 
 
-def test_tool_worktree_start_variant_forwarded(tmp_path: Path):
-    """worktree_start must forward variant='unity-gui' to manager.start."""
+def test_tool_environment_start_variant_forwarded(tmp_path: Path):
+    """environment_start must forward variant='unity-gui' to manager.start."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_running_record()
     mgr.start = MagicMock(return_value=record)
 
-    fns["worktree_start"](worktree_id="wt-id", variant="unity-gui")
+    fns["environment_start"](environment_id="wt-id", variant="unity-gui")
 
     call_args = mgr.start.call_args
     assert call_args.kwargs["variant"] == "unity-gui"
 
 
-def test_tool_worktree_start_env_forwarded(tmp_path: Path):
-    """worktree_start must forward env dict to manager.start."""
+def test_tool_environment_start_env_forwarded(tmp_path: Path):
+    """environment_start must forward env dict to manager.start."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_running_record()
     mgr.start = MagicMock(return_value=record)
 
-    fns["worktree_start"](worktree_id="wt-id", env={"K": "v"})
+    fns["environment_start"](environment_id="wt-id", env={"K": "v"})
 
     call_args = mgr.start.call_args
     assert call_args.kwargs["env"] == {"K": "v"}
 
 
-def test_tool_worktree_start_default_forwards_variant_and_env_explicitly(tmp_path: Path):
-    """Default worktree_start call must pass variant='default' and env=None explicitly."""
+def test_tool_environment_start_default_forwards_variant_and_env_explicitly(tmp_path: Path):
+    """Default environment_start call must pass variant='default' and env=None explicitly."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_running_record()
     mgr.start = MagicMock(return_value=record)
 
-    fns["worktree_start"](worktree_id="wt-id")
+    fns["environment_start"](environment_id="wt-id")
 
     call_args = mgr.start.call_args
     assert call_args.kwargs["variant"] == "default"
     assert call_args.kwargs["env"] is None
 
 
-def test_tool_worktree_start_unknown_variant_raises_valueerror(tmp_path: Path):
-    """worktree_start raises ValueError when manager raises WorktreeError for unknown variant."""
+def test_tool_environment_start_unknown_variant_raises_valueerror(tmp_path: Path):
+    """environment_start raises ValueError when manager raises WorktreeError for unknown variant."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
@@ -806,32 +686,32 @@ def test_tool_worktree_start_unknown_variant_raises_valueerror(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="no start: step named 'bogus'"):
-        fns["worktree_start"](worktree_id="wt-id", variant="bogus")
+        fns["environment_start"](environment_id="wt-id", variant="bogus")
 
 
-def test_tool_worktree_stop_kill_orphans_forwarded(tmp_path: Path):
-    """worktree_stop with kill_orphans=True must forward that flag to manager.stop."""
+def test_tool_environment_stop_kill_orphans_forwarded(tmp_path: Path):
+    """environment_stop with kill_orphans=True must forward that flag to manager.stop."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_stopped_record()
     mgr.stop = MagicMock(return_value=record)
 
-    fns["worktree_stop"](worktree_id="wt-id", kill_orphans=True)
+    fns["environment_stop"](environment_id="wt-id", kill_orphans=True)
 
     call_args = mgr.stop.call_args
     assert call_args.kwargs["kill_orphans"] is True
 
 
-def test_tool_worktree_stop_default_forwards_kill_orphans_false(tmp_path: Path):
-    """Default worktree_stop call must pass kill_orphans=False explicitly."""
+def test_tool_environment_stop_default_forwards_kill_orphans_false(tmp_path: Path):
+    """Default environment_stop call must pass kill_orphans=False explicitly."""
     from unittest.mock import MagicMock
 
     mgr, fns = _make_tool_fixtures(tmp_path)
     record = _make_stopped_record()
     mgr.stop = MagicMock(return_value=record)
 
-    fns["worktree_stop"](worktree_id="wt-id")
+    fns["environment_stop"](environment_id="wt-id")
 
     call_args = mgr.stop.call_args
     assert call_args.kwargs["kill_orphans"] is False
@@ -864,7 +744,7 @@ def test_tool_worktree_remove_kill_blocking_processes_forwarded(tmp_path: Path):
     record = _make_removed_record()
     mgr.remove = MagicMock(return_value=record)
 
-    fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+    fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
 
     mgr.remove.assert_called_once_with(
         "wt-id", force=False, kill_blocking_processes=True
@@ -880,7 +760,7 @@ def test_tool_worktree_remove_default_kill_false_forwarded(tmp_path: Path):
     record = _make_removed_record()
     mgr.remove = MagicMock(return_value=record)
 
-    fns["worktree_remove"](worktree_id="wt-id")
+    fns["worktree_remove"](environment_id="wt-id")
 
     mgr.remove.assert_called_once_with(
         "wt-id", force=False, kill_blocking_processes=False
@@ -897,7 +777,7 @@ def test_tool_worktree_remove_killed_pids_in_response(tmp_path: Path):
     record = _make_removed_record(killed_pids=killed)
     mgr.remove = MagicMock(return_value=record)
 
-    result = fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+    result = fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
 
     assert isinstance(result, dict)
     assert "error" not in result
@@ -918,7 +798,7 @@ def test_tool_worktree_remove_default_empty_killed_pids(tmp_path: Path):
     record = _make_removed_record(killed_pids=[])
     mgr.remove = MagicMock(return_value=record)
 
-    result = fns["worktree_remove"](worktree_id="wt-id")
+    result = fns["worktree_remove"](environment_id="wt-id")
 
     assert isinstance(result, dict)
     assert "error" not in result
@@ -937,7 +817,7 @@ def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
     )
 
     with pytest.raises(ValueError):
-        fns["worktree_remove"](worktree_id="wt-id", kill_blocking_processes=True)
+        fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
 
 
 def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
@@ -949,7 +829,7 @@ def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
     mgr.remove = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
 
     result = fns["worktree_remove"](
-        worktree_id="wt-missing", kill_blocking_processes=True
+        environment_id="wt-missing", kill_blocking_processes=True
     )
 
     assert isinstance(result, dict)
@@ -974,7 +854,7 @@ def test_tool_worktree_remove_teardown_before_remove_wrapper_contract(tmp_path: 
     record = _make_removed_record(worktree_id="wt-48")
     mgr.remove = MagicMock(return_value=record)
 
-    result = fns["worktree_remove"](worktree_id="wt-48")
+    result = fns["worktree_remove"](environment_id="wt-48")
 
     # Must return a plain dict without an 'error' key.
     assert isinstance(result, dict)
@@ -1003,7 +883,7 @@ def test_tool_worktree_remove_teardown_before_remove_force_forwarded(tmp_path: P
     record = _make_removed_record(worktree_id="wt-48-force")
     mgr.remove = MagicMock(return_value=record)
 
-    result = fns["worktree_remove"](worktree_id="wt-48-force", force=True)
+    result = fns["worktree_remove"](environment_id="wt-48-force", force=True)
 
     # Call contract: force=True forwarded correctly.
     mgr.remove.assert_called_once_with(
@@ -1024,7 +904,7 @@ def test_tool_worktree_remove_teardown_before_remove_not_found_soft_error(tmp_pa
     mgr, fns = _make_tool_fixtures(tmp_path)
     mgr.remove = MagicMock(side_effect=WorktreeNotFoundError("wt-48-missing"))
 
-    result = fns["worktree_remove"](worktree_id="wt-48-missing")
+    result = fns["worktree_remove"](environment_id="wt-48-missing")
 
     assert isinstance(result, dict)
     assert "error" in result
@@ -1145,21 +1025,24 @@ def test_worktree_create_contract_copy_error_uses_forward_slashes(
 
 def test_id_instability_caution_prominent_in_docstrings(tmp_path: Path):
     """The 'id is not stable across remove/re-create cycles' caveat must be
-    surfaced as a prominent standalone CAUTION callout in both
-    worktree_create and worktree_get docstrings, not buried in a trailing
-    clause of the id-pattern bullet."""
+    surfaced as a prominent standalone CAUTION callout in worktree_create's
+    docstring, pointing callers at environment_list to re-fetch the current
+    id -- not at the removed worktree_get tool."""
     mgr, fns = _make_tool_fixtures(tmp_path)
 
-    for name in ("worktree_create", "worktree_get"):
-        doc = fns[name].__doc__ or ""
-        assert "CAUTION:" in doc, f"{name} docstring missing prominent CAUTION callout"
-        assert "not stable" in doc.lower(), (
-            f"{name} docstring missing 'not stable' caveat text"
-        )
-        assert "worktree_list" in doc and "worktree_get" in doc, (
-            f"{name} docstring should direct callers to re-fetch the current "
-            "id via worktree_list/worktree_get"
-        )
+    doc = fns["worktree_create"].__doc__ or ""
+    assert "CAUTION:" in doc, "worktree_create docstring missing prominent CAUTION callout"
+    assert "not stable" in doc.lower(), (
+        "worktree_create docstring missing 'not stable' caveat text"
+    )
+    assert "environment_list" in doc, (
+        "worktree_create docstring should direct callers to re-fetch the "
+        "current id via environment_list"
+    )
+    assert "worktree_get" not in doc, (
+        "worktree_create docstring must no longer reference the removed "
+        "worktree_get tool"
+    )
 
 
 # ---- Ticket #60: env passthrough and variant selection verification ----
@@ -1172,7 +1055,7 @@ def _write_contract(path: Path, content: str) -> None:
     (seretos / "worktree-setup.yml").write_text(content, encoding="utf-8")
 
 
-def test_tool_worktree_start_env_vars_reach_child(tmp_path: Path):
+def test_tool_environment_start_env_vars_reach_child(tmp_path: Path):
     """Verify that _lifecycle_start receives WORKTREE_* env vars built from
     the WorktreeRecord (id, path, and port slots) when worktree_start is called.
 
@@ -1216,7 +1099,7 @@ def test_tool_worktree_start_env_vars_reach_child(tmp_path: Path):
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
 
     captured: dict = {}
 
@@ -1231,7 +1114,7 @@ def test_tool_worktree_start_env_vars_reach_child(tmp_path: Path):
         "lib_python_worktree.core.manager._lifecycle_start",
         side_effect=_fake_lifecycle_start,
     ):
-        fn(worktree_id=worktree_id)
+        fn(environment_id=worktree_id)
 
     assert "env" in captured, "_lifecycle_start was not called"
     env = captured["env"]
@@ -1249,7 +1132,7 @@ def test_tool_worktree_start_env_vars_reach_child(tmp_path: Path):
     )
 
 
-def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
+def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
     """Verify that passing variant='worker' to worktree_start causes _lifecycle_start
     to receive a cmd that references start-worker.sh and not start-web.sh.
 
@@ -1295,7 +1178,7 @@ def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
 
     captured: dict = {}
 
@@ -1309,7 +1192,7 @@ def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
         "lib_python_worktree.core.manager._lifecycle_start",
         side_effect=_fake_lifecycle_start,
     ):
-        fn(worktree_id=worktree_id, variant="worker")
+        fn(environment_id=worktree_id, variant="worker")
 
     assert "cmd" in captured, "_lifecycle_start was not called"
     cmd_str = " ".join(captured["cmd"])
@@ -1324,7 +1207,7 @@ def test_tool_worktree_start_variant_selects_correct_step(tmp_path: Path):
 # ---- Ticket #93: default cwd falls back to the worktree path ----
 
 
-def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: Path):
+def test_tool_environment_start_default_cwd_falls_back_to_worktree_path(tmp_path: Path):
     """Omitting ``cwd`` must not silently forward ``cwd=None`` to the OS spawn
     call (which makes the child inherit the host's directory instead of the
     worktree on Windows). The engine is responsible for defaulting ``cwd`` to
@@ -1366,7 +1249,7 @@ def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: P
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
 
     captured: dict = {}
 
@@ -1391,7 +1274,7 @@ def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: P
         "lib_python_worktree.core.process_lifecycle._spawn_detached",
         side_effect=_fake_spawn,
     ):
-        fn(worktree_id=worktree_id)
+        fn(environment_id=worktree_id)
 
     assert captured["cwd"] == str(wt_path), (
         f"Expected omitted cwd to default to the worktree path {str(wt_path)!r}, "
@@ -1406,7 +1289,7 @@ def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: P
         "lib_python_worktree.core.process_lifecycle._spawn_detached",
         side_effect=_fake_spawn,
     ):
-        fn(worktree_id=worktree_id, role="secondary", cwd=str(explicit_dir))
+        fn(environment_id=worktree_id, role="secondary", cwd=str(explicit_dir))
 
     assert captured["cwd"] == str(explicit_dir), (
         f"Expected explicit cwd {str(explicit_dir)!r} to pass through unchanged, "
@@ -1414,7 +1297,7 @@ def test_tool_worktree_start_default_cwd_falls_back_to_worktree_path(tmp_path: P
     )
 
 
-def test_tool_worktree_start_surfaces_start_log_path(tmp_path: Path):
+def test_tool_environment_start_surfaces_start_log_path(tmp_path: Path):
     """The engine's ``start_log_path`` diagnostic field (path to the captured
     startup log for the spawned process) must flow through to the tool's
     response dict so callers can inspect it when a process exits immediately.
@@ -1452,97 +1335,14 @@ def test_tool_worktree_start_surfaces_start_log_path(tmp_path: Path):
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
 
     with patch.object(mgr, "start", return_value=record):
-        result = fn(worktree_id=worktree_id)
+        result = fn(environment_id=worktree_id)
 
     assert result.get("start_log_path") == "/logs/start-main.log", (
         f"Expected start_log_path to flow through to the response dict, "
         f"got {result.get('start_log_path')!r}"
-    )
-
-
-# ---- Ticket #60: worktree_get setup_status enrichment ----
-
-
-@pytest.mark.parametrize(
-    "status,expected_setup_status",
-    [
-        ("running", "running"),
-        ("ready", "ready"),
-        ("stopped", "unknown"),
-        ("created", "unknown"),
-        ("setup_failed", "failed"),
-    ],
-)
-def test_worktree_get_setup_status_derived_from_status(
-    tmp_path: Path, status: str, expected_setup_status: str
-):
-    """worktree_get must derive setup_status from the record's status field.
-
-    Covers: running->running, ready->ready, stopped->unknown, created->unknown, setup_failed->failed.
-    """
-    from mcp.server.fastmcp import FastMCP
-    from worktree_plugin.tools.worktree import register
-
-    store_root = tmp_path / "store"
-    state = InMemoryStateStore()
-    record = WorktreeRecord(
-        id="wt-get-status-test",
-        repo_root="/r",
-        branch="b",
-        path="/p",
-        status=status,
-    )
-    state.add(record)
-
-    mgr = WorktreeManager(
-        config=ManagerConfig(store_root=store_root),
-        state=state,
-    )
-    mcp = FastMCP("test")
-    register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_get"].fn
-
-    result = fn(worktree_id="wt-get-status-test")
-
-    assert "error" not in result, f"Unexpected error: {result}"
-    assert result.get("setup_status") == expected_setup_status, (
-        f"For status={status!r}: expected setup_status={expected_setup_status!r}, "
-        f"got {result.get('setup_status')!r}"
-    )
-
-
-def test_worktree_get_setup_status_present_in_result(tmp_path: Path):
-    """setup_status key must always be present in the worktree_get result dict
-    (not absent for any record, regardless of status value)."""
-    from mcp.server.fastmcp import FastMCP
-    from worktree_plugin.tools.worktree import register
-
-    store_root = tmp_path / "store"
-    state = InMemoryStateStore()
-    record = WorktreeRecord(
-        id="wt-always-has-setup-status",
-        repo_root="/r",
-        branch="b",
-        path="/p",
-        status="created",
-    )
-    state.add(record)
-
-    mgr = WorktreeManager(
-        config=ManagerConfig(store_root=store_root),
-        state=state,
-    )
-    mcp = FastMCP("test")
-    register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_get"].fn
-
-    result = fn(worktree_id="wt-always-has-setup-status")
-
-    assert "setup_status" in result, (
-        f"'setup_status' key missing from worktree_get result: {result!r}"
     )
 
 
@@ -1876,7 +1676,7 @@ def test_worktree_start_docstring_documents_step_schema():
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
     doc = fn.__doc__ or ""
 
     assert "run:" in doc, "worktree_start docstring must document the `run:` step key"
@@ -1906,7 +1706,7 @@ def test_worktree_stop_docstring_documents_step_schema():
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_stop"].fn
+    fn = mcp._tool_manager._tools["environment_stop"].fn
     doc = fn.__doc__ or ""
 
     assert "run:" in doc, "worktree_stop docstring must document the `run:` step key"
@@ -1946,7 +1746,7 @@ def test_worktree_start_docstring_documents_repo_root_contract_location():
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
     doc = fn.__doc__ or ""
 
     assert "inside the worktree" not in doc, (
@@ -1981,7 +1781,7 @@ def test_worktree_start_docstring_shows_version_and_isolation():
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_start"].fn
+    fn = mcp._tool_manager._tools["environment_start"].fn
     doc = fn.__doc__ or ""
 
     assert "version:" in doc, "worktree_start docstring must show the required version: key"
@@ -2014,7 +1814,7 @@ def test_worktree_stop_docstring_documents_repo_root_contract_location():
     )
     mcp = FastMCP("test")
     register(mcp, mgr)
-    fn = mcp._tool_manager._tools["worktree_stop"].fn
+    fn = mcp._tool_manager._tools["environment_stop"].fn
     doc = fn.__doc__ or ""
 
     assert "repo_root" in doc, (
