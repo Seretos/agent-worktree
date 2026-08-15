@@ -7,7 +7,7 @@ lifecycle — so multiple agents can work in parallel without stepping on each o
 - **Isolated worktrees on demand** — create a fresh git worktree per task or agent from a declarative `.seretos/worktree-setup.yml` contract.
 - **Per-worktree MCP servers** — each worktree runs its own server instances, so agents don't share state.
 - **Automatic port allocation** — parallel worktrees get non-colliding ports.
-- **Full lifecycle management** — create, list, get, and remove worktrees through MCP tools.
+- **Full lifecycle management** — create and remove worktree checkouts, and list, start, and stop their environments, through MCP tools.
 - **Built for parallel agents** — purpose-built so a fleet of agents can work the same repo at once.
 
 ## Typical uses

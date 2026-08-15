@@ -10,36 +10,55 @@ description: Teaches the agent-worktree MCP contract (.seretos/worktree-setup.ym
 Reach for this skill when the task involves **git worktree lifecycle management** via
 the `agent-worktree` MCP server — creating an isolated checkout for parallel work,
 authoring or debugging a `.seretos/worktree-setup.yml` contract, deciding between
-`isolation: none` and `isolation: full`, starting/stopping a per-worktree process, or
+`isolation: none` and `isolation: full`, starting/stopping a per-environment process, or
 troubleshooting a failed setup script, a leaked port, a Windows directory lock, or an
 orphaned worktree left on disk.
 
 ## Mental model
 
-Every managed worktree is driven by a single contract file:
+Ticket #99 split this server's tool surface along the two real lifecycles a checkout
+goes through, and everything below is organized around that split:
+
+- **Checkout lifecycle** — a *checkout* is a directory: a git worktree on disk (or the
+  repo's own primary/main clone). `worktree_create`/`worktree_remove` create and delete
+  that directory.
+- **Environment lifecycle** — an *environment* is a process-bearing checkout: the same
+  directory, plus whatever `start:`-launched process is (or isn't) currently running
+  against it. `environment_list`/`environment_start`/`environment_stop` manage that
+  process, against **any** checkout.
+
+**The primary/main clone is an environment like any other.** It is never created or
+deleted by this plugin (it exists before the plugin ever runs, and `worktree_remove`
+structurally refuses to delete it — see Pitfall 5 below), but its process lifecycle is
+managed exactly the same way as a linked worktree's: `environment_start`/
+`environment_stop` work against it too. This matters for anything that runs a
+long-lived process directly in the main checkout (a dev server, a watcher) — you no
+longer need a disposable worktree just to get MCP-managed start/stop for it.
+
+Every managed checkout is driven by a single contract file:
 
 ```
 <repo_root>/.seretos/worktree-setup.yml
 ```
 
 **Critical:** the engine reads this file from `repo_root` — the original repository
-clone the worktree was created from — **not** from the worktree checkout itself.
-`worktree_create` copies `.seretos/` into the new worktree as a create-time convenience
-(so it is visible from inside the checkout), but that copy is *not* what
-`worktree_start`/`worktree_stop` actually read. Placing the contract only in the
-worktree checkout, and never at `<repo_root>/.seretos/worktree-setup.yml`, produces a
-silent no-op — `worktree_start` returns `{"status": "ready", "pids": {}}` with no error,
-indistinguishable from "no contract configured" (issue #87).
+clone every checkout (primary or linked) traces back to — **not** from a linked
+worktree's own copy. `worktree_create` copies `.seretos/` into a new worktree as a
+create-time convenience (so it is visible from inside the checkout), but that copy is
+*not* what `environment_start`/`environment_stop` actually read. Placing the contract
+only in a worktree checkout, and never at `<repo_root>/.seretos/worktree-setup.yml`,
+produces a silent no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
+with no error, indistinguishable from "no contract configured" (issue #87).
 
 The contract declares up to five lifecycle hooks, each fired by a distinct MCP tool:
 
 | Hook | Fired by | When |
 |---|---|---|
 | `setup:` | `worktree_create` | Once, right after the checkout is created |
-| `start:` | `worktree_start` | On demand, to launch a long-running process |
-| `stop:` | `worktree_stop` | On demand, before the process is signalled to exit |
+| `start:` | `environment_start` | On demand, to launch a long-running process |
+| `stop:` | `environment_stop` | On demand, before the process is signalled to exit |
 | `teardown:` | `worktree_remove` | Before the worktree directory is deleted |
-| `ports:` | (reservation only) | Declares named ports the worktree's services bind to |
+| `ports:` | (reservation only) | Declares named ports the environment's services bind to |
 
 ## The contract: `.seretos/worktree-setup.yml`
 
@@ -52,13 +71,13 @@ Each step under `setup:`, `start:`, `stop:`, or `teardown:` is a YAML mapping wi
 
 - `run:` — **required**, the shell command to execute.
 - `name:` — optional; for `start:`/`stop:` steps this selects the step via
-  `worktree_start`'s `variant` parameter (a single unnamed step is the implicit
+  `environment_start`'s `variant` parameter (a single unnamed step is the implicit
   `"default"` variant, for back-compat).
 - `shell:` — optional override of the shell used to run the step.
 
-`worktree_start` supports multiple **named** `start:` variants — pass the step's `name`
-as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch). An
-unknown variant raises a `ValueError` listing the available names.
+`environment_start` supports multiple **named** `start:` variants — pass the step's
+`name` as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch).
+An unknown variant raises a `ValueError` listing the available names.
 
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
@@ -101,37 +120,76 @@ A missing contract file, or an empty one, is treated as an implicit
 
 ## Tool inventory
 
-Six MCP tools, all under the `worktree` server:
+Five MCP tools, all under the `worktree` server, split by lifecycle:
+
+**Checkout lifecycle** (create/delete the directory):
 
 | Tool | Best for |
 |---|---|
 | `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience |
-| `worktree_list` | Enumerate tracked worktrees, optionally filtered by `repo_root` |
-| `worktree_get` | Fetch a single worktree's record (including `setup_status`) without side effects |
-| `worktree_start` | Launch a named `start:` variant as a tracked, detached process |
-| `worktree_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process |
-| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; supports `force` and `kill_blocking_processes` |
+| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; supports `force` and `kill_blocking_processes`. Structurally refuses to delete a primary checkout, even with `force=True` |
+
+**Environment lifecycle** (the process running against any checkout, primary included):
+
+| Tool | Best for |
+|---|---|
+| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status`; `scope="all"` fans out across every tracked repo |
+| `environment_start` | Launch a named `start:` variant as a tracked, detached process, against any checkout |
+| `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout |
+
+## Addressing an environment
+
+`environment_start` and `environment_stop` each accept two ways to name their target —
+pass one or the other (or both, if they agree):
+
+- **`environment_id`** — the normal way. Use the id `worktree_create` returned for a
+  linked worktree, or the id `environment_list`/a prior `environment_start` call
+  returned for the primary (once materialised).
+- **`checkout_path`** — the cold-start/primary way. This is the *only* way to start the
+  primary/main clone's environment before it has ever been started. A primary's id is
+  `primary_id_for(repo_root)` — a one-way SHA-256 hash of the repo root — so nothing
+  persisted maps that hash back to a path until the first successful
+  `environment_start()` call writes the record. Pass the repo root (or any path inside
+  it) as `checkout_path` instead, and the engine resolves (and, for the primary,
+  materialises) the target.
+
+Passing both is fine only when they agree — a mismatch raises `ValueError` from the
+engine's `CheckoutTargetError`. Passing neither also raises `ValueError`. This
+resolution is entirely the *engine's* job, not the MCP wrapper's — the wrapper performs
+no validation of the pair itself.
+
+> **Spec-gap note (ticket #99).** The ticket's originally-specified surface is
+> id-only. That cannot satisfy the ticket's own AC1 — cold-starting a primary that has
+> never been started is structurally impossible with an id-only signature, for the
+> one-way-hash reason above. `checkout_path` is a strict superset: every id-only call
+> keeps working unchanged, and it is the only way to reach a never-started primary.
+> This deviation is intentional and documented here, in `AGENTS.md`, and in the tool
+> docstrings themselves — the ticket calls the id-only surface final, so the deviation
+> is called out explicitly rather than left silent.
 
 ## Lifecycle
 
 ```
-worktree_create  →  setup: runs automatically
+worktree_create     →  setup: runs automatically
       │
       ▼
-worktree_start   →  start: <variant> launches a tracked process (optional; skip if no long-running process is needed)
+environment_start   →  start: <variant> launches a tracked process (optional; skip if no long-running process is needed)
       │
       ▼
    ...work...
       │
       ▼
-worktree_stop    →  stop: steps run best-effort, then the process is terminated
+environment_stop    →  stop: steps run best-effort, then the process is terminated
       │
       ▼
-worktree_remove  →  teardown: steps run, then the checkout is deleted
+worktree_remove     →  teardown: steps run, then the checkout is deleted
 ```
 
-`worktree_start`/`worktree_stop` are optional — many tickets only need
+`environment_start`/`environment_stop` are optional — many tickets only need
 `worktree_create` → work → `worktree_remove`, with no long-running process involved.
+The primary/main clone skips the top and bottom of this diagram entirely (it is never
+created or removed by this plugin) but can still be driven through the middle via
+`environment_start(checkout_path=...)` / `environment_stop(...)`.
 
 ## When to reach for a worktree (the gate)
 
@@ -147,7 +205,9 @@ Use a worktree when:
 
 Skip it for a **single-branch, quick edit** on the checkout you already have open —
 spinning up a worktree adds create/teardown overhead with no isolation benefit when
-there is no concurrent work to isolate from.
+there is no concurrent work to isolate from. If you just need a managed process against
+the checkout you already have (no isolation needed), `environment_start` against the
+primary via `checkout_path` gets you that without a worktree at all.
 
 ## Troubleshooting
 
@@ -160,10 +220,11 @@ that the contract file exists at the repository root (not only inside the worktr
 
 **Port leak after crash / restart**
 
-The server's in-memory state does not survive a restart — after restarting,
-`worktree_list` returns empty and `worktree_remove` becomes a no-op for previously
-tracked worktrees. If an OS port remains bound after a crash, resolve it at the OS
-level: identify the process holding the port (`netstat -ano | findstr <port>` on
+State is persistent and disk-backed (`~/.agent-worktree/state.yaml`) and is reconciled
+on startup, so a crash does not simply forget tracked environments the way pure
+in-memory tracking would. If an OS port nonetheless remains bound after a crash
+(process did not exit cleanly and reconciliation could not recover it), resolve it at
+the OS level: identify the process holding the port (`netstat -ano | findstr <port>` on
 Windows, `lsof -i :<port>` on Linux) and terminate it directly.
 
 **Worktree directory locked by a foreign process (Windows)**
@@ -182,22 +243,33 @@ resolve the remaining lock at the OS level and retry.
 
 **Orphan worktree recovery**
 
-Call `worktree_get <id>` first to inspect the record. If it is safe to discard, call
+Call `environment_list(path=<repo_root>)` first to inspect the records for that repo
+(look for the entry with the id you're chasing). If it is safe to discard, call
 `worktree_remove <id> force=true` to remove it even though it contains uncommitted
 changes.
 
 ## Pitfalls
 
 1. **Contract in the wrong location is a silent no-op.** The engine reads
-   `<repo_root>/.seretos/worktree-setup.yml`, not the worktree checkout's copy. A
+   `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's copy. A
    contract placed only in the worktree checkout produces no error — just an
    indistinguishable-from-unconfigured `{"status": "ready", "pids": {}}` response.
 2. **`isolation: none` forbids every block.** Adding `setup:`, `start:`, `stop:`,
    `teardown:`, or `ports:` under `isolation: none` raises `ContractValidationError` —
    switch to `isolation: full` first.
-3. **In-memory tracking state does not survive a server restart.** Don't rely on
-   `worktree_list`/`worktree_remove` to recover state after a crash; resolve leaked OS
-   resources (ports, processes) directly at the OS level instead.
+3. **State survives a restart, but OS-level resources might not.** `state.yaml` is
+   disk-backed and reconciled on startup; don't assume a crash silently wipes tracked
+   environments the way pure in-memory tracking would, but do still verify leaked OS
+   resources (ports, processes) directly at the OS level if reconciliation couldn't
+   recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
    `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
    fighting the lock manually.
+5. **A primary checkout can never be removed, even with `force=True`.** `worktree_remove`
+   against a primary/main clone's `environment_id` always raises `ValueError` — this is
+   a structural refusal checked before any teardown work runs, not a safety flag you can
+   override. It exists because a primary checkout IS the repo; there is no "linked
+   worktree" fallback semantics to fall back on.
+6. **`environment_id` and `checkout_path` are two names for the same resolution, not
+   two independent filters.** Passing both only works when they agree; a mismatch is a
+   hard `ValueError` from the engine, not a "prefer one over the other" merge.

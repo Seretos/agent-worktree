@@ -4,7 +4,7 @@ MCP server for git worktree lifecycle management. Create/list/remove worktrees w
 
 ## What it does
 
-A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Ships as a self-contained frozen binary — no Python needed on the host. Manages git worktree lifecycle (create, list, get, remove, start, stop) via six MCP tools.
+A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Ships as a self-contained frozen binary — no Python needed on the host. Five MCP tools split along the two real lifecycles a checkout goes through: checkout lifecycle (`worktree_create`, `worktree_remove` — create/delete the directory) and environment lifecycle (`environment_list`, `environment_start`, `environment_stop` — the process running against any checkout, the primary/main clone included). See `AGENTS.md` for the full tool reference.
 
 ## Quickstart
 
@@ -28,7 +28,7 @@ A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib
    setup:
      - run: npm install
    ```
-   An `isolation: none` contract is simply `version: 1` + `isolation: none` with no `setup:`, `teardown:`, or `ports:` blocks. Optional `start:`/`stop:` steps (used by `worktree_start`/`worktree_stop`) follow the same per-step shape — a required `run:` (the shell command) and an optional `name:` (selects the step via `worktree_start`'s `variant` parameter):
+   An `isolation: none` contract is simply `version: 1` + `isolation: none` with no `setup:`, `teardown:`, or `ports:` blocks. Optional `start:`/`stop:` steps (used by `environment_start`/`environment_stop`) follow the same per-step shape — a required `run:` (the shell command) and an optional `name:` (selects the step via `environment_start`'s `variant` parameter):
    ```yaml
    start:
      - name: web
@@ -97,7 +97,7 @@ The executed command comes from the `setup:` steps defined in `.seretos/worktree
 
 **Port leak after crash / restart**
 
-The server's in-memory state does not survive a restart — after restarting, `worktree_list` returns empty and `worktree_remove` is a no-op. In-memory tracking is therefore already cleared. If an OS port remains bound after a crash (process did not exit cleanly), resolve it at the OS level: identify the process holding the port (e.g. `netstat -ano | findstr <port>` on Windows, `lsof -i :<port>` on Linux) and terminate it.
+State is persistent and disk-backed (`~/.agent-worktree/state.yaml`), reconciled on startup. If an OS port nonetheless remains bound after a crash (process did not exit cleanly and reconciliation could not recover it), resolve it at the OS level: identify the process holding the port (e.g. `netstat -ano | findstr <port>` on Windows, `lsof -i :<port>` on Linux) and terminate it.
 
 **Worktree directory locked by a foreign process (Windows)**
 
@@ -111,4 +111,4 @@ The response's `killed_pids` field lists every process that was terminated (pid,
 
 **Orphan worktree on disk**
 
-Call `worktree_get <id>` to inspect the record first. If the worktree is safe to discard, call `worktree_remove <id> force=true` to remove it even if it contains uncommitted changes.
+Call `environment_list(path=<repo_root>)` to inspect the record first (find the entry with the id you're chasing). If the worktree is safe to discard, call `worktree_remove <id> force=true` to remove it even if it contains uncommitted changes.

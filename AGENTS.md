@@ -10,7 +10,19 @@ Concretely: any *"where is X defined / what does the code support / which Y exis
 
 ## Tool reference
 
-### worktree_create
+Ticket #99 splits the six original tools into a five-tool surface along the
+two real lifecycles a checkout goes through: **checkout lifecycle**
+(`worktree_create` / `worktree_remove` — create or delete the directory) and
+**environment lifecycle** (`environment_list` / `environment_start` /
+`environment_stop` — the process running against *any* checkout, the
+repo's own primary/main clone included). This is a hard,
+non-backward-compatible break: the previous unfiltered listing tool, the
+single-record lookup tool, and the id-only process-start/process-stop
+tools no longer exist — there is no alias and no deprecation window.
+
+### Checkout lifecycle
+
+#### worktree_create
 
 ```
 worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
@@ -24,7 +36,7 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 
 **Returns** the canonical worktree record dict. Fields of note:
 
-- `id` — follows the pattern `<repo-slug>-<branch-slug>-<8-hex>` where slugs are lower-case ASCII with non-alphanumeric runs collapsed to `-`; ids are not stable across remove/re-create cycles.
+- `id` — follows the pattern `<repo-slug>-<branch-slug>-<8-hex>` where slugs are lower-case ASCII with non-alphanumeric runs collapsed to `-`; ids are not stable across remove/re-create cycles. Re-fetch the current id via `environment_list`, never cache one across a remove + re-create cycle.
 - `path` — absolute checkout location under `<store_root>/<repo_slug>/<id>/` where `store_root` defaults to `~/agent-worktree-store` or the value of `$WORKTREE_STORE_ROOT`.
 - `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
 - `warning` (optional) — present when `repo_root` was silently re-rooted; contains the original and resolved paths.
@@ -33,114 +45,124 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 
 ---
 
-### worktree_list
+#### worktree_remove
 
 ```
-worktree_list(repo_root: Optional[str] = None) -> list[dict]
+worktree_remove(environment_id: str, force: bool = False, kill_blocking_processes: bool = False) -> dict
 ```
+
+Deliberately **id-only** — unlike the environment-lifecycle tools below, there is no `checkout_path` parameter. Removing the primary/main clone is never allowed regardless of how it might be addressed, so there is no cold-start case to support here.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `repo_root` | `str` | No | When provided, only worktrees whose `repo_root` resolves to the same directory are returned (resolved via `Path.resolve()` before comparison). Omit to return all worktrees across all repos. |
-
-**Returns** a list of canonical worktree record dicts. Each entry mirrors a `WorktreeRecord`. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
-
-**Note:** state is persistent and disk-backed (`~/.agent-worktree/state.yaml`); it survives server restarts and is reconciled on startup.
-
----
-
-### worktree_remove
-
-```
-worktree_remove(worktree_id: str, force: bool = False, kill_blocking_processes: bool = False) -> dict
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `worktree_id` | `str` | Yes | The id of the worktree to remove (as returned by `worktree_create` or `worktree_list`). |
+| `environment_id` | `str` | Yes | The id of the checkout to remove (as returned by `worktree_create` or `environment_list`). |
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
 | `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
 
 **Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs. The response also includes a `killed_pids` list (may be empty); each entry is a dict with `pid` (int), `name` (str), and `cmdline` (list of str) describing a process that was terminated to unblock removal.
 
-**Soft error:** if `worktree_id` is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition.
+**Soft error:** if `environment_id` is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition.
 
 **Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
 
+**Primary refusal (hard, non-`force`-able):** attempting to remove the primary/main clone's environment — even with `force=True` — raises `ValueError`. This is checked before any teardown work runs and can never be bypassed: a primary checkout IS the repo, so deleting it would be catastrophic. The raised message includes the engine's own text plus an explicit `backing: "primary"` token.
+
 ---
 
-### worktree_start
+### Environment lifecycle
+
+`environment_list`, `environment_start`, and `environment_stop` operate against **any** checkout — a linked worktree or the repo's own primary/main clone. The primary is an environment like any other; it is simply never created or deleted by this plugin (it already exists before the plugin runs, and `worktree_remove` refuses to delete it — see above).
+
+#### Addressing an environment
+
+Every environment is addressed by one or both of:
+
+- **`environment_id`** — the normal way. Use the id returned by `worktree_create` (a linked worktree) or by `environment_list` / a prior `environment_start` call (the primary, once materialised).
+- **`checkout_path`** — the cold-start/primary way. This is the *only* way to start the primary/main clone's environment before it has ever been started. A primary's id, `primary_id_for(repo_root)`, is a one-way SHA-256 hash of the repo root — before the first successful `environment_start()` call, nothing persisted maps that hash back to a path, so id-only addressing cannot cold-start it. Pass the repo root (or any path inside it) as `checkout_path` and the engine resolves and, if needed, materialises the primary's record — this is the **only** place a primary record is ever written.
+
+`environment_start` and `environment_stop` both accept `environment_id: Optional[str] = None` and `checkout_path: Optional[str] = None`; neither is schema-required, but the *engine* (not the MCP wrapper) enforces the resolution: passing both is fine only when they agree — a mismatch raises `ValueError` (from the engine's `CheckoutTargetError`) — and passing neither also raises `ValueError`. The wrapper performs no validation of the `(environment_id, checkout_path)` pair itself; every combination is forwarded straight through to the engine.
+
+> **Deliberate, documented deviation from ticket #99.** The ticket specifies id-only `environment_start`/`environment_stop` signatures. That cannot satisfy the ticket's own AC1: cold-starting a primary that has never been started is structurally impossible with an id-only signature, for the one-way-hash reason above. `checkout_path` is a strict *superset* of the id-only surface — every existing id-only call keeps working byte-for-byte, and it is the only way to address a never-started primary.
+
+#### environment_list
 
 ```
-worktree_start(worktree_id: str, role: str = "main", cwd: Optional[str] = None, variant: str = "default", env: Optional[Dict[str, str]] = None) -> dict
+environment_list(path: str, scope: str = "repo") -> list[dict]
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
-| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one worktree under different roles. |
-| `cwd` | `str` | No | Working directory for the spawned process. When omitted, the worktree path is used by the underlying engine. |
+| `path` | `str` | Yes | Any path inside a git repository — the repo root, a linked worktree checkout, or a subdirectory of either. There is no "list everything, everywhere" call; every environment this tool can return is reachable from a `path` you already have. |
+| `scope` | `str` | No | `"repo"` (default) — only the repo containing `path`. `"all"` — every distinct repo this server has ever tracked an environment for, fanned out with the identical entry shape (no second shape, no repo-grouping wrapper); the repo containing `path` is always listed first. Unknown values raise `ValueError`. |
+
+This tool replaces the old unfiltered discovery listing (no `repo_root` filter meant every worktree, everywhere) and the old single-record-by-id lookup. Each entry mirrors a `WorktreeRecord` plus:
+
+- `is_current` (bool) — this entry's checkout contains the queried `path`. At most one entry has this set across the whole result, even under `scope="all"` (entries fanned out from another repo always have it forced to `False`).
+- `tracked` (bool) — `False` marks a *synthesised* entry (on disk but no persisted record yet — the case for the primary before its first `environment_start()`, and for any un-adopted linked worktree). **Always branch on `tracked`, never on `id`**, to tell a synthesised entry from a persisted one — a synthesised primary's `id` is the deterministic `primary_id_for(repo_root)` (round-trips once materialised); a synthesised linked worktree's `id` is `""`.
+- `setup_status` — the same coarse setup-health signal as before (`"ready"` / `"running"` / `"failed"` / `"unknown"`), derived from `status`.
+
+This call **never writes state** — listing the primary before it has ever started does not create a record for it.
+
+**Errors:** raises `ValueError` for an unknown `scope`, or when `path` itself is not a valid, existing git repository (mapped from `InvalidRepoError`). Under `scope="all"`, a *different*, previously tracked repo whose clone has since vanished from disk is skipped gracefully; only a bad `path` argument raises.
+
+---
+
+#### environment_start
+
+```
+environment_start(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: str = "main", cwd: Optional[str] = None, variant: str = "default", env: Optional[Dict[str, str]] = None) -> dict
+```
+
+See "Addressing an environment" above for `environment_id`/`checkout_path`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. |
+| `cwd` | `str` | No | Working directory for the spawned process. When omitted, the environment's checkout path is used by the underlying engine. |
 | `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. |
 | `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
-**The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` inside the worktree.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
+**The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` at `repo_root`.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
 
-**Returns** the canonical worktree record dict on success. Fields of note:
+**Returns** the canonical environment record dict on success. Fields of note:
 
-- `status` — `"running"` when the process started successfully.
+- `status` — `"running"` when the process started successfully; `"ready"` for a no-op start (no `start:` step configured).
+- `backing` — `"primary"` for the main clone, `"worktree"` for a linked worktree.
 - `pids` — dict mapping role name to PID (e.g. `{"main": 12345}`).
 - `ports` — dict mapping port name to host port number; `{}` before port setup runs.
 
-**Soft errors:** if `worktree_id` is not found, or if a process is already running under the given `role`, returns `{"error": "..."}` instead of raising.
+**Soft errors:** if the target is not found, or if a process is already running under the given `role`, returns `{"error": "..."}` instead of raising. The not-found message names whichever target identifier was supplied (`environment_id` if given, else `checkout_path`).
 
-**Errors:** raises `ValueError` for `WorktreeError` or `ProcessLifecycleError` conditions (e.g. bad contract configuration).
+**Errors:** raises `ValueError` for `WorktreeError` (including the engine's `CheckoutTargetError`/`UnknownVariantError`) or `ProcessLifecycleError` conditions.
 
 ---
 
-### worktree_stop
+#### environment_stop
 
 ```
-worktree_stop(worktree_id: str, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False) -> dict
+environment_stop(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False) -> dict
 ```
+
+See "Addressing an environment" above for `environment_id`/`checkout_path`. Unlike `environment_start`, stopping never materialises a primary record — an unstarted primary has nothing to stop, so it returns the same soft not-found dict as an unknown `environment_id`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `worktree_id` | `str` | Yes | The id of the worktree (as returned by `worktree_create` or `worktree_list`). |
 | `role` | `str` | No | Logical role name of the process to stop. Defaults to `"main"`. |
 | `timeout` | `float` | No | Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before the process is forcibly killed (SIGKILL/TerminateProcess). Defaults to `10.0`. |
 | `kill_orphans` | `bool` | No | When `True`, after the primary stop signal a cwd/open-file scan terminates orphaned grandchild processes that were reparented away from the tracked shell wrapper (e.g. a detached GUI started via `Start-Process -PassThru`). Defaults to `False` (backward-compatible). |
 
 Any contract `stop:` steps defined in `.seretos/worktree-setup.yml` are executed best-effort before the graceful SIGTERM/CtrlBreak signal is sent; failures in those steps are logged but do not prevent the process from being stopped.
 
-**Returns** the canonical worktree record dict on success. Fields of note:
+**Returns** the canonical environment record dict on success. Fields of note:
 
 - `status` — `"stopped"` after the process has been terminated.
+- `backing` — `"primary"` for the main clone, `"worktree"` for a linked worktree.
 - `pids` — dict mapping role name to PID; the stopped role's entry is removed once the process exits.
-- `ports` — dict mapping port name to host port number; `{}` for worktrees with no port setup.
+- `ports` — dict mapping port name to host port number; `{}` for environments with no port setup.
 
-**Soft errors:** if `worktree_id` is not found, or if no process is running under the given `role`, returns `{"error": "..."}` instead of raising.
+**Soft errors:** if the target is not found, or if no process is running under the given `role`, returns `{"error": "..."}` instead of raising. The not-found message names whichever target identifier was supplied (`environment_id` if given, else `checkout_path`).
 
 **Errors:** raises `ValueError` for `WorktreeError` or `ProcessLifecycleError` conditions.
-
----
-
-### worktree_get
-
-```
-worktree_get(worktree_id: str) -> dict
-```
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `worktree_id` | `str` | Yes | The id of the worktree to retrieve (as returned by `worktree_create` or `worktree_list`). |
-
-**Returns** the canonical worktree record dict without removing it. Fields of note:
-
-- `id` — follows the pattern `<repo-slug>-<branch-slug>-<8-hex>` where slugs are lower-case ASCII with non-alphanumeric runs collapsed to `-`; ids are not stable across remove/re-create cycles.
-- `path` — absolute checkout location under `<store_root>/<repo_slug>/<id>/` where `store_root` defaults to `~/agent-worktree-store` or the value of `$WORKTREE_STORE_ROOT`.
-- `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
-
-**Soft error:** if `worktree_id` is not found, returns `{"error": "..."}` instead of raising.
 
 ---
 
