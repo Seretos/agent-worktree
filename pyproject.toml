@@ -22,6 +22,7 @@ build = [
 ]
 test = [
   "pytest>=8",
+  "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools]
@@ -34,3 +35,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
+# Ticket #105: bound every test at 60s so the load-dependent daemon-thread
+# leak in lib-python-worktree (upstream Seretos/lib-python-worktree#90) fails
+# loudly instead of hanging the suite silently. On Windows a timeout hit
+# aborts the whole session but dumps thread stacks first -- useful
+# diagnostics for tracking down the upstream leak.
+timeout = 60
