@@ -48,24 +48,29 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 #### worktree_remove
 
 ```
-worktree_remove(environment_id: str, force: bool = False, kill_blocking_processes: bool = False) -> dict
+worktree_remove(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, force: bool = False, kill_blocking_processes: bool = False) -> dict
 ```
 
-Deliberately **id-only** — unlike the environment-lifecycle tools below, there is no `checkout_path` parameter. Removing the primary/main clone is never allowed regardless of how it might be addressed, so there is no cold-start case to support here.
+Addressed by `environment_id` and/or `checkout_path`, mirroring the environment-lifecycle tools below — with one important difference in *why* `checkout_path` matters here: it is the **only** way to remove an untracked/orphan checkout. A linked worktree that exists on disk (`git worktree list --porcelain` reports it, and `environment_list` shows it with `tracked: false`) but was never created through this tool has a synthesised, display-only id of the form `<repo-slug>-<branch-slug>-untracked-<8-hex>` — a one-way derivation of its checkout path, not a state-store key. Such an id can never resolve via `environment_id` alone; pass the checkout's `path` (as shown by `environment_list`) as `checkout_path` instead. Removing an untracked target this way tears down the checkout but never touches the state store (there was nothing there to remove) and never deletes its branch, even with `force=True`, since the checkout was never recorded as owning one.
+
+Removing the primary/main clone is never allowed regardless of how it is addressed (by `environment_id` or by `checkout_path`) — see the primary refusal below.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `environment_id` | `str` | Yes | The id of the checkout to remove (as returned by `worktree_create` or `environment_list`). |
+| `environment_id` | `str` | No* | The id of a *tracked* checkout to remove (as returned by `worktree_create` or `environment_list`). |
+| `checkout_path` | `str` | No* | The path of the checkout to remove — the only way to address an untracked/orphan checkout. |
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
 | `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
 
+\* At least one of `environment_id`/`checkout_path` is required; passing neither raises `ValueError` (from the engine's `CheckoutTargetError`). Passing both is fine only when they agree — a mismatch also raises `ValueError`. The wrapper performs no validation of the pair itself; every combination is forwarded straight through to the engine.
+
 **Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs. The response also includes a `killed_pids` list (may be empty); each entry is a dict with `pid` (int), `name` (str), and `cmdline` (list of str) describing a process that was terminated to unblock removal.
 
-**Soft error:** if `environment_id` is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition.
+**Soft error:** if the target is not found, returns `{"error": "..."}` instead of raising, so callers can treat not-found as an idempotent condition. When `environment_id` looks like a synthesised untracked id, the error text names `checkout_path` as the remedy.
 
 **Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
 
-**Primary refusal (hard, non-`force`-able):** attempting to remove the primary/main clone's environment — even with `force=True` — raises `ValueError`. This is checked before any teardown work runs and can never be bypassed: a primary checkout IS the repo, so deleting it would be catastrophic. The raised message includes the engine's own text plus an explicit `backing: "primary"` token.
+**Primary refusal (hard, non-`force`-able):** attempting to remove the primary/main clone's environment — whether addressed by `environment_id` or by `checkout_path`, and even with `force=True` — raises `ValueError`. This is checked before any teardown work runs and can never be bypassed: a primary checkout IS the repo, so deleting it would be catastrophic. The raised message includes the engine's own text plus an explicit `backing: "primary"` token.
 
 ---
 
@@ -98,7 +103,7 @@ environment_list(path: str, scope: str = "repo") -> list[dict]
 This tool replaces the old unfiltered discovery listing (no `repo_root` filter meant every worktree, everywhere) and the old single-record-by-id lookup. Each entry mirrors a `WorktreeRecord` plus:
 
 - `is_current` (bool) — this entry's checkout contains the queried `path`. At most one entry has this set across the whole result, even under `scope="all"` (entries fanned out from another repo always have it forced to `False`).
-- `tracked` (bool) — `False` marks a *synthesised* entry (on disk but no persisted record yet — the case for the primary before its first `environment_start()`, and for any un-adopted linked worktree). **Always branch on `tracked`, never on `id`**, to tell a synthesised entry from a persisted one — a synthesised primary's `id` is the deterministic `primary_id_for(repo_root)` (round-trips once materialised); a synthesised linked worktree's `id` is `""`.
+- `tracked` (bool) — `False` marks a *synthesised* entry (on disk but no persisted record yet — the case for the primary before its first `environment_start()`, and for any un-adopted/orphan linked worktree). **Always branch on `tracked`, never on `id`**, to tell a synthesised entry from a persisted one — a synthesised primary's `id` is the deterministic `primary_id_for(repo_root)` (round-trips once materialised); a synthesised linked worktree's `id` is `<repo-slug>-<branch-slug>-untracked-<8-hex>` — a one-way derivation of its checkout path, **not** a state-store key. It cannot be looked up by `worktree_remove(environment_id=...)`; address it by `checkout_path` instead (see `worktree_remove` above).
 - `setup_status` — the same coarse setup-health signal as before (`"ready"` / `"running"` / `"failed"` / `"unknown"`), derived from `status`.
 
 This call **never writes state** — listing the primary before it has ever started does not create a record for it.

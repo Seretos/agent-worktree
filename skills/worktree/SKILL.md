@@ -127,7 +127,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 | Tool | Best for |
 |---|---|
 | `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience |
-| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; supports `force` and `kill_blocking_processes`. Structurally refuses to delete a primary checkout, even with `force=True` |
+| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. Structurally refuses to delete a primary checkout, even with `force=True` |
 
 **Environment lifecycle** (the process running against any checkout, primary included):
 
@@ -139,19 +139,27 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 ## Addressing an environment
 
-`environment_start` and `environment_stop` each accept two ways to name their target —
-pass one or the other (or both, if they agree):
+`environment_start`, `environment_stop`, and `worktree_remove` each accept two ways to
+name their target — pass one or the other (or both, if they agree):
 
 - **`environment_id`** — the normal way. Use the id `worktree_create` returned for a
   linked worktree, or the id `environment_list`/a prior `environment_start` call
   returned for the primary (once materialised).
-- **`checkout_path`** — the cold-start/primary way. This is the *only* way to start the
-  primary/main clone's environment before it has ever been started. A primary's id is
+- **`checkout_path`** — the cold-start/primary way for `environment_start`/
+  `environment_stop`, and the *only* way to remove an untracked/orphan checkout via
+  `worktree_remove`. For `environment_start`, this is the *only* way to start the
+  primary/main clone's environment before it has ever been started: a primary's id is
   `primary_id_for(repo_root)` — a one-way SHA-256 hash of the repo root — so nothing
   persisted maps that hash back to a path until the first successful
   `environment_start()` call writes the record. Pass the repo root (or any path inside
   it) as `checkout_path` instead, and the engine resolves (and, for the primary,
-  materialises) the target.
+  materialises) the target. For `worktree_remove`, the same "one-way hash, not a
+  lookup key" problem applies to an **untracked linked worktree**: `environment_list`
+  displays it with a synthesised id of the form
+  `<repo-slug>-<branch-slug>-untracked-<8-hex>` (a one-way derivation of its checkout
+  path), and that id can never resolve via `environment_id` — pass the checkout's
+  `path` (from `environment_list`) as `checkout_path` instead. See "Orphan worktree
+  recovery" below for the full recipe.
 
 Passing both is fine only when they agree — a mismatch raises `ValueError` from the
 engine's `CheckoutTargetError`. Passing neither also raises `ValueError`. This
@@ -243,10 +251,23 @@ resolve the remaining lock at the OS level and retry.
 
 **Orphan worktree recovery**
 
-Call `environment_list(path=<repo_root>)` first to inspect the records for that repo
-(look for the entry with the id you're chasing). If it is safe to discard, call
-`worktree_remove <id> force=true` to remove it even though it contains uncommitted
-changes.
+An orphan is a linked worktree that exists on disk (`git worktree list --porcelain`
+finds it) but has no persisted record — `environment_list` shows it with
+`tracked: false` and a synthesised, display-only id
+(`<repo-slug>-<branch-slug>-untracked-<8-hex>`). That id is a one-way derivation of the
+checkout's path, not a state-store key, so `worktree_remove(environment_id=<that id>)`
+can never resolve it — it always comes back as a soft not-found error. The working
+recipe is:
+
+1. `environment_list(path=<repo_root>)` — find the entry with `tracked: false` (and
+   `backing: "worktree"`, not `"primary"`).
+2. `worktree_remove(checkout_path=<entry's path>, force=true)` — address it by its
+   `path`, not its `id`. If it is safe to discard, `force=true` removes it even though
+   it contains uncommitted changes.
+
+Removing an orphan this way never touches the state store (nothing was recorded there
+to remove) and never deletes its branch, even with `force=true`, since an orphan is
+never recorded as owning one.
 
 ## Pitfalls
 

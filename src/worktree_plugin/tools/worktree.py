@@ -36,6 +36,7 @@ been started. See each tool's docstring, ``AGENTS.md``, and
 
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -63,6 +64,29 @@ from lib_python_worktree import (
     load as load_contract,
     primary_id_for,
 )
+
+
+# Matches the synthesised-id suffix minted by ``untracked_id_for()`` --
+# mirrors ``lib_python_worktree.core.manager._UNTRACKED_ID_RE`` (not
+# re-exported from the package, so duplicated here). Used to decide, in the
+# ``worktree_remove`` not-found soft-error path, whether the engine's
+# exception text is actually informative (it names ``checkout_path`` as the
+# remedy only when the looked-up id is untracked-shaped) or just restates
+# the id back (an ordinary unknown id), in which case it is dropped to keep
+# the original bare error format (ticket #113 review fix).
+#
+# Known, accepted, inherited edge case: this regex is a byte-identical copy
+# of the pinned engine's own private id-shape heuristic, not an
+# independently invented one. In the extremely unlikely case a
+# legitimately-tracked id happens to have this exact shape (e.g. a branch
+# slug ending in "-untracked-" followed by 8 lowercase hex characters),
+# this wrapper's decision to append {exc} will simply mirror whatever the
+# pinned lib_python_worktree engine itself already does for that same id --
+# the engine raises its more informative "not found" message for exactly
+# the ids this pattern matches. That can't be "fixed" here without making
+# the wrapper's error-format decision disagree with the engine's own
+# exception text for the same id, so it is intentionally left as-is.
+_UNTRACKED_ID_RE = re.compile(r"-untracked-[0-9a-f]{8}$")
 
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
@@ -180,9 +204,13 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
 
     Merges the record's fields with the entry-level ``is_current``/
     ``tracked`` flags and the derived ``setup_status`` signal. Untracked
-    (synthesised) entries -- ``tracked=False``, and for a synthesised linked
-    worktree ``id == ""`` -- pass through unchanged; callers must use
-    ``tracked``, never the id, as the "is this persisted" discriminator.
+    (synthesised) entries -- ``tracked=False`` -- pass through unchanged;
+    callers must use ``tracked``, never the id, as the "is this persisted"
+    discriminator. A synthesised linked worktree's ``id`` is
+    ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
+    ``untracked_id_for()``), a one-way derivation of its checkout path --
+    NOT a state-store key. It cannot be passed as ``environment_id`` to
+    ``worktree_remove``; address it via ``checkout_path`` instead.
     """
     result = {
         **asdict(entry.record),
@@ -335,22 +363,56 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
     @mcp.tool()
     def worktree_remove(
-        environment_id: str,
+        environment_id: Optional[str] = None,
+        checkout_path: Optional[str] = None,
         force: bool = False,
         kill_blocking_processes: bool = False,
     ) -> Dict[str, Any]:
-        """Remove a tracked worktree checkout by id.
+        """Remove a worktree checkout, addressed by ``environment_id``
+        and/or ``checkout_path``.
 
-        This tool is deliberately **id-only** -- unlike ``environment_start``/
-        ``environment_stop`` it has no ``checkout_path`` parameter. Deleting
-        the primary/main clone is never allowed (see below) regardless of how
-        it might be addressed, so there is no cold-start case to support here.
+        Addressing the target
+        ----------------------
+        - ``environment_id`` -- **the normal way** for a *tracked* checkout
+          (one ``worktree_create`` persisted a record for). Use the id
+          returned by ``worktree_create`` or ``environment_list``.
+        - ``checkout_path`` -- **the only way to remove an untracked/orphan
+          checkout.** A linked worktree that exists on disk (``git worktree
+          list --porcelain`` reports it, and ``environment_list`` shows it
+          with ``tracked: false``) but was never created through this tool
+          has a synthesised, display-only id
+          (``<repo-slug>-<branch-slug>-untracked-<8-hex>``) that is a
+          one-way derivation of its checkout path, not a state-store key --
+          it can never resolve via ``environment_id`` alone. Pass the
+          checkout's path (as shown in ``environment_list``'s ``path``
+          field) as ``checkout_path`` instead. Removing an untracked target
+          this way tears down the checkout but never touches the state
+          store (there was nothing there to remove) and never deletes its
+          branch, even with ``force=True``, since the checkout was never
+          recorded as owning one.
+
+        Neither is schema-required, but the engine (not this wrapper)
+        enforces the resolution: passing both is fine only when they agree
+        (a mismatch raises ``ValueError``, from the engine's
+        ``CheckoutTargetError``); passing neither also raises ``ValueError``.
+        This wrapper performs no validation of the ``(environment_id,
+        checkout_path)`` pair itself -- every combination is forwarded
+        straight through to the engine.
+
+        (Deliberate, documented deviation from ticket #99's originally
+        id-only signature -- see this module's docstring for why an id-only
+        surface cannot satisfy the ticket's own AC1, and why ``checkout_path``
+        is a strict superset that keeps every existing id-only call working
+        unchanged.)
 
         Parameters
         ----------
         environment_id:
-            The id of the checkout to remove (as returned by
-            ``worktree_create`` or ``environment_list``).
+            The normal way to address a tracked checkout -- see "Addressing
+            the target" above.
+        checkout_path:
+            The only way to address an untracked/orphan checkout -- see
+            "Addressing the target" above.
         force:
             When ``True``, removes the worktree even if it contains
             uncommitted changes. Defaults to ``False``.
@@ -370,21 +432,24 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         is a dict with ``pid`` (int), ``name`` (str), and ``cmdline`` (list of
         str) describing a process that was terminated to unblock removal.
 
-        If ``environment_id`` is not found, returns ``{"error": "..."}``
-        instead of raising, so callers can treat not-found as a soft/idempotent
-        condition.
+        If the target is not found, returns ``{"error": "..."}`` instead of
+        raising, so callers can treat not-found as a soft/idempotent
+        condition. When ``environment_id`` looks like a synthesised untracked
+        id, the error text names ``checkout_path`` as the remedy.
 
         Raises ``ValueError`` (mapped from ``WorktreeDirLockedError``) when the
         worktree directory is still locked after attempting to kill blocking
         processes.
 
         **Primary checkouts are never removed.** Attempting to remove the
-        primary/main clone's environment -- even with ``force=True`` -- raises
-        ``ValueError``. This refusal is structural, checked before any
-        teardown work runs, and cannot be bypassed: a primary checkout IS the
-        repo, so deleting it would be catastrophic. The raised message
-        includes the engine's own text plus an explicit ``backing: "primary"``
-        token so callers can react programmatically without parsing prose.
+        primary/main clone's environment -- whether addressed by
+        ``environment_id`` or by ``checkout_path``, and even with
+        ``force=True`` -- raises ``ValueError``. This refusal is structural,
+        checked before any teardown work runs, and cannot be bypassed: a
+        primary checkout IS the repo, so deleting it would be catastrophic.
+        The raised message includes the engine's own text plus an explicit
+        ``backing: "primary"`` token so callers can react programmatically
+        without parsing prose.
         """
 
         try:
@@ -392,11 +457,29 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 environment_id,
                 force=force,
                 kill_blocking_processes=kill_blocking_processes,
+                checkout_path=checkout_path,
             )
         except PrimaryCheckoutError as exc:
             raise ValueError(f'{exc} (backing: "primary")') from exc
-        except WorktreeNotFoundError:
-            return {"error": f"environment '{environment_id}' not found"}
+        except WorktreeNotFoundError as exc:
+            target_name = (
+                environment_id if environment_id is not None else checkout_path
+            )
+            error_text = f"environment '{target_name}' not found"
+            # Only append the engine's own exception text when the looked-up
+            # id is untracked-shaped: that's the one case where {exc} is
+            # actually informative (it names checkout_path as the remedy).
+            # For an ordinary unknown id, the engine's text just restates the
+            # id ("No worktree tracked with id '...'"), so appending it would
+            # only change the error format without adding information --
+            # restore the original bare format there instead (ticket #113
+            # review fix; preserves backward compatibility for callers who
+            # may depend on the exact bare-error string shape).
+            if environment_id is not None and _UNTRACKED_ID_RE.search(
+                environment_id
+            ):
+                error_text = f"{error_text}: {exc}"
+            return {"error": error_text}
         except WorktreeDirLockedError as exc:
             raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
@@ -455,7 +538,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           persisted one** -- a synthesised primary's ``id`` is the
           deterministic ``primary_id_for(repo_root)`` (so it round-trips
           correctly once later materialised by ``environment_start``), while
-          a synthesised linked worktree's ``id`` is the empty string ``""``.
+          a synthesised linked worktree's ``id`` is
+          ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
+          ``untracked_id_for()``) -- a one-way derivation of its checkout
+          path, NOT a state-store key. It cannot be passed as
+          ``environment_id`` to ``worktree_remove``; address it via
+          ``checkout_path`` instead.
         - ``setup_status``: the same coarse setup-health signal documented on
           ``environment_start`` -- ``"ready"``, ``"running"``, ``"failed"``, or
           ``"unknown"``, derived from the record's ``status``.
@@ -677,9 +765,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 variant=variant,
             )
         except WorktreeNotFoundError:
-            return {
-                "error": f"environment '{environment_id or checkout_path}' not found"
-            }
+            target_name = (
+                environment_id if environment_id is not None else checkout_path
+            )
+            return {"error": f"environment '{target_name}' not found"}
         except ProcessAlreadyRunningError as exc:
             return {"error": str(exc)}
         except (WorktreeError, ProcessLifecycleError) as exc:
@@ -785,9 +874,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 kill_orphans=kill_orphans,
             )
         except WorktreeNotFoundError:
-            return {
-                "error": f"environment '{environment_id or checkout_path}' not found"
-            }
+            target_name = (
+                environment_id if environment_id is not None else checkout_path
+            )
+            return {"error": f"environment '{target_name}' not found"}
         except ProcessNotRunningError as exc:
             return {"error": str(exc)}
         except (WorktreeError, ProcessLifecycleError) as exc:

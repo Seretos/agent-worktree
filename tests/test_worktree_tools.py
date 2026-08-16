@@ -473,6 +473,22 @@ def test_tool_environment_start_unknown_id_returns_soft_error(tmp_path: Path):
     assert "wt-missing" in result["error"]
 
 
+def test_tool_environment_start_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["environment_start"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
+
+
 def test_tool_environment_start_already_running_returns_soft_error(tmp_path: Path):
     """environment_start when already running must return soft-error dict, not raise."""
     from unittest.mock import MagicMock
@@ -531,6 +547,22 @@ def test_tool_environment_stop_unknown_id_returns_soft_error(tmp_path: Path):
     assert isinstance(result, dict)
     assert "error" in result
     assert "wt-missing" in result["error"]
+
+
+def test_tool_environment_stop_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.stop = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["environment_stop"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
 
 
 def test_tool_environment_stop_not_running_returns_soft_error(tmp_path: Path):
@@ -747,7 +779,7 @@ def test_tool_worktree_remove_kill_blocking_processes_forwarded(tmp_path: Path):
     fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
 
     mgr.remove.assert_called_once_with(
-        "wt-id", force=False, kill_blocking_processes=True
+        "wt-id", force=False, kill_blocking_processes=True, checkout_path=None
     )
 
 
@@ -763,7 +795,7 @@ def test_tool_worktree_remove_default_kill_false_forwarded(tmp_path: Path):
     fns["worktree_remove"](environment_id="wt-id")
 
     mgr.remove.assert_called_once_with(
-        "wt-id", force=False, kill_blocking_processes=False
+        "wt-id", force=False, kill_blocking_processes=False, checkout_path=None
     )
 
 
@@ -818,6 +850,22 @@ def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
 
     with pytest.raises(ValueError):
         fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
+
+
+def test_tool_worktree_remove_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["worktree_remove"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
 
 
 def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
@@ -887,7 +935,7 @@ def test_tool_worktree_remove_teardown_before_remove_force_forwarded(tmp_path: P
 
     # Call contract: force=True forwarded correctly.
     mgr.remove.assert_called_once_with(
-        "wt-48-force", force=True, kill_blocking_processes=False
+        "wt-48-force", force=True, kill_blocking_processes=False, checkout_path=None
     )
     # Return-value contract: must be the removed record, not a soft-error.
     assert isinstance(result, dict)

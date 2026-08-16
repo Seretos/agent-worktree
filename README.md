@@ -111,4 +111,7 @@ The response's `killed_pids` field lists every process that was terminated (pid,
 
 **Orphan worktree on disk**
 
-Call `environment_list(path=<repo_root>)` to inspect the record first (find the entry with the id you're chasing). If the worktree is safe to discard, call `worktree_remove <id> force=true` to remove it even if it contains uncommitted changes.
+An orphan is a linked worktree that exists on disk but has no persisted record — `environment_list` shows it with `tracked: false` and a synthesised, display-only id (`<repo-slug>-<branch-slug>-untracked-<8-hex>`) that is a one-way derivation of its checkout path, not a lookup key. Removing it by that id (`worktree_remove(environment_id=...)`) always comes back as a not-found error. Instead:
+
+1. Call `environment_list(path=<repo_root>)` and find the entry with `tracked: false`.
+2. Call `worktree_remove(checkout_path=<entry's path>, force=true)` — addressed by `path`, not `id` — to remove it even if it contains uncommitted changes.
