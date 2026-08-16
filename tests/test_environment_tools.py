@@ -621,23 +621,77 @@ def test_environment_start_with_start_step_reports_contract_read(
     assert result["status"] == "running"
 
 
-def test_environment_start_fast_exiting_start_step_still_reports_real_start(
+@pytest.mark.parametrize("engine_status", ["exited", "running"])
+def test_environment_start_real_start_reports_steps_run_for_any_status(
+    tmp_path: Path, temp_repo: Path, engine_status: str
+):
+    """Ticket #103 regression, determinised for #107.
+
+    The engine's `_lifecycle_start` sets `record.pids[role]`
+    unconditionally, but `record.status` only reaches "running" if the
+    process survives the engine's ~0.25s early-exit wait; a fast-exiting
+    command (`echo hi`) instead leaves `status == "exited"`. Before the
+    #103 fix, `_contract_diagnostics` required `status == "running"` to
+    report a real start, so a real start whose process exited quickly was
+    misreported as `steps_run == 0`, `no_op_reason == "no-start-steps"` --
+    indistinguishable from the true no-op case #103 exists to separate out.
+
+    Ticket #107: the original version of this test raced a real `echo hi`
+    against that 0.25s wait and asserted `status == "exited"` as a
+    precondition, which flaked on `windows-latest` when the process
+    outlived the wait. The state is now injected rather than raced for, so
+    BOTH states are exercised deterministically on every run.
+    """
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nstart:\n  - run: echo hi\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+        rec = store.get(worktree_id)
+        # Mirrors the engine: pids is set unconditionally; only status and
+        # returncode depend on surviving the early-exit wait.
+        rec.pids = {role: 4242}
+        rec.status = engine_status
+        rec.returncode = 0 if engine_status == "exited" else None
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    # Sanity check that the injected state actually reached the response --
+    # this is the relocated guard: it can no longer flake, but the "exited"
+    # case is still guaranteed to be exercised on every run.
+    assert result["status"] == engine_status
+    assert result["pids"] == {"main": 4242}
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] == "full"
+    assert result["steps_run"] == 1
+    assert result["no_op_reason"] is None
+
+
+def test_environment_start_real_process_start_reports_real_start_e2e(
     tmp_path: Path, temp_repo: Path
 ):
-    """Real, unmocked start with a command that exits almost immediately
-    (``echo hi``). The engine's `_lifecycle_start` unconditionally sets
-    `record.pids[role]`, and `record.status` only becomes "running" if the
-    process survives the engine's ~0.25s early-exit wait -- a fast-exiting
-    command instead leaves `status == "exited"`.
+    """End-to-end companion to the parametrised test above: a real,
+    unmocked start of a real `echo hi` process, proving the diagnostics
+    contract holds against the actual engine and not only against a
+    patched `_lifecycle_start`.
 
-    Before the fix, `_contract_diagnostics` required `status == "running"`
-    to report a real start, so this exact scenario -- a real start whose
-    process happens to exit quickly -- was misreported as `steps_run == 0`,
-    `no_op_reason == "no-start-steps"`: indistinguishable from the true
-    no-op case this ticket exists to separate out. This is a regression
-    test for that misclassification: it must report `steps_run == 1` and
-    `no_op_reason is None` regardless of whether the process is still alive
-    by the time diagnostics run.
+    Ticket #107: every timing-dependent assertion is deliberately absent.
+    Whether the process survives the engine's ~0.25s early-exit wait is a
+    wall-clock race, so `status` is only asserted to be one of the two
+    legitimate outcomes -- never pinned to either. The assertions that
+    matter (`pids` populated, `steps_run == 1`, `no_op_reason is None`)
+    key on `record.pids`, which the engine sets unconditionally, so they
+    hold in both outcomes. The state-specific regression guard lives in
+    the parametrised test above, not here.
     """
     _write_contract(
         temp_repo,
@@ -651,14 +705,13 @@ def test_environment_start_fast_exiting_start_step_still_reports_real_start(
     assert result["contract_found"] is True
     assert result["contract_isolation"] == "full"
     assert result["pids"], "a real process should have been spawned"
-    assert result["status"] == "exited", (
-        "this test only exercises the reported bug when the fast-exiting "
-        "process does not survive the engine's early-exit wait -- if this "
-        "fails, the process outlived the wait and the assertions below no "
-        "longer distinguish the fix from the bug"
-    )
     assert result["steps_run"] == 1
     assert result["no_op_reason"] is None
+    assert result["status"] in {"exited", "running"}, (
+        "both outcomes are legitimate -- which one occurs is a wall-clock "
+        "race against the engine's early-exit wait (ticket #107); the "
+        "state-specific assertions live in the parametrised test above"
+    )
 
 
 def test_environment_start_isolation_none_reports_isolation_none(
