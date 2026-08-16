@@ -560,3 +560,354 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
     assert env.get("WORKTREE_PATH") == str(wt_path)
     assert env.get("WORKTREE_PORT_WEB") == "8080"
     assert env.get("WORKTREE_PORT_DB") == "5432"
+
+
+# ---- Ticket #103 ----
+# environment_start's "nothing ran" outcomes -- no contract at all,
+# isolation: none, a contract present but with no start: steps, and a
+# contract misplaced in the checkout instead of repo_root -- must be
+# distinguishable from a real start, and the contract schema must be
+# discoverable from the tool docstrings alone.
+
+
+def test_environment_start_without_contract_reports_no_contract(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is False
+    assert result["steps_run"] == 0
+    assert result["no_op_reason"] == "no-contract"
+    assert result["contract_path"].endswith(".seretos/worktree-setup.yml")
+    assert str(temp_repo.resolve()).replace("\\", "/") in result["contract_path"].replace(
+        "\\", "/"
+    )
+    # Non-breaking: the pre-existing fields are unchanged.
+    assert result["status"] == "ready"
+    assert result["pids"] == {}
+
+
+def test_environment_start_with_start_step_reports_contract_read(
+    tmp_path: Path, temp_repo: Path
+):
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nstart:\n  - run: echo hi\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+        rec = store.get(worktree_id)
+        rec.status = "running"
+        rec.pids = {role: 4242}
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_path"].endswith(".seretos/worktree-setup.yml")
+    assert result["contract_isolation"] == "full"
+    assert result["steps_run"] == 1
+    assert result["no_op_reason"] is None
+    assert result["status"] == "running"
+
+
+def test_environment_start_fast_exiting_start_step_still_reports_real_start(
+    tmp_path: Path, temp_repo: Path
+):
+    """Real, unmocked start with a command that exits almost immediately
+    (``echo hi``). The engine's `_lifecycle_start` unconditionally sets
+    `record.pids[role]`, and `record.status` only becomes "running" if the
+    process survives the engine's ~0.25s early-exit wait -- a fast-exiting
+    command instead leaves `status == "exited"`.
+
+    Before the fix, `_contract_diagnostics` required `status == "running"`
+    to report a real start, so this exact scenario -- a real start whose
+    process happens to exit quickly -- was misreported as `steps_run == 0`,
+    `no_op_reason == "no-start-steps"`: indistinguishable from the true
+    no-op case this ticket exists to separate out. This is a regression
+    test for that misclassification: it must report `steps_run == 1` and
+    `no_op_reason is None` regardless of whether the process is still alive
+    by the time diagnostics run.
+    """
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nstart:\n  - run: echo hi\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] == "full"
+    assert result["pids"], "a real process should have been spawned"
+    assert result["status"] == "exited", (
+        "this test only exercises the reported bug when the fast-exiting "
+        "process does not survive the engine's early-exit wait -- if this "
+        "fails, the process outlived the wait and the assertions below no "
+        "longer distinguish the fix from the bug"
+    )
+    assert result["steps_run"] == 1
+    assert result["no_op_reason"] is None
+
+
+def test_environment_start_isolation_none_reports_isolation_none(
+    tmp_path: Path, temp_repo: Path
+):
+    _write_contract(temp_repo, "version: 1\nisolation: none\n")
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] == "none"
+    assert result["steps_run"] == 0
+    assert result["no_op_reason"] == "isolation-none"
+
+
+def test_environment_start_contract_without_start_block_reports_no_start_steps(
+    tmp_path: Path, temp_repo: Path
+):
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nsetup:\n  - run: echo setup\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] == "full"
+    assert result["steps_run"] == 0
+    assert result["no_op_reason"] == "no-start-steps"
+
+
+def test_environment_start_contract_only_in_checkout_reports_misplaced(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    # Contract placed only in the linked worktree checkout, not repo_root.
+    _write_contract(
+        Path(rec.path), "version: 1\nisolation: full\nstart:\n  - run: echo hi\n"
+    )
+
+    result = fns["environment_start"](environment_id=rec.id)
+
+    assert "error" not in result
+    assert result["contract_found"] is False
+    assert result["no_op_reason"] == "contract-misplaced"
+    assert result["steps_run"] == 0
+
+
+def test_environment_start_primary_same_path_never_reports_misplaced(
+    tmp_path: Path, temp_repo: Path
+):
+    """Primary case: record.path == record.repo_root. A contract there is
+    found normally and must never be misreported as 'misplaced'."""
+    _write_contract(temp_repo, "version: 1\nisolation: none\n")
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["no_op_reason"] != "contract-misplaced"
+
+
+def test_environment_start_diagnostics_degrade_for_unreachable_repo_root(
+    tmp_path: Path,
+):
+    """A nonexistent repo_root/path pair (`/r`, `/p`) hits the ordinary
+    "no-contract" branch cleanly -- `Path.exists()` returns False rather
+    than raising -- so this is NOT the `except (OSError, ContractError)`
+    degrade path (see `test_environment_start_contract_unreadable_degrades_
+    without_raising` below for that). This test only proves that an
+    unreachable repo_root doesn't crash the diagnostics helper and lands on
+    the correct, specific `no_op_reason`, not merely that the key exists.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = WorktreeRecord(
+        id="wt-id",
+        repo_root="/r",
+        branch="b",
+        path="/p",
+        status="running",
+        pids={"main": 12345},
+    )
+    mgr.start = MagicMock(return_value=record)
+
+    result = fns["environment_start"](environment_id="wt-id")
+
+    assert "error" not in result
+    assert result["contract_found"] is False
+    assert result["no_op_reason"] == "no-contract"
+
+
+def test_environment_start_contract_unreadable_degrades_without_raising(
+    tmp_path: Path, temp_repo: Path
+):
+    """Exercises `_contract_diagnostics`'s `except (OSError, ContractError)`
+    branch for real, without weakening `environment_start`'s exception
+    handling (out of scope -- see the ticket).
+
+    The engine's `manager.start()` unconditionally re-reads and validates
+    the contract itself (`lib_python_worktree.core.manager.start`) before
+    `_contract_diagnostics` ever runs its own second read -- confirmed by
+    reproducing this directly: writing a genuinely malformed-YAML contract
+    (`isolation: [full` -- an unterminated flow sequence) and calling
+    `environment_start` raises `ContractError` straight out of
+    `manager.start()`, never reaching `_contract_diagnostics` at all. That
+    `ContractError` is not a `WorktreeError`, so it escapes `environment_
+    start`'s `except (WorktreeError, ProcessLifecycleError)` -- exactly the
+    known, out-of-scope gap the ticket names. So a literally-malformed file
+    on disk cannot reach the helper's own try/except through a real call at
+    all; it always blows up one frame earlier, in the engine.
+
+    What CAN reach the helper's except clause is the TOCTOU window its own
+    docstring documents: `_contract_diagnostics` performs a *second*,
+    independent read of the same contract file after `manager.start()`'s
+    read already succeeded. Simulating that second read failing --
+    independently of the first, real, successful read `manager.start()`
+    performs -- reproduces exactly that race deterministically.
+
+    Two sub-cases, both reaching the same except clause but with different
+    `record.pids` state left over from `manager.start()`'s own successful
+    read/spawn (ticket #103 fix: `record.pids` is the authority here, not
+    the failed second read):
+
+    1. A real process genuinely spawned (`role in record.pids`) before the
+       second read fails -- this must NOT be misreported as a no-op:
+       `steps_run == 1`, `no_op_reason is None`.
+    2. No process spawned at all (`role not in record.pids`, e.g. a
+       contract with no `start:` steps) when the second read fails --
+       this is a genuine no-op: `steps_run == 0`, `no_op_reason ==
+       "contract-unreadable"`.
+
+    Both sub-cases keep `contract_found is True` (the file did exist) and
+    `contract_isolation is None` (the second, failed read never parsed an
+    isolation value), and neither call raises.
+    """
+    from lib_python_worktree import ContractError
+
+    # Sub-case 1: a real start happened -- `role` lands in `record.pids` --
+    # and only the diagnostics helper's own second read fails.
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nstart:\n  - run: echo hi\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with patch(
+        "worktree_plugin.tools.worktree.load_contract",
+        side_effect=ContractError("boom"),
+    ):
+        result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] is None
+    assert result["steps_run"] == 1
+    assert result["no_op_reason"] is None
+
+
+def test_environment_start_contract_unreadable_with_no_spawn_stays_no_op(
+    tmp_path: Path, temp_repo: Path
+):
+    """Sub-case 2 of the except-clause degrade (see the sibling test's
+    docstring): when `manager.start()`'s own successful read found no
+    `start:` steps to run at all, nothing was ever spawned for `role`, so
+    `role not in record.pids`. If the diagnostics helper's own second read
+    then fails, this is a genuine no-op -- not a real start -- and must
+    still report `steps_run == 0`, `no_op_reason == "contract-unreadable"`.
+    """
+    from lib_python_worktree import ContractError
+
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\n",
+    )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with patch(
+        "worktree_plugin.tools.worktree.load_contract",
+        side_effect=ContractError("boom"),
+    ):
+        result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in result
+    assert result["contract_found"] is True
+    assert result["contract_isolation"] is None
+    assert result["steps_run"] == 0
+    assert result["no_op_reason"] == "contract-unreadable"
+
+
+def test_environment_start_soft_errors_carry_no_diagnostic_keys(tmp_path: Path):
+    from unittest.mock import MagicMock
+
+    from lib_python_worktree import ProcessAlreadyRunningError, WorktreeNotFoundError
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    mgr.start = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
+    not_found = fns["environment_start"](environment_id="wt-missing")
+    assert "error" in not_found
+    assert "contract_found" not in not_found
+
+    mgr.start = MagicMock(
+        side_effect=ProcessAlreadyRunningError("wt-id", "main", 12345)
+    )
+    already_running = fns["environment_start"](environment_id="wt-id")
+    assert "error" in already_running
+    assert "contract_found" not in already_running
+
+
+def test_worktree_create_docstring_documents_contract_schema(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["worktree_create"].__doc__ or ""
+
+    for token in (
+        ".seretos/worktree-setup.yml",
+        "repo_root",
+        "setup:",
+        "run:",
+        "version:",
+        "isolation:",
+    ):
+        assert token in doc, f"worktree_create docstring missing {token!r}"
+
+
+def test_environment_start_docstring_lists_all_contract_keys(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+
+    for token in (
+        "setup:",
+        "start:",
+        "stop:",
+        "teardown:",
+        "ports:",
+        "version:",
+        "isolation:",
+        "default",
+        "contract_found",
+        "contract_path",
+        "contract_isolation",
+        "steps_run",
+        "no_op_reason",
+    ):
+        assert token in doc, f"environment_start docstring missing {token!r}"
