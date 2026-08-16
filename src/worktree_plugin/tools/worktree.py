@@ -46,6 +46,7 @@ from mcp.server.fastmcp import FastMCP
 from lib_python_worktree import (
     CONTRACT_FILENAME,
     CheckoutTargetError,
+    ContractError,
     EnvironmentEntry,
     InvalidRepoError,
     KilledProcessInfo,
@@ -59,6 +60,7 @@ from lib_python_worktree import (
     WorktreeManager,
     WorktreeNotFoundError,
     WorktreeRecord,
+    load as load_contract,
     primary_id_for,
 )
 
@@ -83,6 +85,93 @@ def _derive_setup_status(status: str) -> str:
     if status == "setup_failed":
         return "failed"
     return "unknown"
+
+
+def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
+    """Diagnose whether ``environment_start`` actually read a contract, and
+    from where, so "nothing ran" outcomes are distinguishable from a real
+    start (ticket #103): no contract at all, a contract found but
+    ``isolation: none``, a contract present but with no ``start:`` steps, or
+    a contract misplaced in the worktree checkout instead of ``repo_root``.
+
+    Two accepted, deliberate caveats:
+
+    - This is a **second read** of the same contract file
+      ``manager.start()`` already read internally -- a negligible, accepted
+      TOCTOU window (the file could in principle change between the two
+      reads), not a shared/cached read.
+    - This function **re-derives** its own no-op verdict from the contract
+      and the final record state; it does not observe the engine's actual
+      internal decision (the engine has no first-class "why" signal to
+      surface -- see the plan's "deferred to the engine repo" notes).
+
+    Never raises: any ``OSError``/``ContractError`` degrades to
+    ``no_op_reason == "contract-unreadable"`` rather than propagating.
+    """
+    contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+    contract_found = False
+    contract_isolation: Optional[str] = None
+    steps_run = 0
+    no_op_reason: Optional[str] = None
+
+    try:
+        contract_found = contract_path.exists()
+        if contract_found:
+            contract = load_contract(contract_path)
+            contract_isolation = contract.isolation
+            if contract.isolation == "none":
+                no_op_reason = "isolation-none"
+            elif not contract.start:
+                no_op_reason = "no-start-steps"
+            elif role in record.pids:
+                # By this point `contract.start` is non-empty and no
+                # exception was raised, so the engine's `_lifecycle_start`
+                # already ran unconditionally and set `record.pids[role]`
+                # (ticket #103 regression: `record.status` only reaches
+                # "running" if the process survives the engine's early-exit
+                # wait -- a fast-exiting process is "exited" but is still a
+                # real start, not a no-op). Key purely on `role in
+                # record.pids`, not on `status == "running"`.
+                steps_run = 1
+            else:
+                no_op_reason = "no-start-steps"
+        else:
+            checkout_dir = Path(record.path)
+            same_dir = checkout_dir.resolve() == Path(record.repo_root).resolve()
+            checkout_contract_path = checkout_dir / CONTRACT_FILENAME
+            if not same_dir and checkout_contract_path.exists():
+                no_op_reason = "contract-misplaced"
+            else:
+                no_op_reason = "no-contract"
+    except (OSError, ContractError):
+        # `contract_found` is deliberately left as whatever it was already
+        # set to above: if `contract_path.exists()` returned True before
+        # this exception was raised (a contract that exists but failed to
+        # parse/read), it stays True -- "found but unreadable" is a
+        # different state than "nothing there at all". It only stays at its
+        # initial False if `.exists()` itself is what raised.
+        contract_isolation = None
+        # `manager.start()` already performed its own, successful read of
+        # this contract before this helper's second (redundant) read ever
+        # ran -- only the second read failed (the documented TOCTOU
+        # window). `record.pids` was populated by that first, real read and
+        # needs no further I/O, so it is the authority here: if `role` is
+        # already in it, a real start genuinely happened and must not be
+        # misreported as a no-op just because the diagnostics re-read failed.
+        if role in record.pids:
+            steps_run = 1
+            no_op_reason = None
+        else:
+            steps_run = 0
+            no_op_reason = "contract-unreadable"
+
+    return {
+        "contract_found": contract_found,
+        "contract_path": contract_path.as_posix(),
+        "contract_isolation": contract_isolation,
+        "steps_run": steps_run,
+        "no_op_reason": no_op_reason,
+    }
 
 
 def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
@@ -177,6 +266,34 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``warning`` (optional): present when ``repo_root`` was silently
           re-rooted to the actual git repository root (e.g. when a subdirectory
           was passed). The field contains the original and resolved paths.
+
+        Contract file (``.seretos/worktree-setup.yml``)
+        -------------------------------------------------
+        ``create()`` runs the contract's ``setup:`` steps as part of
+        creating this worktree. The contract lives at
+        ``<repo_root>/.seretos/worktree-setup.yml`` -- the engine always
+        reads it from ``repo_root`` (the original repository clone), never
+        from the new checkout. Top-level keys: ``version`` (int, required),
+        ``isolation`` (required; one of ``full``, ``partial``, or ``none``),
+        ``setup:``, ``start:``, ``stop:``, ``teardown:`` (each an ordered
+        list of steps), and ``ports:`` (a list of named port slots).
+        ``isolation: none`` forbids all of ``setup:``/``start:``/``stop:``/
+        ``teardown:``/``ports:`` -- combining them is a hard schema-
+        validation error, not a silent no-op. Each ``setup:`` step is a YAML
+        mapping with a required ``run:`` key (the shell command) and
+        optional ``name:``/``shell:`` keys. Example::
+
+            version: 1
+            isolation: full
+            setup:
+              - name: install
+                run: npm install
+
+        As a create-time convenience, this tool also *copies*
+        ``<repo_root>/.seretos/`` into the new worktree checkout when it
+        would not otherwise be tracked there (see below) -- but that copy is
+        never what ``environment_start``/``environment_stop`` read; they
+        always read the ``repo_root`` original.
         """
 
         try:
@@ -442,18 +559,30 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         unchanged.)
 
         Multiple named ``start:`` steps are supported; ``variant`` selects the
-        step by its ``name`` (default ``"default"`` resolves to the lone unnamed
-        step for back-compat). An unknown variant surfaces as a ``ValueError``.
+        step by its ``name``. A single **unnamed** ``start:`` step is
+        implicitly the ``"default"`` variant, for back-compat, so
+        ``variant="default"`` (the parameter's own default) resolves to it
+        without needing a ``name:`` key at all. An unknown variant surfaces
+        as a ``ValueError`` listing the available names.
 
         Step schema: each ``start:`` entry is a YAML mapping with a required
         ``run:`` key (the shell command to execute) and an optional ``name:``
         key (used by ``variant`` to select that step). A single unnamed step
         is the ``"default"`` variant, for back-compat.
 
-        The contract file also requires two top-level keys: ``version`` (an
-        int) and ``isolation`` (one of ``full``, ``partial``, or ``none``).
-        When ``isolation: none`` is set, ``start:``, ``stop:``, and ``ports:``
-        are forbidden in the contract. Example::
+        Contract file schema (``<repo_root>/.seretos/worktree-setup.yml``)
+        ----------------------------------------------------------------
+        Top-level keys: ``version`` (int, required), ``isolation`` (required;
+        one of ``full``, ``partial``, or ``none``), ``setup:``, ``start:``,
+        ``stop:``, ``teardown:`` (each an ordered list of steps), and
+        ``ports:`` (a list of named port slots).
+
+        Isolation rule: any of the ``setup:``/``start:``/``stop:``/
+        ``teardown:``/``ports:`` blocks requires a non-``none`` isolation --
+        use ``isolation: full`` (``partial`` also validates); ``isolation:
+        none`` **forbids** those blocks, and combining them is not a silent
+        no-op -- it is a hard schema-validation error (``ContractError``)
+        raised when the contract is loaded. Example::
 
             version: 1
             isolation: full
@@ -509,6 +638,29 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           process that exits immediately. May be absent/``null`` on a no-op
           ``"ready"`` start where nothing was spawned.
 
+        Contract diagnostics (ticket #103) -- five additive keys that make a
+        real start distinguishable from every "nothing ran" flavour,
+        including the misplaced-contract case warned about above:
+
+        - ``contract_found`` (bool): whether ``<repo_root>/.seretos/worktree-
+          setup.yml`` actually existed and was read.
+        - ``contract_path`` (str): the absolute path the engine reads. When
+          ``contract_found`` is ``False``, this is where to create the
+          contract.
+        - ``contract_isolation`` (str or ``None``): the contract's
+          ``isolation`` value (``"full"``, ``"partial"``, or ``"none"``), or
+          ``None`` when no contract was read.
+        - ``steps_run`` (int): ``1`` when a ``start:`` step was actually
+          spawned for ``role``; ``0`` for every no-op flavour.
+        - ``no_op_reason`` (str or ``None``): ``None`` on a real start;
+          otherwise exactly one of ``"no-contract"`` (nothing at
+          ``repo_root``), ``"contract-misplaced"`` (found only in the
+          worktree checkout, not ``repo_root``), ``"isolation-none"``
+          (contract read but ``isolation: none``), ``"no-start-steps"``
+          (contract read, isolation allows it, but no ``start:`` step ran),
+          or ``"contract-unreadable"`` (the contract exists but could not be
+          read/parsed).
+
         If the target is not found, returns ``{"error": "..."}`` instead of
         raising, so callers can treat not-found as a soft/idempotent
         condition. The message names whichever target identifier was
@@ -532,7 +684,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             return {"error": str(exc)}
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
-        return _record_to_dict(record)
+        return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
 
     @mcp.tool()
     def environment_stop(
