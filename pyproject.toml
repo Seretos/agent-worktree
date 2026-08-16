@@ -12,7 +12,7 @@ dependencies = [
   "mcp>=1.2,<2",
   "pydantic>=2.6",
   "PyYAML>=6.0",
-  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.1",
+  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.2",
   "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.1",
 ]
 
@@ -22,6 +22,7 @@ build = [
 ]
 test = [
   "pytest>=8",
+  "pytest-timeout>=2.3",
 ]
 
 [tool.setuptools]
@@ -34,3 +35,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
+# Ticket #105: bound every test at 60s so the load-dependent daemon-thread
+# leak in lib-python-worktree (upstream Seretos/lib-python-worktree#90) fails
+# loudly instead of hanging the suite silently. On Windows a timeout hit
+# aborts the whole session but dumps thread stacks first -- useful
+# diagnostics for tracking down the upstream leak.
+timeout = 60
