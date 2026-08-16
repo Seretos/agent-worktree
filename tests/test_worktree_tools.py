@@ -80,11 +80,93 @@ def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path)
     assert manager.list() == []
 
 
-def test_create_unknown_branch_without_base(
+# ---- Ticket #114: v0.3.3 default-base semantics for create() ----
+#
+# v0.3.2 always raised BranchNotFoundError when `branch` did not exist and
+# `base` was omitted. v0.3.3 (see WorktreeManager.create()'s docstring and
+# manager._current_branch()) changed that: an omitted `base` now defaults to
+# the branch currently checked out at the main clone, and only still raises
+# when that HEAD is detached or unborn (no commits yet) -- the two cases
+# where no sensible default branch exists. The three tests below replace the
+# old single "always raises" test with coverage of both the new success path
+# and the two still-raising conditions.
+
+
+def test_create_unknown_branch_without_base_defaults_to_checked_out_branch(
     manager: WorktreeManager, temp_repo: Path
 ):
+    """v0.3.3: an unknown branch with `base` omitted no longer raises -- it
+    defaults to the branch currently checked out at the main clone (`main`,
+    in `temp_repo`) and the new worktree is created from that tip.
+
+    Advances `main` past the commit `feature/alpha` was branched from so the
+    two SHAs provably diverge, proving the new worktree is based on main's
+    *current* tip rather than merely some commit shared by every branch in
+    the fixture.
+    """
+    (temp_repo / "README.md").write_text("hello again\n", encoding="utf-8")
+    _git("add", "-A", cwd=temp_repo)
+    _git("commit", "-q", "-m", "second commit on main", cwd=temp_repo)
+
+    main_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    alpha_sha = subprocess.run(
+        ["git", "rev-parse", "feature/alpha"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert main_sha != alpha_sha  # sanity: the fixture's branches now diverge
+
+    rec = manager.create(str(temp_repo), "feature/does-not-exist")
+
+    assert rec.branch == "feature/does-not-exist"
+    assert Path(rec.path).exists()
+    wt_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=rec.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert wt_sha == main_sha, (
+        "New worktree's HEAD must match main's tip (the defaulted base), "
+        "not feature/alpha's older commit"
+    )
+
+
+def test_create_unknown_branch_without_base_raises_when_head_detached(
+    manager: WorktreeManager, temp_repo: Path
+):
+    """Still raises BranchNotFoundError when the main clone's HEAD is
+    detached -- there is no "currently checked out branch" to default to."""
+    _git("checkout", "--detach", "HEAD", cwd=temp_repo)
+
     with pytest.raises(BranchNotFoundError):
         manager.create(str(temp_repo), "feature/does-not-exist")
+
+
+def test_create_unknown_branch_without_base_raises_when_head_unborn(
+    manager: WorktreeManager, tmp_path: Path
+):
+    """Still raises BranchNotFoundError when the main clone's HEAD is
+    unborn (freshly `git init`ed, no commits yet) -- there is no branch
+    checked out to default to. Uses a bespoke repo rather than the
+    `temp_repo` fixture, which commits immediately on setup."""
+    repo = tmp_path / "unborn-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+
+    with pytest.raises(BranchNotFoundError):
+        manager.create(str(repo), "feature/does-not-exist")
 
 
 def test_create_unknown_branch_with_base(
