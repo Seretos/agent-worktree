@@ -13,6 +13,7 @@ addressing path, and the hard primary-removal refusal.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -55,6 +56,18 @@ def _write_contract(path: Path, content: str) -> None:
     seretos = path / ".seretos"
     seretos.mkdir(parents=True, exist_ok=True)
     (seretos / "worktree-setup.yml").write_text(content, encoding="utf-8")
+
+
+def _make_orphan(repo: Path, base: Path) -> Path:
+    """Create a linked git worktree via a raw ``git worktree add`` subprocess
+    call, bypassing ``manager.create()`` entirely so nothing is ever
+    persisted to the state store. Simulates a checkout that shows up in
+    ``git worktree list --porcelain`` (and thus in ``environment_list`` with
+    ``tracked: False``) but was never created through this plugin -- an
+    orphan/untracked linked worktree (ticket #113)."""
+    orphan_path = base / "orphan-wt"
+    _git("worktree", "add", "-b", "orphan-branch", str(orphan_path), cwd=repo)
+    return orphan_path
 
 
 def _make_tool_fixtures(tmp_path: Path) -> Tuple[WorktreeManager, dict, dict]:
@@ -400,6 +413,153 @@ def test_worktree_remove_unknown_id_still_soft_error(tmp_path: Path):
     result = fns["worktree_remove"](environment_id="definitely-unknown-99999")
     assert isinstance(result, dict)
     assert "error" in result
+    # An ordinary (non-untracked-shaped) unknown id gets the original bare
+    # format -- no raw engine-exception suffix, since the engine's plain
+    # "No worktree tracked with id '...'" text carries no remedy hint worth
+    # surfacing here. This preserves backward compatibility for callers who
+    # may depend on the exact bare-error string shape (ticket #113 review
+    # fix).
+    assert result["error"] == "environment 'definitely-unknown-99999' not found"
+    assert "tracked with id" not in result["error"]
+
+
+# ---- Ticket #113: untracked orphan recovery via checkout_path ----
+#
+# An orphaned/untracked linked worktree shows up in `environment_list` with
+# a well-formed-looking id (`<slug>-untracked-<8hex>`), but that id is a
+# one-way hash of the checkout path, not a state-store key -- it can never
+# resolve through `worktree_remove(environment_id=...)`. `checkout_path` is
+# the only way to address it. `manager.remove()` already supports this at
+# the engine layer (v0.3.2); these tests drive `worktree_remove`'s
+# `checkout_path` forwarding.
+
+
+def test_worktree_remove_untracked_orphan_by_checkout_path(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    orphan_path = _make_orphan(temp_repo, tmp_path)
+
+    result = fns["worktree_remove"](checkout_path=str(orphan_path))
+
+    assert "error" not in result
+    assert re.search(r"-untracked-[0-9a-f]{8}$", result["id"])
+    assert result["status"] == "removed"
+    assert not orphan_path.exists()
+    assert mgr.state.list() == []
+
+
+def test_worktree_remove_orphan_leaves_branch_intact(tmp_path: Path, temp_repo: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    orphan_path = _make_orphan(temp_repo, tmp_path)
+
+    result = fns["worktree_remove"](checkout_path=str(orphan_path), force=True)
+
+    assert "error" not in result
+    branches = subprocess.run(
+        ["git", "branch", "--list", "orphan-branch"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "orphan-branch" in branches
+
+
+def test_worktree_remove_by_checkout_path_on_tracked_worktree(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    assert mgr.state.list() == [rec]
+
+    result = fns["worktree_remove"](checkout_path=rec.path)
+
+    assert "error" not in result
+    assert result["id"] == rec.id
+    assert result["status"] == "removed"
+    assert mgr.state.list() == []
+
+
+def test_worktree_remove_checkout_path_and_id_mismatch_raises_valueerror(
+    tmp_path: Path
+):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    mgr.create(str(repo2), "feature/wt2")
+
+    with pytest.raises(ValueError):
+        fns["worktree_remove"](environment_id=rec1.id, checkout_path=str(repo2))
+
+    # Neither worktree was touched by the failed, mismatched call.
+    assert Path(rec1.path).exists()
+
+
+def test_worktree_remove_with_neither_target_raises_valueerror(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    with pytest.raises(ValueError):
+        fns["worktree_remove"]()
+
+
+def test_worktree_remove_checkout_path_outside_any_repo(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    # Observed engine behaviour: classify_checkout() raises InvalidRepoError
+    # (a WorktreeError) before any store/removal logic runs, which the tool
+    # wrapper's catch-all `except WorktreeError` maps to a raised
+    # ValueError -- not a soft error dict, since this isn't a "target not
+    # found" condition but an invalid argument.
+    with pytest.raises(ValueError):
+        fns["worktree_remove"](checkout_path=str(non_repo))
+
+
+@pytest.mark.parametrize("pre_start", [False, True])
+@pytest.mark.parametrize("force", [False, True])
+def test_worktree_remove_primary_by_checkout_path_refused_even_unstarted(
+    tmp_path: Path, temp_repo: Path, pre_start: bool, force: bool
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    if pre_start:
+        started = fns["environment_start"](checkout_path=str(temp_repo))
+        assert "error" not in started
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](checkout_path=str(temp_repo), force=force)
+    msg = str(excinfo.value)
+    assert "primary" in msg
+    assert "backing" in msg
+
+    # The primary checkout was never touched.
+    assert temp_repo.exists()
+    assert (temp_repo / ".git").exists()
+
+
+def test_worktree_remove_untracked_id_soft_error_names_checkout_path(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _make_orphan(temp_repo, tmp_path)
+
+    listing = fns["environment_list"](path=str(temp_repo))
+    orphan_entry = next(
+        e for e in listing if e["backing"] == "worktree" and e["tracked"] is False
+    )
+    orphan_id = orphan_entry["id"]
+
+    result = fns["worktree_remove"](environment_id=orphan_id)
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert orphan_id in result["error"]
+    assert "not found" in result["error"]
+    assert "checkout_path" in result["error"]
 
 
 # ---- R7: environment_start/stop work against both the primary and a
@@ -942,6 +1102,20 @@ def test_worktree_create_docstring_documents_contract_schema(tmp_path: Path):
         "isolation:",
     ):
         assert token in doc, f"worktree_create docstring missing {token!r}"
+
+
+def test_worktree_remove_docstring_documents_checkout_path_and_orphan_case(
+    tmp_path: Path,
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["worktree_remove"].__doc__ or ""
+
+    for token in (
+        "checkout_path",
+        "-untracked-",
+        "untracked",
+    ):
+        assert token in doc, f"worktree_remove docstring missing {token!r}"
 
 
 def test_environment_start_docstring_lists_all_contract_keys(tmp_path: Path):
