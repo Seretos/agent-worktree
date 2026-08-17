@@ -160,3 +160,30 @@ def test_source_docstrings_state_untracked_orphan_recovery():
         "worktree.py's _entry_to_dict and environment_list docstrings must "
         "both attribute the synthesised id to untracked_id_for()"
     )
+
+
+def test_docs_state_base_default_behaviour():
+    """AGENTS.md and SKILL.md must document that omitting `base` for a
+    not-yet-existing branch defaults to the branch currently checked out at
+    repo_root, and the detached/unborn-HEAD exception -- and AGENTS.md must
+    no longer carry the stale phrasing that implied base was mandatory for
+    a new branch (ticket #110, Befund 1)."""
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        text_lower = text.lower()
+
+        assert (
+            "currently checked out" in text_lower
+            or "currently checked-out" in text_lower
+        ), f"{path.name} does not document the base default-to-checked-out-branch behaviour"
+
+        assert "detached" in text_lower and "unborn" in text_lower, (
+            f"{path.name} does not document the detached/unborn HEAD exception "
+            "to the base default"
+        )
+
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    assert "Omit when `branch` already exists." not in agents_text, (
+        "AGENTS.md still carries the stale base-row phrasing that implied "
+        "base was mandatory for a new branch"
+    )
