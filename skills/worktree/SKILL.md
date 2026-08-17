@@ -256,7 +256,8 @@ finds it) but has no persisted record — `environment_list` shows it with
 `tracked: false` and a synthesised, display-only id
 (`<repo-slug>-<branch-slug>-untracked-<8-hex>`). That id is a one-way derivation of the
 checkout's path, not a state-store key, so `worktree_remove(environment_id=<that id>)`
-can never resolve it — it always comes back as a soft not-found error. The working
+can never resolve it — it always comes back as a soft not-found error
+(`{"error": "...", "code": "not_found"}`). The working
 recipe is:
 
 1. `environment_list(path=<repo_root>)` — find the entry with `tracked: false` (and
@@ -268,6 +269,14 @@ recipe is:
 Removing an orphan this way never touches the state store (nothing was recorded there
 to remove) and never deletes its branch, even with `force=true`, since an orphan is
 never recorded as owning one.
+
+**Soft error codes.** `worktree_remove`, `environment_start`, and `environment_stop`
+all return an additive machine-readable `code` field alongside `error` on their soft
+(non-raising) failure paths, so callers can branch on `code` instead of parsing the
+error text: `code: "not_found"` (target not found — all three tools), `code:
+"already_running"` (`environment_start` when a process is already running under the
+given `role`), and `code: "not_running"` (`environment_stop` when no process is
+running under the given `role`).
 
 ## Pitfalls
 

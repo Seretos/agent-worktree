@@ -73,6 +73,18 @@ joined and never counted against the cap for *future* scans -- so a
 long-lived host process making many *sequential* ``worktree_remove`` calls
 still leaks roughly one thread per call, once the cap has filled. These
 tests are the empirical proof.
+
+**Cross-reference (ticket #112):** a *separate* investigation into an
+intermittent "Connection closed" symptom on Windows considered this ticket's
+thread leak as a candidate cause and **falsified** it -- see
+``tests/test_signal_resilience.py``'s module docstring for the full writeup.
+The real #112 mechanism is a Windows ``CTRL_BREAK_EVENT`` delivery ambiguity
+in the pinned engine's ``_send_graceful_signal``, entirely independent of
+``_win_handle_holders``/the handle-scan code path this file's tests exercise.
+``tests/test_signal_resilience.py::test_default_environment_stop_never_reaches_handle_scan``
+is the executable proof that a default (``kill_orphans=False``)
+``environment_stop`` call never reaches this file's leak-implicated code
+path at all.
 """
 
 from __future__ import annotations

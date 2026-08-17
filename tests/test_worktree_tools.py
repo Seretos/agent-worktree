@@ -2356,3 +2356,150 @@ def test_worktree_stop_docstring_documents_repo_root_contract_location():
         "worktree_stop docstring must document that isolation: none forbids "
         "start:/stop:/ports:"
     )
+
+
+# ---- Ticket #112: soft-error dicts carry a machine-readable `code` ----
+#
+# Additive to the pre-existing `{"error": "..."}` soft-error shape at all 5
+# not-found/already-running/not-running call sites, so MCP callers can
+# branch on `code` instead of parsing the `error` string. The `error` text
+# itself must stay byte-identical -- see
+# test_soft_error_message_text_unchanged_alongside_code below, and the
+# untouched exact-string assertions elsewhere in this file (e.g.
+# test_tool_environment_start_empty_string_id_not_absent,
+# test_tool_environment_stop_empty_string_id_not_absent,
+# test_tool_worktree_remove_empty_string_id_not_absent), which this ticket
+# deliberately leaves unedited as must-stay-passing guards.
+
+_SOFT_ERROR_CODE_SITES = [
+    (
+        "worktree_remove",
+        "remove",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_start",
+        "start",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_start",
+        "start",
+        ProcessAlreadyRunningError("wt-id", "main", 12345),
+        {"environment_id": "wt-id"},
+        "already_running",
+        "process already running for worktree 'wt-id' role 'main' (pid=12345)",
+    ),
+    (
+        "environment_stop",
+        "stop",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_stop",
+        "stop",
+        ProcessNotRunningError("wt-id", "main"),
+        {"environment_id": "wt-id"},
+        "not_running",
+        "no running process for worktree 'wt-id' role 'main'",
+    ),
+]
+
+_SOFT_ERROR_CODE_SITE_IDS = [
+    "worktree_remove-not_found",
+    "environment_start-not_found",
+    "environment_start-already_running",
+    "environment_stop-not_found",
+    "environment_stop-not_running",
+]
+
+
+@pytest.mark.parametrize(
+    "tool_name,mock_attr,exception,call_kwargs,expected_code,expected_error",
+    _SOFT_ERROR_CODE_SITES,
+    ids=_SOFT_ERROR_CODE_SITE_IDS,
+)
+def test_soft_error_dicts_carry_machine_readable_code(
+    tmp_path: Path,
+    tool_name: str,
+    mock_attr: str,
+    exception: Exception,
+    call_kwargs: dict,
+    expected_code: str,
+    expected_error: str,
+):
+    """Driving test (RED before this ticket: no ``"code"`` key existed at
+    any of the 5 soft-error call sites). Every soft-error dict returned by
+    ``worktree_remove``/``environment_start``/``environment_stop`` must now
+    carry an additive machine-readable ``"code"`` key alongside the
+    pre-existing ``"error"`` text."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    setattr(mgr, mock_attr, MagicMock(side_effect=exception))
+
+    result = fns[tool_name](**call_kwargs)
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "code" in result, f"expected a 'code' key in {result}"
+    assert result["code"] == expected_code
+    assert result["error"] == expected_error
+
+
+def test_soft_error_message_text_unchanged_alongside_code(tmp_path: Path):
+    """The 5 soft-error call sites' ``"error"`` text must be byte-identical
+    to what it was before the ``"code"`` key was added -- adding ``code``
+    must never reword, reorder, or repunctuate the existing message. Each
+    literal string here is hardcoded independently of the implementation,
+    so a future accidental reword of the error text (not just a missing
+    code) would fail this test."""
+    from unittest.mock import MagicMock
+
+    for tool_name, mock_attr, exception, call_kwargs, _code, expected_error in _SOFT_ERROR_CODE_SITES:
+        mgr, fns = _make_tool_fixtures(tmp_path)
+        setattr(mgr, mock_attr, MagicMock(side_effect=exception))
+
+        result = fns[tool_name](**call_kwargs)
+
+        assert result["error"] == expected_error, (
+            f"{tool_name} error text changed: got {result['error']!r}, "
+            f"expected {expected_error!r}"
+        )
+
+
+def test_soft_error_code_absent_on_success(tmp_path: Path):
+    """A successful (non-error) record dict from worktree_remove/
+    environment_start/environment_stop must never carry a ``"code"`` key --
+    guards against a blanket/implementation mistake that injects ``code``
+    unconditionally rather than only on the 5 documented soft-error paths."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    remove_record = _make_removed_record()
+    mgr.remove = MagicMock(return_value=remove_record)
+    remove_result = fns["worktree_remove"](environment_id="wt-id")
+    assert "error" not in remove_result
+    assert "code" not in remove_result
+
+    start_record = _make_running_record()
+    mgr.start = MagicMock(return_value=start_record)
+    start_result = fns["environment_start"](environment_id="wt-id")
+    assert "error" not in start_result
+    assert "code" not in start_result
+
+    stop_record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=stop_record)
+    stop_result = fns["environment_stop"](environment_id="wt-id")
+    assert "error" not in stop_result
+    assert "code" not in stop_result
