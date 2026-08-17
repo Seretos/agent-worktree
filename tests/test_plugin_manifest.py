@@ -187,3 +187,39 @@ def test_docs_state_base_default_behaviour():
         "AGENTS.md still carries the stale base-row phrasing that implied "
         "base was mandatory for a new branch"
     )
+
+
+# ---- Ticket #112: soft-error `code` values + Windows signal-handling docs ----
+
+
+def test_docs_document_soft_error_codes_and_signal_guard():
+    """AGENTS.md must document the 3 machine-readable soft-error ``code``
+    values (``not_found``/``already_running``/``not_running``) and a new
+    "Signal handling on Windows" note covering the SIGBREAK guard, the
+    deliberate non-change to SIGINT, and the upstream engine hazard
+    (recommended, not implemented here). SKILL.md must mirror the 3 code
+    values in its existing soft-error prose.
+
+    RED (pre-fix): none of these tokens exist in either doc yet.
+    """
+    code_values = ["not_found", "already_running", "not_running"]
+
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        for code in code_values:
+            assert code in text, (
+                f"{path.name} is missing the soft-error code value {code!r}"
+            )
+
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    assert "SIGBREAK" in agents_text or "Ctrl+Break" in agents_text, (
+        "AGENTS.md is missing a Ctrl+Break/SIGBREAK signal-handling note"
+    )
+    assert "SIGINT" in agents_text, (
+        "AGENTS.md does not mention SIGINT's deliberately unchanged disposition"
+    )
+    agents_lower = agents_text.lower()
+    assert "unchanged" in agents_lower or "untouched" in agents_lower, (
+        "AGENTS.md does not state that SIGINT's disposition is deliberately "
+        "left unchanged/untouched"
+    )

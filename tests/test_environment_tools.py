@@ -421,6 +421,9 @@ def test_worktree_remove_unknown_id_still_soft_error(tmp_path: Path):
     # fix).
     assert result["error"] == "environment 'definitely-unknown-99999' not found"
     assert "tracked with id" not in result["error"]
+    # Ticket #112: additive machine-readable code alongside the unchanged
+    # error text above.
+    assert result["code"] == "not_found"
 
 
 # ---- Ticket #113: untracked orphan recovery via checkout_path ----
@@ -560,6 +563,9 @@ def test_worktree_remove_untracked_id_soft_error_names_checkout_path(
     assert orphan_id in result["error"]
     assert "not found" in result["error"]
     assert "checkout_path" in result["error"]
+    # Ticket #112: additive machine-readable code alongside the unchanged
+    # error text above.
+    assert result["code"] == "not_found"
 
 
 # ---- R7: environment_start/stop work against both the primary and a

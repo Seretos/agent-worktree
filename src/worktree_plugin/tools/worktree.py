@@ -509,10 +509,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         is a dict with ``pid`` (int), ``name`` (str), and ``cmdline`` (list of
         str) describing a process that was terminated to unblock removal.
 
-        If the target is not found, returns ``{"error": "..."}`` instead of
-        raising, so callers can treat not-found as a soft/idempotent
-        condition. When ``environment_id`` looks like a synthesised untracked
-        id, the error text names ``checkout_path`` as the remedy.
+        If the target is not found, returns ``{"error": "...", "code":
+        "not_found"}`` instead of raising, so callers can treat not-found as
+        a soft/idempotent condition, and can branch on ``code`` rather than
+        parsing the error text. When ``environment_id`` looks like a
+        synthesised untracked id, the error text names ``checkout_path`` as
+        the remedy (``code`` is ``"not_found"`` either way).
 
         Raises ``ValueError`` (mapped from ``WorktreeDirLockedError``) when the
         worktree directory is still locked after attempting to kill blocking
@@ -556,7 +558,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 environment_id
             ):
                 error_text = f"{error_text}: {exc}"
-            return {"error": error_text}
+            return {"error": error_text, "code": "not_found"}
         except WorktreeDirLockedError as exc:
             raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
@@ -785,8 +787,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         The operation is idempotent in the sense that if a process is already
         running under the given ``role``, this tool returns a soft error dict
-        ``{"error": "..."}`` rather than raising, so callers can treat the
-        already-running case gracefully.
+        ``{"error": "...", "code": "already_running"}`` rather than raising,
+        so callers can treat the already-running case gracefully and branch
+        on ``code`` rather than parsing the error text.
 
         On success returns the canonical environment record dict. Fields of
         note:
@@ -826,10 +829,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           or ``"contract-unreadable"`` (the contract exists but could not be
           read/parsed).
 
-        If the target is not found, returns ``{"error": "..."}`` instead of
-        raising, so callers can treat not-found as a soft/idempotent
-        condition. The message names whichever target identifier was
-        supplied (``environment_id`` if given, else ``checkout_path``).
+        If the target is not found, returns ``{"error": "...", "code":
+        "not_found"}`` instead of raising, so callers can treat not-found as
+        a soft/idempotent condition, and can branch on ``code`` rather than
+        parsing the error text. The message names whichever target
+        identifier was supplied (``environment_id`` if given, else
+        ``checkout_path``).
         """
 
         try:
@@ -845,9 +850,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             target_name = (
                 environment_id if environment_id is not None else checkout_path
             )
-            return {"error": f"environment '{target_name}' not found"}
+            return {
+                "error": f"environment '{target_name}' not found",
+                "code": "not_found",
+            }
         except ProcessAlreadyRunningError as exc:
-            return {"error": str(exc)}
+            return {"error": str(exc), "code": "already_running"}
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
@@ -875,7 +883,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         Unlike ``environment_start``, stopping never materialises a primary
         record: an unstarted primary has nothing to stop, so it returns the
-        same soft ``{"error": "..."}`` not-found dict as an unknown
+        same soft not-found dict (``{"error": "...", "code": "not_found"}``
+        -- see "If the target is not found" below) as an unknown
         ``environment_id`` rather than creating a record just to stop it.
 
         Parameters
@@ -922,8 +931,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         The operation is idempotent in the sense that if no process is running
         under the given ``role``, this tool returns a soft error dict
-        ``{"error": "..."}`` rather than raising, so callers can treat the
-        already-stopped case gracefully.
+        ``{"error": "...", "code": "not_running"}`` rather than raising, so
+        callers can treat the already-stopped case gracefully and branch on
+        ``code`` rather than parsing the error text.
 
         On success returns the canonical environment record dict. Fields of
         note:
@@ -936,10 +946,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``ports``: a dict mapping port name to host port number; empty dict
           ``{}`` for environments with no port setup.
 
-        If the target is not found, returns ``{"error": "..."}`` instead of
-        raising, so callers can treat not-found as a soft/idempotent
-        condition. The message names whichever target identifier was
-        supplied (``environment_id`` if given, else ``checkout_path``).
+        If the target is not found, returns ``{"error": "...", "code":
+        "not_found"}`` instead of raising, so callers can treat not-found as
+        a soft/idempotent condition, and can branch on ``code`` rather than
+        parsing the error text. The message names whichever target
+        identifier was supplied (``environment_id`` if given, else
+        ``checkout_path``).
         """
 
         try:
@@ -954,9 +966,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             target_name = (
                 environment_id if environment_id is not None else checkout_path
             )
-            return {"error": f"environment '{target_name}' not found"}
+            return {
+                "error": f"environment '{target_name}' not found",
+                "code": "not_found",
+            }
         except ProcessNotRunningError as exc:
-            return {"error": str(exc)}
+            return {"error": str(exc), "code": "not_running"}
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
