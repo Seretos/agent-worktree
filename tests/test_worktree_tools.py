@@ -80,11 +80,93 @@ def test_create_list_remove_roundtrip(manager: WorktreeManager, temp_repo: Path)
     assert manager.list() == []
 
 
-def test_create_unknown_branch_without_base(
+# ---- Ticket #114: v0.3.3 default-base semantics for create() ----
+#
+# v0.3.2 always raised BranchNotFoundError when `branch` did not exist and
+# `base` was omitted. v0.3.3 (see WorktreeManager.create()'s docstring and
+# manager._current_branch()) changed that: an omitted `base` now defaults to
+# the branch currently checked out at the main clone, and only still raises
+# when that HEAD is detached or unborn (no commits yet) -- the two cases
+# where no sensible default branch exists. The three tests below replace the
+# old single "always raises" test with coverage of both the new success path
+# and the two still-raising conditions.
+
+
+def test_create_unknown_branch_without_base_defaults_to_checked_out_branch(
     manager: WorktreeManager, temp_repo: Path
 ):
+    """v0.3.3: an unknown branch with `base` omitted no longer raises -- it
+    defaults to the branch currently checked out at the main clone (`main`,
+    in `temp_repo`) and the new worktree is created from that tip.
+
+    Advances `main` past the commit `feature/alpha` was branched from so the
+    two SHAs provably diverge, proving the new worktree is based on main's
+    *current* tip rather than merely some commit shared by every branch in
+    the fixture.
+    """
+    (temp_repo / "README.md").write_text("hello again\n", encoding="utf-8")
+    _git("add", "-A", cwd=temp_repo)
+    _git("commit", "-q", "-m", "second commit on main", cwd=temp_repo)
+
+    main_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    alpha_sha = subprocess.run(
+        ["git", "rev-parse", "feature/alpha"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert main_sha != alpha_sha  # sanity: the fixture's branches now diverge
+
+    rec = manager.create(str(temp_repo), "feature/does-not-exist")
+
+    assert rec.branch == "feature/does-not-exist"
+    assert Path(rec.path).exists()
+    wt_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=rec.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert wt_sha == main_sha, (
+        "New worktree's HEAD must match main's tip (the defaulted base), "
+        "not feature/alpha's older commit"
+    )
+
+
+def test_create_unknown_branch_without_base_raises_when_head_detached(
+    manager: WorktreeManager, temp_repo: Path
+):
+    """Still raises BranchNotFoundError when the main clone's HEAD is
+    detached -- there is no "currently checked out branch" to default to."""
+    _git("checkout", "--detach", "HEAD", cwd=temp_repo)
+
     with pytest.raises(BranchNotFoundError):
         manager.create(str(temp_repo), "feature/does-not-exist")
+
+
+def test_create_unknown_branch_without_base_raises_when_head_unborn(
+    manager: WorktreeManager, tmp_path: Path
+):
+    """Still raises BranchNotFoundError when the main clone's HEAD is
+    unborn (freshly `git init`ed, no commits yet) -- there is no branch
+    checked out to default to. Uses a bespoke repo rather than the
+    `temp_repo` fixture, which commits immediately on setup."""
+    repo = tmp_path / "unborn-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+
+    with pytest.raises(BranchNotFoundError):
+        manager.create(str(repo), "feature/does-not-exist")
 
 
 def test_create_unknown_branch_with_base(
@@ -473,6 +555,22 @@ def test_tool_environment_start_unknown_id_returns_soft_error(tmp_path: Path):
     assert "wt-missing" in result["error"]
 
 
+def test_tool_environment_start_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.start = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["environment_start"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
+
+
 def test_tool_environment_start_already_running_returns_soft_error(tmp_path: Path):
     """environment_start when already running must return soft-error dict, not raise."""
     from unittest.mock import MagicMock
@@ -531,6 +629,22 @@ def test_tool_environment_stop_unknown_id_returns_soft_error(tmp_path: Path):
     assert isinstance(result, dict)
     assert "error" in result
     assert "wt-missing" in result["error"]
+
+
+def test_tool_environment_stop_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.stop = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["environment_stop"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
 
 
 def test_tool_environment_stop_not_running_returns_soft_error(tmp_path: Path):
@@ -747,7 +861,7 @@ def test_tool_worktree_remove_kill_blocking_processes_forwarded(tmp_path: Path):
     fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
 
     mgr.remove.assert_called_once_with(
-        "wt-id", force=False, kill_blocking_processes=True
+        "wt-id", force=False, kill_blocking_processes=True, checkout_path=None
     )
 
 
@@ -763,7 +877,7 @@ def test_tool_worktree_remove_default_kill_false_forwarded(tmp_path: Path):
     fns["worktree_remove"](environment_id="wt-id")
 
     mgr.remove.assert_called_once_with(
-        "wt-id", force=False, kill_blocking_processes=False
+        "wt-id", force=False, kill_blocking_processes=False, checkout_path=None
     )
 
 
@@ -818,6 +932,22 @@ def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
 
     with pytest.raises(ValueError):
         fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
+
+
+def test_tool_worktree_remove_empty_string_id_not_absent(tmp_path: Path):
+    """Regression test: environment_id="" is a present-but-empty identifier,
+    not an absent one -- the not-found error must name it (empty string),
+    not silently fall back to checkout_path (which is None here)."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(side_effect=WorktreeNotFoundError(""))
+
+    result = fns["worktree_remove"](environment_id="")
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert result["error"] == "environment '' not found"
 
 
 def test_tool_worktree_remove_not_found_still_soft_error(tmp_path: Path):
@@ -887,7 +1017,7 @@ def test_tool_worktree_remove_teardown_before_remove_force_forwarded(tmp_path: P
 
     # Call contract: force=True forwarded correctly.
     mgr.remove.assert_called_once_with(
-        "wt-48-force", force=True, kill_blocking_processes=False
+        "wt-48-force", force=True, kill_blocking_processes=False, checkout_path=None
     )
     # Return-value contract: must be the removed record, not a soft-error.
     assert isinstance(result, dict)
@@ -970,6 +1100,405 @@ def test_create_does_not_overwrite_existing_contract_dir(tmp_path: Path):
     assert "error" not in result
     wt_contract = Path(result["path"]) / ".seretos" / "worktree-setup.yml"
     assert wt_contract.exists(), "Tracked .seretos/ must still be present after create"
+
+
+# ---- Ticket #110: freshly created worktrees remove without force ----
+
+
+def test_create_then_remove_without_force_succeeds_with_untracked_contract_dir(
+    tmp_path: Path,
+):
+    """A freshly created worktree whose .seretos/ was copied in (untracked)
+    must be removable with worktree_remove's default force=False.
+
+    Before the fix, the untracked .seretos/ copy made git consider the
+    worktree dirty, so plain removal raised DirtyWorktreeError -> ValueError
+    and force=True was practically mandatory (ticket #110, Befund 2)."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    # Place .seretos/ in the repo root but do NOT git-add it (untracked).
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    create_result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in create_result
+
+    remove_result = fns["worktree_remove"](environment_id=create_result["id"])
+
+    assert "error" not in remove_result, (
+        f"Expected plain removal (force=False) to succeed, got: {remove_result}"
+    )
+    assert remove_result["status"] == "removed"
+    assert not Path(create_result["path"]).exists()
+
+
+def test_create_leaves_worktree_git_clean(tmp_path: Path):
+    """After copying an untracked .seretos/ into the new worktree, `git
+    status --porcelain` run inside the worktree must report nothing -- the
+    copy must be invisible to git, mechanism-agnostic of how that is
+    achieved."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in result
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == "", (
+        f"Expected clean git status in new worktree, got: {status.stdout!r}"
+    )
+    assert ".seretos" not in status.stdout
+
+
+def test_create_does_not_modify_repo_root_or_source_contract_dir(tmp_path: Path):
+    """The fix must be fully contained inside the new worktree: it must not
+    write a .gitignore into the source .seretos/ under repo_root, and it
+    must not write to the shared common git dir's info/exclude."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in result
+
+    assert not (repo / ".seretos" / ".gitignore").exists(), (
+        "Fix must not write a .gitignore into repo_root's source .seretos/"
+    )
+    exclude_path = repo / ".git" / "info" / "exclude"
+    if exclude_path.exists():
+        assert ".seretos" not in exclude_path.read_text(encoding="utf-8")
+
+
+def test_create_preserves_existing_gitignore_in_copied_contract_dir(tmp_path: Path):
+    """If the source .seretos/ already ships its own .gitignore, the fix must
+    append its self-ignoring rule rather than clobbering the existing
+    content, and the resulting worktree must still be git-clean."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    (seretos / ".gitignore").write_text("foo\n", encoding="utf-8")
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in result
+
+    wt_gitignore = Path(result["path"]) / ".seretos" / ".gitignore"
+    content = wt_gitignore.read_text(encoding="utf-8")
+    assert "foo" in content, "Existing .gitignore content must be preserved"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+
+def test_create_tracked_contract_dir_gets_no_injected_gitignore(tmp_path: Path):
+    """When .seretos/ is git-tracked (git already copied it into the new
+    worktree), worktree_create must skip the copy entirely and must not
+    inject a .gitignore -- but the worktree is still git-clean and still
+    removable without force, since git already tracks the directory."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    create_result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in create_result
+
+    wt_gitignore = Path(create_result["path"]) / ".seretos" / ".gitignore"
+    assert not wt_gitignore.exists(), (
+        "Tracked .seretos/ must not receive an injected .gitignore"
+    )
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=create_result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+    remove_result = fns["worktree_remove"](environment_id=create_result["id"])
+    assert "error" not in remove_result
+    assert remove_result["status"] == "removed"
+
+
+def test_ensure_contract_copy_ignored_is_idempotent(tmp_path: Path):
+    """Calling the helper twice on the same directory must not duplicate the
+    self-ignoring rule.
+
+    The idempotency signal is the helper's own marker comment (not "any bare
+    '*' line" -- see test_create_preserves_gitignore_with_star_then_negation
+    for why that detection would be wrong), so this asserts the marker
+    appears exactly once after two calls."""
+    from worktree_plugin.tools.worktree import _ensure_contract_copy_ignored
+
+    target = tmp_path / "contract-dir"
+    target.mkdir()
+
+    _ensure_contract_copy_ignored(target)
+    _ensure_contract_copy_ignored(target)
+
+    content = (target / ".gitignore").read_text(encoding="utf-8")
+    marker = "# Ticket #110: keep this create-time copy out of git status."
+    marker_count = content.count(marker)
+    assert marker_count == 1, (
+        f"Expected the idempotency marker exactly once after two calls, got "
+        f"{marker_count} occurrences in: {content!r}"
+    )
+    star_lines = [line for line in content.splitlines() if line.strip() == "*"]
+    assert len(star_lines) == 1, (
+        f"Expected exactly one '*' line after two calls, got: {content!r}"
+    )
+
+
+def test_create_preserves_gitignore_with_star_then_negation(tmp_path: Path):
+    """Regression for the order-sensitivity bug in the marker-detection fix:
+    gitignore semantics mean the *last* matching pattern wins, so a source
+    .seretos/.gitignore containing a bare '*' followed by a later negation
+    (e.g. '!worktree-setup.yml') does NOT actually ignore everything -- the
+    negated file stays visible to git. Detecting "already self-ignoring"
+    from the presence of any bare '*' line (the pre-fix behaviour) would
+    wrongly skip appending an overriding '*' at the end, leaving the copied
+    .seretos/ only partially ignored and the worktree dirty. The fix must
+    always append its own trailing '*' (using its own marker comment, not a
+    bare-'*' scan, to detect idempotency) so it wins regardless of what the
+    pre-existing file contains."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    (seretos / ".gitignore").write_text("*\n!worktree-setup.yml\n", encoding="utf-8")
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in result
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == "", (
+        f"Expected clean git status even with a source .gitignore containing "
+        f"'*' followed by a negation, got: {status.stdout!r}"
+    )
+
+    remove_result = fns["worktree_remove"](environment_id=result["id"])
+    assert "error" not in remove_result, (
+        f"Expected plain removal (force=False) to succeed, got: {remove_result}"
+    )
+    assert remove_result["status"] == "removed"
+
+
+def test_worktree_create_docstring_documents_base_default(tmp_path: Path):
+    """worktree_create's docstring -- the MCP tool description an agent
+    reads -- must document that omitting `base` for a not-yet-existing
+    branch defaults to whatever branch is currently checked out at
+    repo_root, and that a detached/unborn HEAD still raises (ticket #110,
+    Befund 1; the default behaviour itself shipped in #114's v0.3.3 bump)."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    doc = fns["worktree_create"].__doc__ or ""
+    doc_lower = doc.lower()
+    assert "currently checked out" in doc_lower or "currently checked-out" in doc_lower, (
+        "worktree_create docstring must document the default-to-checked-out-"
+        "branch behaviour when base is omitted"
+    )
+    assert "detached" in doc_lower and "unborn" in doc_lower, (
+        "worktree_create docstring must document that a detached or unborn "
+        "HEAD still raises even with the base default"
+    )
+
+
+def test_create_preserves_non_utf8_existing_gitignore_bytes(tmp_path: Path):
+    """If the source .seretos/.gitignore is not valid UTF-8 (e.g. cp1252),
+    worktree_create must still succeed (no unwrapped UnicodeDecodeError),
+    the new worktree must be git-clean, worktree_remove must succeed with
+    force left at its default False, and -- crucially -- the copied
+    .gitignore's original bytes must be preserved unchanged. A whole-file
+    rewrite through a tolerant/lossy decode would silently corrupt those
+    bytes; only a true append (never reading the pre-existing bytes back out
+    through decode+encode) guarantees this."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    non_utf8_bytes = b"caf\xe9\n"  # cp1252 for "café\n"; invalid UTF-8
+    (seretos / ".gitignore").write_bytes(non_utf8_bytes)
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    create_result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in create_result
+
+    wt_gitignore = Path(create_result["path"]) / ".seretos" / ".gitignore"
+    copied_bytes = wt_gitignore.read_bytes()
+    assert copied_bytes.startswith(non_utf8_bytes), (
+        "Original non-UTF-8 bytes of the source .gitignore must be preserved "
+        f"unchanged at the start of the copy, got: {copied_bytes!r}"
+    )
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=create_result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == "", (
+        f"Expected clean git status with a non-UTF-8 source .gitignore, got: "
+        f"{status.stdout!r}"
+    )
+
+    remove_result = fns["worktree_remove"](environment_id=create_result["id"])
+    assert "error" not in remove_result, (
+        f"Expected plain removal (force=False) to succeed, got: {remove_result}"
+    )
+    assert remove_result["status"] == "removed"
+
+
+def test_create_appends_marker_on_gitignore_without_trailing_newline(tmp_path: Path):
+    """Reviewer nit: when the pre-existing .gitignore has no trailing
+    newline, the appended self-ignoring marker block must still land on its
+    own line rather than being glued onto the last existing line, and the
+    resulting worktree must still be git-clean."""
+    repo = tmp_path / "src-repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "init", cwd=repo)
+    _git("branch", "feature/wt", cwd=repo)
+
+    seretos = repo / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: none\n", encoding="utf-8"
+    )
+    (seretos / ".gitignore").write_text("foo", encoding="utf-8")  # no trailing newline
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    result = fns["worktree_create"](repo_root=str(repo), branch="feature/wt")
+    assert "error" not in result
+
+    wt_gitignore = Path(result["path"]) / ".seretos" / ".gitignore"
+    content = wt_gitignore.read_text(encoding="utf-8")
+    marker = "# Ticket #110: keep this create-time copy out of git status."
+    lines = content.splitlines()
+    assert "foo" in lines, (
+        f"Expected 'foo' to remain on its own line, got: {content!r}"
+    )
+    assert any(line == marker for line in lines), (
+        f"Expected marker header on its own line, got: {content!r}"
+    )
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=result["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
 
 
 # ---- Ticket #84: UX polish (path style, id-instability visibility) ----
@@ -1827,3 +2356,150 @@ def test_worktree_stop_docstring_documents_repo_root_contract_location():
         "worktree_stop docstring must document that isolation: none forbids "
         "start:/stop:/ports:"
     )
+
+
+# ---- Ticket #112: soft-error dicts carry a machine-readable `code` ----
+#
+# Additive to the pre-existing `{"error": "..."}` soft-error shape at all 5
+# not-found/already-running/not-running call sites, so MCP callers can
+# branch on `code` instead of parsing the `error` string. The `error` text
+# itself must stay byte-identical -- see
+# test_soft_error_message_text_unchanged_alongside_code below, and the
+# untouched exact-string assertions elsewhere in this file (e.g.
+# test_tool_environment_start_empty_string_id_not_absent,
+# test_tool_environment_stop_empty_string_id_not_absent,
+# test_tool_worktree_remove_empty_string_id_not_absent), which this ticket
+# deliberately leaves unedited as must-stay-passing guards.
+
+_SOFT_ERROR_CODE_SITES = [
+    (
+        "worktree_remove",
+        "remove",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_start",
+        "start",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_start",
+        "start",
+        ProcessAlreadyRunningError("wt-id", "main", 12345),
+        {"environment_id": "wt-id"},
+        "already_running",
+        "process already running for worktree 'wt-id' role 'main' (pid=12345)",
+    ),
+    (
+        "environment_stop",
+        "stop",
+        WorktreeNotFoundError("wt-missing"),
+        {"environment_id": "wt-missing"},
+        "not_found",
+        "environment 'wt-missing' not found",
+    ),
+    (
+        "environment_stop",
+        "stop",
+        ProcessNotRunningError("wt-id", "main"),
+        {"environment_id": "wt-id"},
+        "not_running",
+        "no running process for worktree 'wt-id' role 'main'",
+    ),
+]
+
+_SOFT_ERROR_CODE_SITE_IDS = [
+    "worktree_remove-not_found",
+    "environment_start-not_found",
+    "environment_start-already_running",
+    "environment_stop-not_found",
+    "environment_stop-not_running",
+]
+
+
+@pytest.mark.parametrize(
+    "tool_name,mock_attr,exception,call_kwargs,expected_code,expected_error",
+    _SOFT_ERROR_CODE_SITES,
+    ids=_SOFT_ERROR_CODE_SITE_IDS,
+)
+def test_soft_error_dicts_carry_machine_readable_code(
+    tmp_path: Path,
+    tool_name: str,
+    mock_attr: str,
+    exception: Exception,
+    call_kwargs: dict,
+    expected_code: str,
+    expected_error: str,
+):
+    """Driving test (RED before this ticket: no ``"code"`` key existed at
+    any of the 5 soft-error call sites). Every soft-error dict returned by
+    ``worktree_remove``/``environment_start``/``environment_stop`` must now
+    carry an additive machine-readable ``"code"`` key alongside the
+    pre-existing ``"error"`` text."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    setattr(mgr, mock_attr, MagicMock(side_effect=exception))
+
+    result = fns[tool_name](**call_kwargs)
+
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "code" in result, f"expected a 'code' key in {result}"
+    assert result["code"] == expected_code
+    assert result["error"] == expected_error
+
+
+def test_soft_error_message_text_unchanged_alongside_code(tmp_path: Path):
+    """The 5 soft-error call sites' ``"error"`` text must be byte-identical
+    to what it was before the ``"code"`` key was added -- adding ``code``
+    must never reword, reorder, or repunctuate the existing message. Each
+    literal string here is hardcoded independently of the implementation,
+    so a future accidental reword of the error text (not just a missing
+    code) would fail this test."""
+    from unittest.mock import MagicMock
+
+    for tool_name, mock_attr, exception, call_kwargs, _code, expected_error in _SOFT_ERROR_CODE_SITES:
+        mgr, fns = _make_tool_fixtures(tmp_path)
+        setattr(mgr, mock_attr, MagicMock(side_effect=exception))
+
+        result = fns[tool_name](**call_kwargs)
+
+        assert result["error"] == expected_error, (
+            f"{tool_name} error text changed: got {result['error']!r}, "
+            f"expected {expected_error!r}"
+        )
+
+
+def test_soft_error_code_absent_on_success(tmp_path: Path):
+    """A successful (non-error) record dict from worktree_remove/
+    environment_start/environment_stop must never carry a ``"code"`` key --
+    guards against a blanket/implementation mistake that injects ``code``
+    unconditionally rather than only on the 5 documented soft-error paths."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    remove_record = _make_removed_record()
+    mgr.remove = MagicMock(return_value=remove_record)
+    remove_result = fns["worktree_remove"](environment_id="wt-id")
+    assert "error" not in remove_result
+    assert "code" not in remove_result
+
+    start_record = _make_running_record()
+    mgr.start = MagicMock(return_value=start_record)
+    start_result = fns["environment_start"](environment_id="wt-id")
+    assert "error" not in start_result
+    assert "code" not in start_result
+
+    stop_record = _make_stopped_record()
+    mgr.stop = MagicMock(return_value=stop_record)
+    stop_result = fns["environment_stop"](environment_id="wt-id")
+    assert "error" not in stop_result
+    assert "code" not in stop_result
