@@ -126,7 +126,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 | Tool | Best for |
 |---|---|
-| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience |
+| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD) |
 | `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. Structurally refuses to delete a primary checkout, even with `force=True` |
 
 **Environment lifecycle** (the process running against any checkout, primary included):
@@ -294,3 +294,8 @@ never recorded as owning one.
 6. **`environment_id` and `checkout_path` are two names for the same resolution, not
    two independent filters.** Passing both only works when they agree; a mismatch is a
    hard `ValueError` from the engine, not a "prefer one over the other" merge.
+7. **`base` is not mandatory when creating a brand-new branch.** Omitting `base` for a
+   `branch` that does not yet exist defaults to whatever branch is currently checked out
+   at `repo_root` — you do not have to pass `base` just because the branch is new. This
+   default still raises `ValueError` when `repo_root`'s HEAD is detached or unborn (no
+   commits yet), since there is then no checked-out branch to default to.

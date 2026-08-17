@@ -93,6 +93,75 @@ def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
     return asdict(record)
 
 
+def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
+    """Make ``contract_dir`` (the ``.seretos/`` copy ``worktree_create``
+    just wrote into a *new worktree checkout*) invisible to git.
+
+    Ticket #110 (Befund 2): the create-time convenience copy of
+    ``.seretos/`` (see the "Contract file" section of ``worktree_create``'s
+    docstring) is untracked by definition -- that is exactly why the copy
+    was needed in the first place. An untracked directory left behind makes
+    ``git status`` report the checkout as dirty, which in turn makes ``git
+    worktree remove`` refuse to run without ``force=True`` -- so a freshly
+    created, otherwise-untouched worktree could never be removed with the
+    default ``force=False``.
+
+    The fix: write a self-ignoring ``.gitignore`` into the copied
+    directory. A bare ``*`` pattern in a directory's own ``.gitignore``
+    matches every entry in that directory *including the ``.gitignore``
+    file itself* (gitignore glob matching applies to dotfiles too), so git
+    reports nothing for ``.seretos/`` at all -- neither tracked nor
+    untracked -- and the worktree stays clean.
+
+    This must never touch anything under ``repo_root``: it only ever
+    receives the *destination* (in-worktree) contract directory, never the
+    source. Writing to the shared ``.git/info/exclude`` was considered and
+    rejected -- for a linked worktree that path maps to the *common* git
+    dir, so it would silently mutate the user's main clone and every
+    sibling worktree.
+
+    Idempotent: this helper's own marker comment (``header`` below) is the
+    only signal used to detect "already ran" -- if ``<contract_dir>/.gitignore``
+    already contains it, the file is left untouched. A bare ``*`` line is
+    *not* treated as sufficient by itself: gitignore matching is
+    order-sensitive (the last matching pattern wins), so a source
+    ``.seretos/.gitignore`` that happens to contain ``*`` followed by a
+    later negation (e.g. ``!worktree-setup.yml``) would leave that file
+    un-ignored, and detecting "already self-ignoring" from the bare ``*``
+    alone would then wrongly skip appending the override. When the marker
+    is absent -- whether the file doesn't exist yet, or it exists without
+    ever having been touched by this helper -- the self-ignoring block is
+    always appended at the end (never clobbering existing content). Since
+    the last matching pattern wins, appending ``*`` last is precisely what
+    makes it override any earlier negation in the pre-existing content.
+    """
+    gitignore_path = contract_dir / ".gitignore"
+    header = "# Ticket #110: keep this create-time copy out of git status.\n"
+    if gitignore_path.exists():
+        # Read tolerantly, for detection only. A pre-existing .gitignore that
+        # is not valid UTF-8 (e.g. cp1252/Latin-1, plausible on a Windows
+        # box) must not crash worktree_create with an unwrapped
+        # UnicodeDecodeError -- and UnicodeDecodeError is a ValueError
+        # subclass, not an OSError, so it would slip past the `except
+        # OSError` around this helper's call site. This decoded text is used
+        # only to check the idempotency marker and the trailing-newline
+        # separator below; it is never written back, so a lossy decode here
+        # can never corrupt the file's original bytes.
+        with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+        if header in existing:
+            return
+        separator = "" if existing.endswith("\n") or existing == "" else "\n"
+        # Append rather than rewrite: this leaves every pre-existing byte in
+        # the file untouched, so a non-UTF-8 (or otherwise unusual) existing
+        # .gitignore is never round-tripped through the tolerant decode
+        # above and cannot be corrupted by it.
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            f.write(f"{separator}\n{header}*\n")
+    else:
+        gitignore_path.write_text(f"{header}*\n", encoding="utf-8")
+
+
 def _derive_setup_status(status: str) -> str:
     """Map a WorktreeRecord status to a coarse setup-health signal.
 
@@ -268,7 +337,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``base`` is the name of a local branch to base the new worktree on;
         the tool fetches the latest commits from ``origin`` automatically so
         the new worktree always starts from an up-to-date remote state.
-        Omit ``base`` when ``branch`` already exists.
+        Omit ``base`` when ``branch`` already exists. When ``branch`` does
+        not yet exist and ``base`` is omitted, it defaults to whatever
+        branch is currently checked out at ``repo_root`` -- but this still
+        raises when ``repo_root``'s HEAD is detached or unborn (no commits
+        yet), since there is then no checked-out branch to default to.
 
         The ``ports`` field is a dict mapping port name to host port number;
         empty dict ``{}`` for ``isolation: none`` worktrees or before setup
@@ -321,7 +394,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``<repo_root>/.seretos/`` into the new worktree checkout when it
         would not otherwise be tracked there (see below) -- but that copy is
         never what ``environment_start``/``environment_stop`` read; they
-        always read the ``repo_root`` original.
+        always read the ``repo_root`` original. The copy is marked ignored
+        via a self-ignoring ``.gitignore`` written inside it, so it stays
+        invisible to ``git status`` and the worktree remains removable with
+        ``worktree_remove``'s default ``force=False`` (ticket #110).
         """
 
         try:
@@ -344,6 +420,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         if src_contract_dir.is_dir() and not dst_contract_dir.exists():
             try:
                 shutil.copytree(src_contract_dir, dst_contract_dir)
+                _ensure_contract_copy_ignored(dst_contract_dir)
             except OSError as exc:
                 raise ValueError(
                     f"Worktree created at '{record.path}' but failed to copy"

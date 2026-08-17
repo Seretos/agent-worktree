@@ -32,7 +32,7 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 |-----------|------|----------|-------------|
 | `repo_root` | `str` | Yes | Path to the git repository root. If a subdirectory is passed, it is silently re-rooted to the actual repository root and a `warning` field is added to the result. |
 | `branch` | `str` | Yes | Name of the branch to check out in the new worktree. |
-| `base` | `str` | No | Name of an existing local branch to create `branch` from. Must be a local branch name — not a SHA, `HEAD`, or remote ref. Omit when `branch` already exists. |
+| `base` | `str` | No | Name of an existing local branch to create `branch` from. Must be a local branch name — not a SHA, `HEAD`, or remote ref. Not required just because `branch` is new: when `branch` does not yet exist and `base` is omitted, it defaults to whatever branch is currently checked out at `repo_root` — but this still raises when `repo_root`'s HEAD is detached or unborn (no commits yet). |
 
 **Returns** the canonical worktree record dict. Fields of note:
 
