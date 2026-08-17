@@ -4,6 +4,13 @@
 # extras, then delegates to pytest. Any remaining arguments are forwarded
 # to pytest as-is.
 #
+# Note (ticket #111): `pip install -e ".[test]"` does NOT re-resolve an
+# already-installed git-URL pin (e.g. lib-python-worktree) after the pin is
+# bumped in pyproject.toml -- an existing .venv/ can silently stay on an
+# older commit. tests/test_dependency_pin.py detects this and its failure
+# message states the exact `pip install --force-reinstall --no-deps ...`
+# command to repair it.
+#
 # Usage (from plugin root):
 #   pwsh -File scripts/test.ps1
 #   pwsh -File scripts/test.ps1 -v                  # verbose
