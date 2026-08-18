@@ -18,6 +18,7 @@ import lib_python_worktree.core.manager as manager_module
 from lib_python_worktree import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
+    CheckoutTargetError,
     DuplicateWorktreeError,
     GitTimeoutError,
     InMemoryStateStore,
@@ -932,6 +933,30 @@ def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
 
     with pytest.raises(ValueError):
         fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
+
+
+def test_tool_worktree_remove_unknown_checkout_target_reason_defensive_text(
+    tmp_path: Path,
+):
+    """Ticket #119: an unknown/future CheckoutTargetError.reason (not
+    "missing" or "id_mismatch") must fall through to a generic,
+    wrapper-native addressing message -- never `str(exc)`, which would leak
+    the engine's internal `worktree_id` wording straight through."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(
+        side_effect=CheckoutTargetError(
+            worktree_id="x", checkout_path="y", reason="future_reason"
+        )
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](environment_id="x", checkout_path="y")
+
+    msg = str(excinfo.value)
+    assert "worktree_remove" in msg
+    assert "worktree_id" not in msg
 
 
 def test_tool_worktree_remove_empty_string_id_not_absent(tmp_path: Path):

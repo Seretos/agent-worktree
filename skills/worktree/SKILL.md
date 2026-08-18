@@ -161,10 +161,14 @@ name their target — pass one or the other (or both, if they agree):
   `path` (from `environment_list`) as `checkout_path` instead. See "Orphan worktree
   recovery" below for the full recipe.
 
-Passing both is fine only when they agree — a mismatch raises `ValueError` from the
-engine's `CheckoutTargetError`. Passing neither also raises `ValueError`. This
-resolution is entirely the *engine's* job, not the MCP wrapper's — the wrapper performs
-no validation of the pair itself.
+Passing both is fine only when they agree — a mismatch raises `ValueError`. Passing
+neither also raises `ValueError`. This resolution is entirely the *engine's* job, not
+the MCP wrapper's — the wrapper performs no validation of the pair itself — but each
+tool (`worktree_remove`, `environment_start`, `environment_stop`) re-words the engine's
+raw `CheckoutTargetError` text before raising `ValueError`: the engine's own message
+names its internal parameter and describes the contract in engine-API vocabulary
+(`start()`/`stop()`/`remove()`), so the wrapper replaces it with a message naming
+`environment_id`, `checkout_path`, and the calling tool itself.
 
 > **Spec-gap note (ticket #99).** The ticket's originally-specified surface is
 > id-only. That cannot satisfy the ticket's own AC1 — cold-starting a primary that has
