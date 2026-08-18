@@ -133,7 +133,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 | Tool | Best for |
 |---|---|
-| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status`; `scope="all"` fans out across every tracked repo |
+| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status` (`"completed"` / `"failed"` / `"skipped"` / `"unknown"`, derived solely from the record's `setup_outcome`, never from `status`); `scope="all"` fans out across every tracked repo |
 | `environment_start` | Launch a named `start:` variant as a tracked, detached process, against any checkout |
 | `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout |
 

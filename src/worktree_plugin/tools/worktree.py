@@ -56,6 +56,7 @@ from lib_python_worktree import (
     ProcessLifecycleError,
     ProcessNotRunningError,
     SetupFailedError,
+    SetupOutcome,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
@@ -200,22 +201,28 @@ def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
         gitignore_path.write_text(f"{header}*\n", encoding="utf-8")
 
 
-def _derive_setup_status(status: str) -> str:
-    """Map a WorktreeRecord status to a coarse setup-health signal.
+def _derive_setup_status(setup_outcome: Optional[SetupOutcome]) -> str:
+    """Map a ``WorktreeRecord.setup_outcome`` to a coarse setup-health
+    signal, fully decoupled from ``record.status`` (ticket #117).
 
-    ``"ready"``   -- no managed process; worktree is usable (no-op start).
-    ``"running"`` -- managed process is alive.
-    ``"failed"``  -- setup: steps ran and at least one step exited non-zero;
-                     the worktree directory is left intact for inspection.
-    ``"unknown"`` -- process not yet started or has been stopped.
+    ``record.status`` is continuously rewritten by ``create``/``start``/
+    ``stop``/``reconcile`` for entirely different purposes and does not
+    answer "how did the ``setup:`` hook itself end?" once later calls have
+    moved ``status`` on -- so this deliberately never reads ``status``, not
+    even as a fallback for legacy records.
+
+    - ``None`` -- the ``setup:`` hook was never reached (a record predating
+      ``setup_outcome``, an adopted record, or a synthesised entry) --
+      ``"unknown"``.
+    - otherwise -- ``setup_outcome.status`` verbatim (``"completed"``,
+      ``"failed"``, ``"skipped"``, or any forward-compatible future engine
+      value) -- passed through as-is rather than mapped through an
+      if/elif chain, so an unrecognised future status is preserved rather
+      than rejected.
     """
-    if status == "ready":
-        return "ready"
-    if status == "running":
-        return "running"
-    if status == "setup_failed":
-        return "failed"
-    return "unknown"
+    if setup_outcome is None:
+        return "unknown"
+    return setup_outcome.status
 
 
 def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
@@ -310,7 +317,9 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     into the flat dict returned by ``environment_list``.
 
     Merges the record's fields with the entry-level ``is_current``/
-    ``tracked`` flags and the derived ``setup_status`` signal. Untracked
+    ``tracked`` flags and the ``setup_status`` signal derived from
+    ``record.setup_outcome`` (never from ``record.status`` -- see
+    ``_derive_setup_status``). Untracked
     (synthesised) entries -- ``tracked=False`` -- pass through unchanged;
     callers must use ``tracked``, never the id, as the "is this persisted"
     discriminator. A synthesised linked worktree's ``id`` is
@@ -324,7 +333,7 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
         "is_current": entry.is_current,
         "tracked": entry.tracked,
     }
-    result["setup_status"] = _derive_setup_status(entry.record.status)
+    result["setup_status"] = _derive_setup_status(entry.record.setup_outcome)
     return result
 
 
@@ -676,9 +685,21 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           path, NOT a state-store key. It cannot be passed as
           ``environment_id`` to ``worktree_remove``; address it via
           ``checkout_path`` instead.
-        - ``setup_status``: the same coarse setup-health signal documented on
-          ``environment_start`` -- ``"ready"``, ``"running"``, ``"failed"``, or
-          ``"unknown"``, derived from the record's ``status``.
+        - ``setup_status``: a coarse setup-health signal derived SOLELY from
+          the record's ``setup_outcome`` (an ``Optional[SetupOutcome]``),
+          never from ``status`` (the overall run status) -- full decoupling
+          (ticket #117). ``"unknown"`` when ``setup_outcome`` is ``None``
+          (the ``setup:`` hook was never reached -- a record predating this
+          field, an adopted record, or a synthesised entry); otherwise the
+          verbatim ``setup_outcome.status``: ``"completed"``, ``"failed"``,
+          or ``"skipped"``. This value survives later rewrites of ``status``
+          by ``start``/``stop``/``reconcile`` -- it reflects only what
+          happened when ``create()`` ran the ``setup:`` hook, once, and is
+          never touched again. Each entry's full ``setup_outcome`` dict
+          (via ``asdict``) is also present for detail: ``message``,
+          ``completed_at``, ``steps_run``, ``failed_step_index``,
+          ``failed_step_name``, ``log_path``, ``returncode``, and
+          ``timed_out``.
 
         This call **never writes state** -- listing the primary before it has
         ever been started does not create a record for it; only
