@@ -26,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from lib_python_worktree import (
     InMemoryStateStore,
     ManagerConfig,
+    SetupOutcome,
     WorktreeManager,
     WorktreeRecord,
     YamlStateStore,
@@ -154,32 +155,132 @@ def test_environment_list_entry_shape(tmp_path: Path, temp_repo: Path):
             "pids",
             "ports",
             "setup_status",
+            "setup_outcome",
             "tracked",
         ):
             assert key in entry, f"{key!r} missing from entry: {entry}"
+        assert isinstance(entry["setup_outcome"], dict) or entry["setup_outcome"] is None, (
+            f"setup_outcome must be a nested dict (via asdict) or None: {entry['setup_outcome']!r}"
+        )
+
+
+# ---- Ticket #117: setup_status derived SOLELY from setup_outcome, never
+# from record.status (full decoupling) ----
 
 
 @pytest.mark.parametrize(
-    "status,expected_setup_status",
-    [
-        ("running", "running"),
-        ("ready", "ready"),
-        ("stopped", "unknown"),
-        ("created", "unknown"),
-        ("setup_failed", "failed"),
-    ],
+    "status",
+    ["created", "running", "ready", "stopped", "setup_failed"],
 )
-def test_environment_list_setup_status_derivations(
-    tmp_path: Path, temp_repo: Path, status: str, expected_setup_status: str
+def test_environment_list_setup_status_unknown_without_setup_outcome(
+    tmp_path: Path, temp_repo: Path, status: str
 ):
+    """A record with no ``setup_outcome`` (the ``setup:`` hook was never
+    reached -- a legacy record, an adopted record, or synthesised entry)
+    must report ``"unknown"`` regardless of ``status`` -- even
+    ``"setup_failed"``. This is the strict-decoupling/legacy-record case:
+    ``status`` must never be consulted as a fallback."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     rec = mgr.create(str(temp_repo), "feature/wt")
     rec.status = status
+    rec.setup_outcome = None
     mgr.state.update(rec)
 
     result = fns["environment_list"](path=str(temp_repo))
     entry = next(e for e in result if e["id"] == rec.id)
-    assert entry["setup_status"] == expected_setup_status
+    assert entry["setup_status"] == "unknown"
+
+
+def test_environment_list_setup_status_completed(tmp_path: Path, temp_repo: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    rec.setup_outcome = SetupOutcome(status="completed", steps_run=2)
+    # Prove decoupling: status has since moved on to something unrelated.
+    rec.status = "running"
+    mgr.state.update(rec)
+
+    result = fns["environment_list"](path=str(temp_repo))
+    entry = next(e for e in result if e["id"] == rec.id)
+    assert entry["setup_status"] == "completed"
+
+
+def test_environment_list_setup_status_failed_survives_status_rewrite(
+    tmp_path: Path, temp_repo: Path
+):
+    """The ticket's exact reported symptom: setup_status used to alias the
+    overall run status, so a "failed" setup outcome would disappear once
+    something else (e.g. a later stop) rewrote record.status. It must
+    survive that rewrite."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    rec.setup_outcome = SetupOutcome(
+        status="failed",
+        message="boom",
+        failed_step_index=1,
+        failed_step_name="install",
+        returncode=1,
+    )
+    rec.status = "stopped"
+    mgr.state.update(rec)
+
+    result = fns["environment_list"](path=str(temp_repo))
+    entry = next(e for e in result if e["id"] == rec.id)
+    assert entry["setup_status"] == "failed"
+
+
+def test_environment_list_setup_status_skipped_is_distinct_from_unknown(
+    tmp_path: Path
+):
+    repo_a = _make_repo(tmp_path, "repo-a")
+    _git("branch", "feature/a", cwd=repo_a)
+    repo_b = _make_repo(tmp_path, "repo-b")
+    _git("branch", "feature/b", cwd=repo_b)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec_skipped = mgr.create(str(repo_a), "feature/a")
+    rec_skipped.setup_outcome = SetupOutcome(status="skipped", steps_run=0)
+    mgr.state.update(rec_skipped)
+
+    rec_unknown = mgr.create(str(repo_b), "feature/b")
+    rec_unknown.setup_outcome = None
+    mgr.state.update(rec_unknown)
+
+    result_a = fns["environment_list"](path=str(repo_a))
+    entry_skipped = next(e for e in result_a if e["id"] == rec_skipped.id)
+    assert entry_skipped["setup_status"] == "skipped"
+
+    result_b = fns["environment_list"](path=str(repo_b))
+    entry_unknown = next(e for e in result_b if e["id"] == rec_unknown.id)
+    assert entry_unknown["setup_status"] == "unknown"
+
+
+def test_environment_list_setup_status_decoupling_holds_under_scope_all(
+    tmp_path: Path
+):
+    """The setup_outcome-based derivation isn't scope-local: it must hold
+    identically whether an entry is listed directly (scope="repo") or
+    fanned out from another repo's vantage point (scope="all")."""
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec1.setup_outcome = SetupOutcome(status="failed", message="boom")
+    rec1.status = "stopped"
+    mgr.state.update(rec1)
+
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+    rec2.setup_outcome = SetupOutcome(status="completed", steps_run=1)
+    rec2.status = "running"
+    mgr.state.update(rec2)
+
+    result_all = fns["environment_list"](path=str(repo1), scope="all")
+    entry1 = next(e for e in result_all if e["id"] == rec1.id)
+    entry2 = next(e for e in result_all if e["id"] == rec2.id)
+    assert entry1["setup_status"] == "failed"
+    assert entry2["setup_status"] == "completed"
 
 
 # ---- R3: the primary is synthesised without ever writing state ----
@@ -496,8 +597,16 @@ def test_worktree_remove_checkout_path_and_id_mismatch_raises_valueerror(
     rec1 = mgr.create(str(repo1), "feature/wt1")
     mgr.create(str(repo2), "feature/wt2")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["worktree_remove"](environment_id=rec1.id, checkout_path=str(repo2))
+
+    # The message must be re-worded to name the wrapper's own
+    # `environment_id` parameter, not the engine-internal `worktree_id`
+    # (ticket #119).
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
     # Neither worktree was touched by the failed, mismatched call.
     assert Path(rec1.path).exists()
@@ -507,6 +616,23 @@ def test_worktree_remove_with_neither_target_raises_valueerror(tmp_path: Path):
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     with pytest.raises(ValueError):
         fns["worktree_remove"]()
+
+
+def test_worktree_remove_missing_target_error_names_environment_id(tmp_path: Path):
+    """Ticket #119: the ValueError raised when neither environment_id nor
+    checkout_path is given must be re-worded to name worktree_remove's own
+    parameters and itself by name -- not the engine-internal `worktree_id`
+    parameter or engine-API vocabulary (start()/stop()/remove())."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"]()
+
+    msg = str(excinfo.value)
+    assert "worktree_remove" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
 
 
 def test_worktree_remove_checkout_path_outside_any_repo(tmp_path: Path):
@@ -633,15 +759,40 @@ def test_environment_start_id_and_path_mismatch_raises(tmp_path: Path):
     with pytest.raises(ValueError) as excinfo:
         fns["environment_start"](environment_id=rec1.id, checkout_path=str(repo2))
 
-    # The message must originate from the engine's CheckoutTargetError, not
-    # wrapper-side validation -- assert on its distinctive wording.
-    assert "resolved to id" in str(excinfo.value)
+    # The underlying resolution still originates from the engine's
+    # CheckoutTargetError, but the tool re-words its text (ticket #119) to
+    # name the wrapper's own `environment_id` parameter instead of the
+    # engine-internal `worktree_id` -- assert on the distinctive "resolved
+    # to id" wording (preserved verbatim by the re-wording) plus the
+    # renamed parameter.
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_start_with_neither_target_raises(tmp_path: Path):
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     with pytest.raises(ValueError):
         fns["environment_start"]()
+
+
+def test_environment_start_missing_target_error_names_environment_id(
+    tmp_path: Path,
+):
+    """Ticket #119: same as worktree_remove's missing-target driving test,
+    but for environment_start -- must name environment_start itself and
+    environment_id/checkout_path, never worktree_id."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"]()
+
+    msg = str(excinfo.value)
+    assert "environment_start" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_stop_unmaterialised_primary_soft_error(
@@ -655,6 +806,43 @@ def test_environment_stop_unmaterialised_primary_soft_error(
     assert "error" in result
     assert "not found" in result["error"]
     assert mgr.state.list() == [], "stop() must never materialise a primary record"
+
+
+def test_environment_stop_missing_target_error_names_environment_id(tmp_path: Path):
+    """Ticket #119: same as worktree_remove's missing-target driving test,
+    but for environment_stop -- must name environment_stop itself and
+    environment_id/checkout_path, never worktree_id."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"]()
+
+    msg = str(excinfo.value)
+    assert "environment_stop" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
+
+
+def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
+    tmp_path: Path,
+):
+    """Ticket #119: environment_stop's id/checkout_path mismatch error must
+    also be re-worded to name environment_id, not worktree_id."""
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](environment_id=rec1.id, checkout_path=str(repo2))
+
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_start_contract_variant_and_env_injection_unchanged(
@@ -703,7 +891,7 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["cmd"] = cmd
         captured["env"] = env
         record.status = "running"
@@ -765,7 +953,7 @@ def test_environment_start_with_start_step_reports_contract_read(
     )
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         rec = store.get(worktree_id)
         rec.status = "running"
         rec.pids = {role: 4242}
@@ -814,7 +1002,7 @@ def test_environment_start_real_start_reports_steps_run_for_any_status(
     )
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         rec = store.get(worktree_id)
         # Mirrors the engine: pids is set unconditionally; only status and
         # returncode depend on surviving the early-exit wait.
@@ -1144,3 +1332,202 @@ def test_environment_start_docstring_lists_all_contract_keys(tmp_path: Path):
         "no_op_reason",
     ):
         assert token in doc, f"environment_start docstring missing {token!r}"
+
+
+# ---- Ticket #118: role vs variant addressing model ----
+#
+# environment_start's "role" and "variant" parameters are independent
+# (role is the tracking/addressing key a pid is filed under; variant only
+# selects which contract start: step ran) but were previously documented in
+# total isolation from each other, with no explanation of how they interact.
+# This block also drives environment_stop's new `variant` parameter (ticket
+# #104's engine-level `stop(variant=...)` resolution, newly exposed through
+# the MCP tool surface), including the `role=None` sentinel fix required to
+# forward "role omitted" vs "role explicitly main" correctly.
+
+
+def test_environment_start_docstring_explains_role_vs_variant(tmp_path: Path):
+    """The docstring must explain, in one connected section, that `role`
+    defaults to "main" regardless of which `variant` is requested -- not
+    just document each parameter in isolation."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+
+    assert "regardless" in doc.lower()
+
+    # Both "role" and "variant" must appear together within the same
+    # explanatory section (not just anywhere in the docstring, which the
+    # pre-existing isolated parameter entries would already satisfy).
+    idx = doc.lower().find("regardless")
+    assert idx != -1
+    window = doc[max(0, idx - 400) : idx + 400]
+    assert "role" in window
+    assert "variant" in window
+
+
+def test_environment_stop_docstring_documents_role_vs_variant(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+
+    assert "variant" in doc
+
+
+def _seed_record(
+    mgr: WorktreeManager,
+    *,
+    pids: dict,
+    variants: dict,
+    repo_root: str,
+    path: str,
+) -> WorktreeRecord:
+    record = WorktreeRecord(
+        id="wt-118-test",
+        repo_root=repo_root,
+        branch="feature/wt",
+        path=path,
+        status="running",
+        pids=dict(pids),
+        variants=dict(variants),
+    )
+    mgr.state.add(record)
+    return record
+
+
+def test_environment_stop_variant_resolves_to_started_role(
+    tmp_path: Path, temp_repo: Path
+):
+    """BR1+BR2 combined: calling environment_stop(variant=...) with NO role
+    given must resolve to the role that was actually started with that
+    variant (here "web", not the "main" default) -- this simultaneously
+    exercises the new variant-resolution behavior and the role=None sentinel
+    fix (forwarding a hardcoded "main" would have broken this)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"web": 99999},
+        variants={"web": "gui"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    captured: dict = {}
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.variants.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id, variant="gui")
+
+    assert "error" not in result
+    assert captured["role"] == "web"
+    assert "web" not in result.get("pids", {})
+
+
+def test_environment_stop_no_role_no_variant_still_stops_main(
+    tmp_path: Path, temp_repo: Path
+):
+    """Back-compat regression: environment_stop(environment_id=...) with
+    neither role nor variant given must still stop role="main", exactly as
+    before the role=None sentinel change."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"main": 12345},
+        variants={},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    captured: dict = {}
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id)
+
+    assert "error" not in result
+    assert captured["role"] == "main"
+    assert "main" not in result.get("pids", {})
+
+
+_VARIANT_RESOLUTION_FAILURE_CASES = [
+    pytest.param(
+        {"main": 1},
+        {},
+        None,
+        "nonexistent-variant",
+        id="zero-match-typo",
+    ),
+    pytest.param(
+        {"web": 1, "worker": 2},
+        {"web": "shared", "worker": "shared"},
+        None,
+        "shared",
+        id="ambiguous-multiple-roles",
+    ),
+    pytest.param(
+        {"web": 1},
+        {"web": "gui"},
+        "worker",
+        "gui",
+        id="role-variant-disagreement",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "pids,variants,role,variant",
+    _VARIANT_RESOLUTION_FAILURE_CASES,
+)
+def test_environment_stop_variant_resolution_failure_raises_valueerror(
+    tmp_path: Path,
+    temp_repo: Path,
+    pids: dict,
+    variants: dict,
+    role,
+    variant: str,
+):
+    """All three of the engine's variant-resolution failure modes (zero-
+    match/unknown variant, ambiguous/multiple-match, and role/variant
+    disagreement) must raise ValueError uniformly -- there is no soft
+    {"code": "not_running"}-style dict for any of them."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids=pids,
+        variants=variants,
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    kwargs = {"environment_id": record.id, "variant": variant}
+    if role is not None:
+        kwargs["role"] = role
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](**kwargs)
+
+    msg = str(excinfo.value)
+    # The engine's own message uses role=/variant= vocabulary; the wrapper's
+    # hint is appended, never replacing it.
+    assert variant in msg
+    assert "hint" in msg.lower()
+    assert "role=" in msg or "role" in msg.lower()

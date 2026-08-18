@@ -223,3 +223,30 @@ def test_docs_document_soft_error_codes_and_signal_guard():
         "AGENTS.md does not state that SIGINT's disposition is deliberately "
         "left unchanged/untouched"
     )
+
+
+# ---- Ticket #117: setup_status derived from setup_outcome, not status ----
+
+
+def test_docs_document_setup_status_derived_from_setup_outcome():
+    """AGENTS.md and SKILL.md must document the ticket #117 full decoupling
+    of ``setup_status`` from ``setup_outcome`` (never from ``status``, the
+    overall run status) and its real vocabulary (``"completed"`` /
+    ``"failed"`` / ``"skipped"`` / ``"unknown"``), and must no longer carry
+    the stale claim that it is "derived from status" / "derived from
+    `status`" (the pre-fix behaviour ticket #117 reports as a bug)."""
+    required_tokens = ["setup_outcome", "completed", "failed", "skipped", "unknown"]
+    stale_claims = ["derived from status", "derived from `status`"]
+
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        for token in required_tokens:
+            assert token in text, (
+                f"{path.name} is missing expected setup_status vocabulary "
+                f"token: {token!r}"
+            )
+        for stale in stale_claims:
+            assert stale not in text, (
+                f"{path.name} still contains the stale setup_status claim: "
+                f"{stale!r}"
+            )

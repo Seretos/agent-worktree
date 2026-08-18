@@ -56,11 +56,14 @@ from lib_python_worktree import (
     ProcessLifecycleError,
     ProcessNotRunningError,
     SetupFailedError,
+    SetupOutcome,
+    VariantResolutionError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
     WorktreeNotFoundError,
     WorktreeRecord,
+    WorktreeRemovalBlockedError,
     load as load_contract,
     primary_id_for,
 )
@@ -91,6 +94,44 @@ _UNTRACKED_ID_RE = re.compile(r"-untracked-[0-9a-f]{8}$")
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
     return asdict(record)
+
+
+def _addressing_error_text(
+    exc: CheckoutTargetError, *, tool_name: str, hint: str
+) -> str:
+    """Re-word the engine's ``CheckoutTargetError`` into a wrapper-native
+    addressing-error message for ``tool_name``.
+
+    The engine's own message names its internal ``worktree_id`` parameter
+    and describes the contract in engine-API vocabulary (``start()``/
+    ``stop()``/``remove()``), neither of which matches this wrapper's actual
+    ``environment_id`` parameter or the calling tool's own name. This
+    re-words the message to name ``environment_id`` and ``tool_name``
+    instead -- addressing BEHAVIOUR is entirely unchanged (resolution is
+    still the engine's job; this wrapper still performs no validation of the
+    pair itself), only the text presented to callers changes.
+
+    ``exc.reason`` is one of ``"missing"`` (neither ``environment_id`` nor
+    ``checkout_path`` was given) or ``"id_mismatch"`` (both were given but
+    disagree). Any other/future ``reason`` value falls through to a generic,
+    wrapper-native message -- deliberately never ``str(exc)``, which would
+    re-leak the engine's ``worktree_id`` wording straight through.
+    """
+    if exc.reason == "missing":
+        return (
+            f"{tool_name} requires either environment_id or checkout_path "
+            f"to address a target; neither was given. {hint}"
+        )
+    if exc.reason == "id_mismatch":
+        return (
+            f"checkout_path '{exc.checkout_path}' resolved to id "
+            f"'{exc.resolved_id}', which does not match the given "
+            f"environment_id '{exc.worktree_id}'."
+        )
+    return (
+        f"{tool_name} could not resolve environment_id/checkout_path to a "
+        f"single target. {hint}"
+    )
 
 
 def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
@@ -162,22 +203,28 @@ def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
         gitignore_path.write_text(f"{header}*\n", encoding="utf-8")
 
 
-def _derive_setup_status(status: str) -> str:
-    """Map a WorktreeRecord status to a coarse setup-health signal.
+def _derive_setup_status(setup_outcome: Optional[SetupOutcome]) -> str:
+    """Map a ``WorktreeRecord.setup_outcome`` to a coarse setup-health
+    signal, fully decoupled from ``record.status`` (ticket #117).
 
-    ``"ready"``   -- no managed process; worktree is usable (no-op start).
-    ``"running"`` -- managed process is alive.
-    ``"failed"``  -- setup: steps ran and at least one step exited non-zero;
-                     the worktree directory is left intact for inspection.
-    ``"unknown"`` -- process not yet started or has been stopped.
+    ``record.status`` is continuously rewritten by ``create``/``start``/
+    ``stop``/``reconcile`` for entirely different purposes and does not
+    answer "how did the ``setup:`` hook itself end?" once later calls have
+    moved ``status`` on -- so this deliberately never reads ``status``, not
+    even as a fallback for legacy records.
+
+    - ``None`` -- the ``setup:`` hook was never reached (a record predating
+      ``setup_outcome``, an adopted record, or a synthesised entry) --
+      ``"unknown"``.
+    - otherwise -- ``setup_outcome.status`` verbatim (``"completed"``,
+      ``"failed"``, ``"skipped"``, or any forward-compatible future engine
+      value) -- passed through as-is rather than mapped through an
+      if/elif chain, so an unrecognised future status is preserved rather
+      than rejected.
     """
-    if status == "ready":
-        return "ready"
-    if status == "running":
-        return "running"
-    if status == "setup_failed":
-        return "failed"
-    return "unknown"
+    if setup_outcome is None:
+        return "unknown"
+    return setup_outcome.status
 
 
 def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
@@ -272,7 +319,9 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     into the flat dict returned by ``environment_list``.
 
     Merges the record's fields with the entry-level ``is_current``/
-    ``tracked`` flags and the derived ``setup_status`` signal. Untracked
+    ``tracked`` flags and the ``setup_status`` signal derived from
+    ``record.setup_outcome`` (never from ``record.status`` -- see
+    ``_derive_setup_status``). Untracked
     (synthesised) entries -- ``tracked=False`` -- pass through unchanged;
     callers must use ``tracked``, never the id, as the "is this persisted"
     discriminator. A synthesised linked worktree's ``id`` is
@@ -286,7 +335,7 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
         "is_current": entry.is_current,
         "tracked": entry.tracked,
     }
-    result["setup_status"] = _derive_setup_status(entry.record.status)
+    result["setup_status"] = _derive_setup_status(entry.record.setup_outcome)
     return result
 
 
@@ -470,11 +519,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         Neither is schema-required, but the engine (not this wrapper)
         enforces the resolution: passing both is fine only when they agree
-        (a mismatch raises ``ValueError``, from the engine's
-        ``CheckoutTargetError``); passing neither also raises ``ValueError``.
-        This wrapper performs no validation of the ``(environment_id,
-        checkout_path)`` pair itself -- every combination is forwarded
-        straight through to the engine.
+        (a mismatch raises ``ValueError``); passing neither also raises
+        ``ValueError``. This wrapper performs no validation of the
+        ``(environment_id, checkout_path)`` pair itself -- resolution is
+        entirely the engine's job, via its ``CheckoutTargetError`` -- but it
+        re-words that error's text before raising ``ValueError``: the
+        engine's own message names its internal ``worktree_id`` parameter
+        and engine-API vocabulary (``start()``/``stop()``/``remove()``),
+        so this wrapper replaces it with a ``worktree_remove``-specific
+        message naming ``environment_id`` and ``checkout_path`` instead.
 
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
@@ -520,6 +573,19 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         worktree directory is still locked after attempting to kill blocking
         processes.
 
+        **Compound blocking is reported in one shot (ticket #120).** When
+        BOTH the directory lock AND uncommitted/untracked changes are
+        blocking removal at once, the engine raises
+        ``WorktreeRemovalBlockedError`` instead of the single-condition
+        exceptions above. This wrapper catches it explicitly and raises a
+        single ``ValueError`` naming every currently-blocking condition and
+        the flag needed to clear each -- ``(blocked_by: "dir_locked",
+        "uncommitted_changes"; required_flags: kill_blocking_processes=True,
+        force=True)`` -- so one informed retry (passing both flags at once)
+        suffices, instead of a caller discovering each condition
+        sequentially across up to three separate failed attempts. Filesystem
+        paths are deliberately never included in this message.
+
         **Primary checkouts are never removed.** Attempting to remove the
         primary/main clone's environment -- whether addressed by
         ``environment_id`` or by ``checkout_path``, and even with
@@ -559,8 +625,31 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             ):
                 error_text = f"{error_text}: {exc}"
             return {"error": error_text, "code": "not_found"}
+        except WorktreeRemovalBlockedError as exc:
+            # Ticket #120: WorktreeRemovalBlockedError subclasses BOTH
+            # WorktreeDirLockedError and DirtyWorktreeError, so this clause
+            # must come before the plain `except WorktreeDirLockedError`
+            # below -- otherwise that clause would silently swallow the
+            # compound case and only ever report the lock half of the
+            # picture. Surface both blocking conditions and both required
+            # flags in one message so a single informed retry suffices.
+            raise ValueError(
+                f'{exc} (blocked_by: "dir_locked", "uncommitted_changes"; '
+                f"required_flags: kill_blocking_processes=True, force=True)"
+            ) from exc
         except WorktreeDirLockedError as exc:
             raise ValueError(str(exc)) from exc
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="worktree_remove",
+                    hint=(
+                        "Pass environment_id for a tracked checkout, or "
+                        "checkout_path for an untracked/orphan checkout."
+                    ),
+                )
+            ) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
@@ -623,9 +712,21 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           path, NOT a state-store key. It cannot be passed as
           ``environment_id`` to ``worktree_remove``; address it via
           ``checkout_path`` instead.
-        - ``setup_status``: the same coarse setup-health signal documented on
-          ``environment_start`` -- ``"ready"``, ``"running"``, ``"failed"``, or
-          ``"unknown"``, derived from the record's ``status``.
+        - ``setup_status``: a coarse setup-health signal derived SOLELY from
+          the record's ``setup_outcome`` (an ``Optional[SetupOutcome]``),
+          never from ``status`` (the overall run status) -- full decoupling
+          (ticket #117). ``"unknown"`` when ``setup_outcome`` is ``None``
+          (the ``setup:`` hook was never reached -- a record predating this
+          field, an adopted record, or a synthesised entry); otherwise the
+          verbatim ``setup_outcome.status``: ``"completed"``, ``"failed"``,
+          or ``"skipped"``. This value survives later rewrites of ``status``
+          by ``start``/``stop``/``reconcile`` -- it reflects only what
+          happened when ``create()`` ran the ``setup:`` hook, once, and is
+          never touched again. Each entry's full ``setup_outcome`` dict
+          (via ``asdict``) is also present for detail: ``message``,
+          ``completed_at``, ``steps_run``, ``failed_step_index``,
+          ``failed_step_name``, ``log_path``, ``returncode``, and
+          ``timed_out``.
 
         This call **never writes state** -- listing the primary before it has
         ever been started does not create a record for it; only
@@ -712,12 +813,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           record here -- this is the **only** place a primary
           ``WorktreeRecord`` is ever written.
 
-        Neither is schema-required, but the engine (not this wrapper) enforces
-        the resolution: passing both is fine only when they agree (a mismatch
-        raises ``ValueError``, from the engine's ``CheckoutTargetError``);
-        passing neither also raises ``ValueError``. This wrapper performs no
-        validation of the ``(environment_id, checkout_path)`` pair itself --
-        every combination is forwarded straight through to the engine.
+        Neither is schema-required, but the engine (not this wrapper)
+        enforces the resolution: passing both is fine only when they agree
+        (a mismatch raises ``ValueError``); passing neither also raises
+        ``ValueError``. This wrapper performs no validation of the
+        ``(environment_id, checkout_path)`` pair itself -- resolution is
+        entirely the engine's job, via its ``CheckoutTargetError`` -- but it
+        re-words that error's text before raising ``ValueError``: the
+        engine's own message names its internal ``worktree_id`` parameter
+        and engine-API vocabulary (``start()``/``stop()``/``remove()``),
+        so this wrapper replaces it with an ``environment_start``-specific
+        message naming ``environment_id`` and ``checkout_path`` instead.
 
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
@@ -759,6 +865,30 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
               - name: worker
                 run: start-worker.sh
 
+        ``role`` vs ``variant``
+        -----------------------
+        These two parameters are independent and are easy to conflate:
+
+        - ``role`` is the *tracking/addressing key* under which the spawned
+          process's pid is recorded (``record.pids[role]``). It defaults to
+          ``"main"`` **regardless of which** ``variant`` was requested --
+          starting ``variant="worker"`` with no explicit ``role`` still
+          records its pid under ``role="main"``, exactly like starting
+          ``variant="default"`` would.
+        - ``variant`` only selects *which* contract ``start:`` step is run
+          (by its ``name``). It has no effect on where the resulting pid is
+          filed.
+
+        Because the two are independent, two variants started concurrently
+        against the same environment need two *distinct* ``role``s -- if the
+        second call reuses the same (default) role, it returns/errors with
+        an ``already_running`` condition (that role already has a live pid),
+        even though a different ``variant`` was requested. Whichever
+        ``variant`` actually started a given ``role`` is remembered in
+        ``record.variants[role]``, so a later ``environment_stop(variant=...)``
+        call can address that role without the caller having to separately
+        track which role it used -- see ``environment_stop``'s docstring.
+
         Parameters
         ----------
         environment_id:
@@ -770,7 +900,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         role:
             Logical role name for the process; defaults to ``"main"``. Multiple
             processes can be attached to one environment under different
-            roles.
+            roles. See "``role`` vs ``variant``" above for how this relates
+            to the ``variant`` parameter.
         cwd:
             Working directory for the spawned process. When omitted the
             environment's checkout path is used by the underlying engine.
@@ -779,7 +910,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             ``"default"``, which resolves to the lone unnamed step for
             back-compat. When multiple named steps exist, pass the step's
             ``name`` here. An unknown variant raises ``ValueError`` listing
-            the available names.
+            the available names. See "``role`` vs ``variant``" above for how
+            this relates to the ``role`` parameter.
         env:
             Optional dict of extra environment variables merged into the process
             environment by the engine. Omit (or pass ``None``) to inherit the
@@ -856,6 +988,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             }
         except ProcessAlreadyRunningError as exc:
             return {"error": str(exc), "code": "already_running"}
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="environment_start",
+                    hint=(
+                        "Pass environment_id for a known environment, or "
+                        "checkout_path to cold-start the primary/main clone."
+                    ),
+                )
+            ) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
@@ -864,7 +1007,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     def environment_stop(
         environment_id: Optional[str] = None,
         checkout_path: Optional[str] = None,
-        role: str = "main",
+        role: Optional[str] = None,
+        variant: Optional[str] = None,
         timeout: float = 10.0,
         kill_orphans: bool = False,
     ) -> Dict[str, Any]:
@@ -877,15 +1021,47 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         Same two ways as ``environment_start`` -- ``environment_id`` (the
         normal way) or ``checkout_path`` (the cold-start/primary way; see
         ``environment_start``'s docstring for the full rationale). Passing
-        neither, or both when they disagree, raises ``ValueError`` from the
-        engine's ``CheckoutTargetError`` -- this wrapper performs no
-        validation of the pair itself.
+        neither, or both when they disagree, raises ``ValueError``.
+        Resolution is entirely the engine's job, via its
+        ``CheckoutTargetError`` -- this wrapper performs no validation of
+        the pair itself -- but it re-words that error's text before
+        raising ``ValueError``: the engine's own message names its
+        internal ``worktree_id`` parameter and engine-API vocabulary
+        (``start()``/``stop()``/``remove()``), so this wrapper replaces it
+        with an ``environment_stop``-specific message naming
+        ``environment_id`` and ``checkout_path`` instead.
 
         Unlike ``environment_start``, stopping never materialises a primary
         record: an unstarted primary has nothing to stop, so it returns the
         same soft not-found dict (``{"error": "...", "code": "not_found"}``
         -- see "If the target is not found" below) as an unknown
         ``environment_id`` rather than creating a record just to stop it.
+
+        ``role`` vs ``variant``
+        -----------------------
+        See ``environment_start``'s "``role`` vs ``variant``" section for the
+        full explanation of why these are independent (``role`` is the
+        addressing key a pid is tracked under; ``variant`` only selects which
+        contract step ran to start it). Here, ``variant`` lets you stop a
+        process **without knowing which role it was started under**:
+
+        - Neither ``role`` nor ``variant`` given: stops ``role="main"``,
+          exactly as before this parameter existed.
+        - ``variant`` given, ``role`` omitted: resolved against
+          ``record.variants`` (populated by a prior
+          ``environment_start(variant=...)`` call) to whichever currently-
+          running role was started with that variant, and that role is
+          stopped.
+        - Both given: they must agree -- ``variant`` must resolve to exactly
+          the role named by ``role``, or a ``ValueError`` is raised.
+
+        Resolution can fail three ways, all surfaced as ``ValueError`` (never
+        a soft error dict): the variant matches no currently-running role
+        (e.g. a typo, or a role started before this parameter existed and so
+        has no recorded variant), the variant matches more than one
+        currently-running role (ambiguous -- pass ``role=`` to disambiguate),
+        or an explicitly-given ``role`` disagrees with the role ``variant``
+        resolves to.
 
         Parameters
         ----------
@@ -896,7 +1072,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             The cold-start/primary way to address the target -- see
             "Addressing the target" above.
         role:
-            Logical role name of the process to stop; defaults to ``"main"``.
+            Logical role name of the process to stop. Omitting it (the
+            default, ``None``) means "use ``main``" *unless* ``variant`` is
+            also given, in which case ``variant`` alone resolves the role --
+            see "``role`` vs ``variant``" above.
+        variant:
+            Resolves to the role that was started with this variant (via
+            ``record.variants``), so a process started with
+            ``environment_start(variant=...)`` can be stopped without
+            separately tracking which role it used. Defaults to ``None``
+            (no resolution; ``role`` alone selects the target). See
+            "``role`` vs ``variant``" above for the full contract, including
+            its three ``ValueError`` failure modes.
         timeout:
             Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before
             the process is forcibly killed (SIGKILL/TerminateProcess). Defaults
@@ -959,6 +1146,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 environment_id,
                 checkout_path=checkout_path,
                 role=role,
+                variant=variant,
                 timeout=timeout,
                 kill_orphans=kill_orphans,
             )
@@ -972,6 +1160,28 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             }
         except ProcessNotRunningError as exc:
             return {"error": str(exc), "code": "not_running"}
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="environment_stop",
+                    hint=(
+                        "Pass environment_id for a known environment, or "
+                        "checkout_path to address it directly."
+                    ),
+                )
+            ) from exc
+        except VariantResolutionError as exc:
+            # VariantResolutionError subclasses WorktreeError, so this catch
+            # must come before the generic (WorktreeError, ProcessLifecycleError)
+            # tail below -- same MRO-ordering concern as CheckoutTargetError's
+            # catch above (ticket #119). The engine's own message already
+            # uses role=/variant= vocabulary, so it is passed through
+            # verbatim, with a short hint appended pointing at the fix.
+            raise ValueError(
+                f"{exc} (hint: pass role=<role> explicitly, or see "
+                f"environment_start's role-vs-variant docs)"
+            ) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)

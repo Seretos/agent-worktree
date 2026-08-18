@@ -62,13 +62,15 @@ Removing the primary/main clone is never allowed regardless of how it is address
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
 | `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
 
-\* At least one of `environment_id`/`checkout_path` is required; passing neither raises `ValueError` (from the engine's `CheckoutTargetError`). Passing both is fine only when they agree — a mismatch also raises `ValueError`. The wrapper performs no validation of the pair itself; every combination is forwarded straight through to the engine.
+\* At least one of `environment_id`/`checkout_path` is required; passing neither raises `ValueError`. Passing both is fine only when they agree — a mismatch also raises `ValueError`. Resolution is entirely the engine's job (via its `CheckoutTargetError`), and the wrapper performs no validation of the pair itself — but it re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a `worktree_remove`-specific message naming `environment_id` and `checkout_path`.
 
 **Returns** the removed worktree record dict on success. The `ports` field is a dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs. The response also includes a `killed_pids` list (may be empty); each entry is a dict with `pid` (int), `name` (str), and `cmdline` (list of str) describing a process that was terminated to unblock removal.
 
 **Soft error:** if the target is not found, returns `{"error": "...", "code": "not_found"}` instead of raising, so callers can treat not-found as an idempotent condition and branch on `code` rather than parsing the error text. When `environment_id` looks like a synthesised untracked id, the error text names `checkout_path` as the remedy (`code` is `"not_found"` either way).
 
 **Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
+
+**Compound blocking, reported in one shot (ticket #120):** when the directory lock AND uncommitted/untracked changes are BOTH blocking removal at once, the engine raises `WorktreeRemovalBlockedError` instead of the single-condition exceptions above. The wrapper catches it explicitly and raises one `ValueError` naming every currently-blocking condition and the flag needed to clear each — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)` — so a single informed retry (passing both flags at once) suffices, instead of a caller discovering each condition sequentially across up to three separate failed attempts. Filesystem paths are never included in this message.
 
 **Primary refusal (hard, non-`force`-able):** attempting to remove the primary/main clone's environment — whether addressed by `environment_id` or by `checkout_path`, and even with `force=True` — raises `ValueError`. This is checked before any teardown work runs and can never be bypassed: a primary checkout IS the repo, so deleting it would be catastrophic. The raised message includes the engine's own text plus an explicit `backing: "primary"` token.
 
@@ -85,9 +87,18 @@ Every environment is addressed by one or both of:
 - **`environment_id`** — the normal way. Use the id returned by `worktree_create` (a linked worktree) or by `environment_list` / a prior `environment_start` call (the primary, once materialised).
 - **`checkout_path`** — the cold-start/primary way. This is the *only* way to start the primary/main clone's environment before it has ever been started. A primary's id, `primary_id_for(repo_root)`, is a one-way SHA-256 hash of the repo root — before the first successful `environment_start()` call, nothing persisted maps that hash back to a path, so id-only addressing cannot cold-start it. Pass the repo root (or any path inside it) as `checkout_path` and the engine resolves and, if needed, materialises the primary's record — this is the **only** place a primary record is ever written.
 
-`environment_start` and `environment_stop` both accept `environment_id: Optional[str] = None` and `checkout_path: Optional[str] = None`; neither is schema-required, but the *engine* (not the MCP wrapper) enforces the resolution: passing both is fine only when they agree — a mismatch raises `ValueError` (from the engine's `CheckoutTargetError`) — and passing neither also raises `ValueError`. The wrapper performs no validation of the `(environment_id, checkout_path)` pair itself; every combination is forwarded straight through to the engine.
+`environment_start` and `environment_stop` both accept `environment_id: Optional[str] = None` and `checkout_path: Optional[str] = None`; neither is schema-required, but the *engine* (not the MCP wrapper) enforces the resolution: passing both is fine only when they agree — a mismatch raises `ValueError` — and passing neither also raises `ValueError`. Resolution is entirely the engine's job, via its `CheckoutTargetError`, and the wrapper performs no validation of the `(environment_id, checkout_path)` pair itself — but each tool re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a message naming `environment_id`, `checkout_path`, and the calling tool itself (`environment_start` or `environment_stop`).
 
 > **Deliberate, documented deviation from ticket #99.** The ticket specifies id-only `environment_start`/`environment_stop` signatures. That cannot satisfy the ticket's own AC1: cold-starting a primary that has never been started is structurally impossible with an id-only signature, for the one-way-hash reason above. `checkout_path` is a strict *superset* of the id-only surface — every existing id-only call keeps working byte-for-byte, and it is the only way to address a never-started primary.
+
+#### `role` vs `variant`
+
+These two parameters are independent and easy to conflate:
+
+- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would.
+- **`variant`** only selects *which* contract `start:` step is run (by its `name`). It has no effect on where the resulting pid is filed.
+
+Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
 
 #### environment_list
 
@@ -104,7 +115,7 @@ This tool replaces the old unfiltered discovery listing (no `repo_root` filter m
 
 - `is_current` (bool) — this entry's checkout contains the queried `path`. At most one entry has this set across the whole result, even under `scope="all"` (entries fanned out from another repo always have it forced to `False`).
 - `tracked` (bool) — `False` marks a *synthesised* entry (on disk but no persisted record yet — the case for the primary before its first `environment_start()`, and for any un-adopted/orphan linked worktree). **Always branch on `tracked`, never on `id`**, to tell a synthesised entry from a persisted one — a synthesised primary's `id` is the deterministic `primary_id_for(repo_root)` (round-trips once materialised); a synthesised linked worktree's `id` is `<repo-slug>-<branch-slug>-untracked-<8-hex>` — a one-way derivation of its checkout path, **not** a state-store key. It cannot be looked up by `worktree_remove(environment_id=...)`; address it by `checkout_path` instead (see `worktree_remove` above).
-- `setup_status` — the same coarse setup-health signal as before (`"ready"` / `"running"` / `"failed"` / `"unknown"`), derived from `status`.
+- `setup_status` — a coarse setup-health signal derived SOLELY from the record's `setup_outcome` (never from `status`, the overall run status — full decoupling, ticket #117): `"unknown"` when `setup_outcome` is `None` (the `setup:` hook was never reached — a legacy/adopted/synthesised record); otherwise the verbatim `setup_outcome.status` — `"completed"` / `"failed"` / `"skipped"`. This value survives later rewrites of `status` by `start`/`stop`/`reconcile`. Each entry's full `setup_outcome` dict (`message`, `completed_at`, `steps_run`, `failed_step_index`, `failed_step_name`, `log_path`, `returncode`, `timed_out`) is also present for detail.
 
 This call **never writes state** — listing the primary before it has ever started does not create a record for it.
 
@@ -122,9 +133,9 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. |
+| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. See "`role` vs `variant`" above. |
 | `cwd` | `str` | No | Working directory for the spawned process. When omitted, the environment's checkout path is used by the underlying engine. |
-| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. |
+| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. See "`role` vs `variant`" above. |
 | `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
 **The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` at `repo_root`.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
@@ -138,21 +149,22 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 
 **Soft errors:** if the target is not found, returns `{"error": "...", "code": "not_found"}`; if a process is already running under the given `role`, returns `{"error": "...", "code": "already_running"}` — both instead of raising, so callers can branch on `code` rather than parsing the error text. The not-found message names whichever target identifier was supplied (`environment_id` if given, else `checkout_path`).
 
-**Errors:** raises `ValueError` for `WorktreeError` (including the engine's `CheckoutTargetError`/`UnknownVariantError`) or `ProcessLifecycleError` conditions.
+**Errors:** raises `ValueError` for `WorktreeError` (including the engine's `CheckoutTargetError` — re-worded to a wrapper-native `environment_start` message, see "Addressing an environment" above — and `UnknownVariantError`) or `ProcessLifecycleError` conditions.
 
 ---
 
 #### environment_stop
 
 ```
-environment_stop(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False) -> dict
+environment_stop(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False) -> dict
 ```
 
 See "Addressing an environment" above for `environment_id`/`checkout_path`. Unlike `environment_start`, stopping never materialises a primary record — an unstarted primary has nothing to stop, so it returns the same soft not-found dict as an unknown `environment_id`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `role` | `str` | No | Logical role name of the process to stop. Defaults to `"main"`. |
+| `role` | `Optional[str]` | No | Logical role name of the process to stop. Defaults to `None`, meaning "use `main`" *unless* `variant` is also given, in which case `variant` alone resolves the role. See "`role` vs `variant`" above. |
+| `variant` | `Optional[str]` | No | Resolves to the role that was started with this variant (via `record.variants`), so a process can be stopped without knowing which role it was started under. Defaults to `None`. See "`role` vs `variant`" above for the full resolution contract, including the three ways it can raise `ValueError`. |
 | `timeout` | `float` | No | Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before the process is forcibly killed (SIGKILL/TerminateProcess). Defaults to `10.0`. |
 | `kill_orphans` | `bool` | No | When `True`, after the primary stop signal a cwd/open-file scan terminates orphaned grandchild processes that were reparented away from the tracked shell wrapper (e.g. a detached GUI started via `Start-Process -PassThru`). Defaults to `False` (backward-compatible). |
 

@@ -79,6 +79,17 @@ Each step under `setup:`, `start:`, `stop:`, or `teardown:` is a YAML mapping wi
 `name` as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch).
 An unknown variant raises a `ValueError` listing the available names.
 
+**`role` vs `variant`.** These are independent parameters, easy to conflate: `role` is
+the tracking key a process's pid is filed under (`pids[role]`), and it defaults to
+`"main"` **regardless of which `variant` was requested** — starting `variant="gui"`
+with no explicit `role` still records its pid under `role="main"`. `variant` only
+selects which `start:` step runs. Because they're independent, two variants started
+concurrently need two distinct `role`s, or the second call returns/errors with an
+`already_running` condition. Whichever `variant` started a given `role` is remembered
+(`record.variants`), so `environment_stop(variant=...)` can later stop that role
+without the caller separately tracking which role it used — see `environment_stop`'s
+own `variant` parameter below.
+
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
 
@@ -133,9 +144,9 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 | Tool | Best for |
 |---|---|
-| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status`; `scope="all"` fans out across every tracked repo |
+| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status` (`"completed"` / `"failed"` / `"skipped"` / `"unknown"`, derived solely from the record's `setup_outcome`, never from `status`); `scope="all"` fans out across every tracked repo |
 | `environment_start` | Launch a named `start:` variant as a tracked, detached process, against any checkout |
-| `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout |
+| `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout; accepts an optional `variant` to resolve the target `role` from `record.variants` instead of naming `role` directly (see "`role` vs `variant`" above) |
 
 ## Addressing an environment
 
@@ -161,10 +172,14 @@ name their target — pass one or the other (or both, if they agree):
   `path` (from `environment_list`) as `checkout_path` instead. See "Orphan worktree
   recovery" below for the full recipe.
 
-Passing both is fine only when they agree — a mismatch raises `ValueError` from the
-engine's `CheckoutTargetError`. Passing neither also raises `ValueError`. This
-resolution is entirely the *engine's* job, not the MCP wrapper's — the wrapper performs
-no validation of the pair itself.
+Passing both is fine only when they agree — a mismatch raises `ValueError`. Passing
+neither also raises `ValueError`. This resolution is entirely the *engine's* job, not
+the MCP wrapper's — the wrapper performs no validation of the pair itself — but each
+tool (`worktree_remove`, `environment_start`, `environment_stop`) re-words the engine's
+raw `CheckoutTargetError` text before raising `ValueError`: the engine's own message
+names its internal parameter and describes the contract in engine-API vocabulary
+(`start()`/`stop()`/`remove()`), so the wrapper replaces it with a message naming
+`environment_id`, `checkout_path`, and the calling tool itself.
 
 > **Spec-gap note (ticket #99).** The ticket's originally-specified surface is
 > id-only. That cannot satisfy the ticket's own AC1 — cold-starting a primary that has
@@ -249,6 +264,15 @@ The response's `killed_pids` field lists every terminated process (pid, name,
 cmdline). If the directory is still locked afterward, the tool raises an error —
 resolve the remaining lock at the OS level and retry.
 
+**Compound blocking (ticket #120): one retry, not a guessing sequence.** If the
+directory lock AND uncommitted/untracked changes are BOTH blocking removal at
+once, the raised `ValueError` names every blocking condition and the flag that
+clears each in a single message — `(blocked_by: "dir_locked",
+"uncommitted_changes"; required_flags: kill_blocking_processes=True,
+force=True)`. Read both tokens off that one error and retry once with both
+flags set, rather than discovering each condition across separate failed
+attempts (plain retry → `kill_blocking_processes=True` → `force=True`).
+
 **Orphan worktree recovery**
 
 An orphan is a linked worktree that exists on disk (`git worktree list --porcelain`
@@ -294,7 +318,10 @@ running under the given `role`).
    recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
    `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
-   fighting the lock manually.
+   fighting the lock manually. If the directory lock and uncommitted changes are
+   BOTH blocking removal, the error names both conditions and both required
+   flags (`blocked_by`/`required_flags`) in one message — set both flags in a
+   single retry instead of discovering each condition one at a time.
 5. **A primary checkout can never be removed, even with `force=True`.** `worktree_remove`
    against a primary/main clone's `environment_id` always raises `ValueError` — this is
    a structural refusal checked before any teardown work runs, not a safety flag you can

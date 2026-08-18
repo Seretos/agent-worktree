@@ -18,6 +18,7 @@ import lib_python_worktree.core.manager as manager_module
 from lib_python_worktree import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
+    CheckoutTargetError,
     DuplicateWorktreeError,
     GitTimeoutError,
     InMemoryStateStore,
@@ -32,6 +33,7 @@ from lib_python_worktree import (
     WorktreeManager,
     WorktreeNotFoundError,
     WorktreeRecord,
+    WorktreeRemovalBlockedError,
 )
 from lib_python_worktree.core.manager import _run_git
 
@@ -612,8 +614,17 @@ def test_tool_environment_stop_returns_record(tmp_path: Path):
     assert "error" not in result
     assert result["status"] == "stopped"
     assert result["pids"] == {}
+    # role=None is forwarded unchanged (ticket #118's role=None sentinel) --
+    # the engine itself defaults an omitted role to "main"; the wrapper no
+    # longer hardcodes "main" here so it can distinguish "role omitted" from
+    # "role explicitly main" when variant is also given.
     mgr.stop.assert_called_once_with(
-        "wt-id", checkout_path=None, role="main", timeout=10.0, kill_orphans=False
+        "wt-id",
+        checkout_path=None,
+        role=None,
+        variant=None,
+        timeout=10.0,
+        kill_orphans=False,
     )
 
 
@@ -740,7 +751,12 @@ def test_tool_environment_stop_custom_role_and_timeout_forwarded(tmp_path: Path)
     fns["environment_stop"](environment_id="wt-id", role="worker", timeout=5.0)
 
     mgr.stop.assert_called_once_with(
-        "wt-id", checkout_path=None, role="worker", timeout=5.0, kill_orphans=False
+        "wt-id",
+        checkout_path=None,
+        role="worker",
+        variant=None,
+        timeout=5.0,
+        kill_orphans=False,
     )
 
 
@@ -920,6 +936,73 @@ def test_tool_worktree_remove_default_empty_killed_pids(tmp_path: Path):
     assert result["killed_pids"] == []
 
 
+def test_tool_worktree_remove_blocked_by_both_conditions_names_both_flags(
+    tmp_path: Path,
+):
+    """Ticket #120: when manager.remove raises WorktreeRemovalBlockedError
+    (BOTH a directory lock AND uncommitted changes are blocking removal),
+    the tool must surface both conditions and both required flags in a
+    single ValueError -- not silently fall through the existing
+    WorktreeDirLockedError clause (WorktreeRemovalBlockedError subclasses
+    it), which would swallow the uncommitted-changes half of the picture.
+
+    Filesystem paths must NOT leak into the message -- the engine
+    deliberately keeps ``dirty_paths`` out of the human-readable text."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = WorktreeRemovalBlockedError(
+        worktree_id="x", killed=[], kill_attempted=False, dirty_paths=["notes.txt"]
+    )
+    mgr.remove = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](environment_id="x")
+
+    msg = str(excinfo.value)
+    assert str(exc) in msg
+    assert "blocked_by:" in msg
+    assert "dir_locked" in msg
+    assert "uncommitted_changes" in msg
+    assert "required_flags:" in msg
+    assert "kill_blocking_processes=True" in msg
+    assert "force=True" in msg
+    assert "notes.txt" not in msg
+
+
+def test_tool_worktree_remove_blocked_after_kill_attempt_still_names_both_flags(
+    tmp_path: Path,
+):
+    """Same compound-blocking condition, but reached via the
+    kill_attempted=True message branch (kill_blocking_processes=True was
+    passed, processes were killed, and the directory is STILL locked AND
+    the worktree is still dirty). Both required flags must still be
+    named."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = WorktreeRemovalBlockedError(
+        worktree_id="x",
+        killed=[KilledProcessInfo(pid=1234, name="devenv.exe", cmdline=[])],
+        kill_attempted=True,
+        dirty_paths=["notes.txt"],
+    )
+    mgr.remove = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](environment_id="x", kill_blocking_processes=True)
+
+    msg = str(excinfo.value)
+    assert str(exc) in msg
+    assert "blocked_by:" in msg
+    assert "dir_locked" in msg
+    assert "uncommitted_changes" in msg
+    assert "required_flags:" in msg
+    assert "kill_blocking_processes=True" in msg
+    assert "force=True" in msg
+    assert "notes.txt" not in msg
+
+
 def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
     """When manager.remove raises WorktreeDirLockedError (directory still
     locked after kill attempt), the tool must raise ValueError."""
@@ -930,8 +1013,52 @@ def test_tool_worktree_remove_dir_locked_raises_valueerror(tmp_path: Path):
         side_effect=WorktreeDirLockedError("wt-id", killed=[])
     )
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
+
+    # Regression guard (ticket #120): the single-condition case must NOT be
+    # captured by the new compound-blocking branch, so it must not carry
+    # the compound-only tokens.
+    msg = str(excinfo.value)
+    assert "blocked_by:" not in msg
+    assert "required_flags:" not in msg
+
+
+def test_worktree_remove_docstring_documents_compound_blocking_contract(
+    tmp_path: Path,
+):
+    """Ticket #120: the docstring must document the one-shot compound
+    reporting contract, naming the blocked_by/required_flags tokens
+    callers can branch on."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    doc = fns["worktree_remove"].__doc__ or ""
+
+    for token in ("blocked_by", "required_flags"):
+        assert token in doc, f"worktree_remove docstring missing {token!r}"
+
+
+def test_tool_worktree_remove_unknown_checkout_target_reason_defensive_text(
+    tmp_path: Path,
+):
+    """Ticket #119: an unknown/future CheckoutTargetError.reason (not
+    "missing" or "id_mismatch") must fall through to a generic,
+    wrapper-native addressing message -- never `str(exc)`, which would leak
+    the engine's internal `worktree_id` wording straight through."""
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr.remove = MagicMock(
+        side_effect=CheckoutTargetError(
+            worktree_id="x", checkout_path="y", reason="future_reason"
+        )
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](environment_id="x", checkout_path="y")
+
+    msg = str(excinfo.value)
+    assert "worktree_remove" in msg
+    assert "worktree_id" not in msg
 
 
 def test_tool_worktree_remove_empty_string_id_not_absent(tmp_path: Path):
@@ -1632,7 +1759,7 @@ def test_tool_environment_start_env_vars_reach_child(tmp_path: Path):
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["env"] = env
         # Return the record with status updated to "running" so the tool succeeds.
         record.status = "running"
@@ -1711,7 +1838,7 @@ def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["cmd"] = cmd
         record.status = "running"
         record.pids = {role: 99999}
