@@ -109,6 +109,8 @@ worktree_remove(<id>, kill_blocking_processes=True)
 
 The response's `killed_pids` field lists every process that was terminated (pid, name, cmdline). If the directory is still locked after the kill attempt, the tool raises an error — you can then resolve the remaining lock at the OS level and retry.
 
+**Compound blocking (ticket #120).** If the directory lock and uncommitted/untracked changes are BOTH blocking removal at once, the raised error names every blocking condition and the flag needed to clear each in one message — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)`. Retry once with both flags set instead of discovering each condition across separate failed attempts.
+
 **Orphan worktree on disk**
 
 An orphan is a linked worktree that exists on disk but has no persisted record — `environment_list` shows it with `tracked: false` and a synthesised, display-only id (`<repo-slug>-<branch-slug>-untracked-<8-hex>`) that is a one-way derivation of its checkout path, not a lookup key. Removing it by that id (`worktree_remove(environment_id=...)`) always comes back as a not-found error. Instead:

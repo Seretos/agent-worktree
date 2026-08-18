@@ -253,6 +253,15 @@ The response's `killed_pids` field lists every terminated process (pid, name,
 cmdline). If the directory is still locked afterward, the tool raises an error —
 resolve the remaining lock at the OS level and retry.
 
+**Compound blocking (ticket #120): one retry, not a guessing sequence.** If the
+directory lock AND uncommitted/untracked changes are BOTH blocking removal at
+once, the raised `ValueError` names every blocking condition and the flag that
+clears each in a single message — `(blocked_by: "dir_locked",
+"uncommitted_changes"; required_flags: kill_blocking_processes=True,
+force=True)`. Read both tokens off that one error and retry once with both
+flags set, rather than discovering each condition across separate failed
+attempts (plain retry → `kill_blocking_processes=True` → `force=True`).
+
 **Orphan worktree recovery**
 
 An orphan is a linked worktree that exists on disk (`git worktree list --porcelain`
@@ -298,7 +307,10 @@ running under the given `role`).
    recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
    `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
-   fighting the lock manually.
+   fighting the lock manually. If the directory lock and uncommitted changes are
+   BOTH blocking removal, the error names both conditions and both required
+   flags (`blocked_by`/`required_flags`) in one message — set both flags in a
+   single retry instead of discovering each condition one at a time.
 5. **A primary checkout can never be removed, even with `force=True`.** `worktree_remove`
    against a primary/main clone's `environment_id` always raises `ValueError` — this is
    a structural refusal checked before any teardown work runs, not a safety flag you can
