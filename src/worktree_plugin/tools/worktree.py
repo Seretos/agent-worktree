@@ -57,6 +57,7 @@ from lib_python_worktree import (
     ProcessNotRunningError,
     SetupFailedError,
     SetupOutcome,
+    VariantResolutionError,
     WorktreeDirLockedError,
     WorktreeError,
     WorktreeManager,
@@ -864,6 +865,30 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
               - name: worker
                 run: start-worker.sh
 
+        ``role`` vs ``variant``
+        -----------------------
+        These two parameters are independent and are easy to conflate:
+
+        - ``role`` is the *tracking/addressing key* under which the spawned
+          process's pid is recorded (``record.pids[role]``). It defaults to
+          ``"main"`` **regardless of which** ``variant`` was requested --
+          starting ``variant="worker"`` with no explicit ``role`` still
+          records its pid under ``role="main"``, exactly like starting
+          ``variant="default"`` would.
+        - ``variant`` only selects *which* contract ``start:`` step is run
+          (by its ``name``). It has no effect on where the resulting pid is
+          filed.
+
+        Because the two are independent, two variants started concurrently
+        against the same environment need two *distinct* ``role``s -- if the
+        second call reuses the same (default) role, it returns/errors with
+        an ``already_running`` condition (that role already has a live pid),
+        even though a different ``variant`` was requested. Whichever
+        ``variant`` actually started a given ``role`` is remembered in
+        ``record.variants[role]``, so a later ``environment_stop(variant=...)``
+        call can address that role without the caller having to separately
+        track which role it used -- see ``environment_stop``'s docstring.
+
         Parameters
         ----------
         environment_id:
@@ -875,7 +900,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         role:
             Logical role name for the process; defaults to ``"main"``. Multiple
             processes can be attached to one environment under different
-            roles.
+            roles. See "``role`` vs ``variant``" above for how this relates
+            to the ``variant`` parameter.
         cwd:
             Working directory for the spawned process. When omitted the
             environment's checkout path is used by the underlying engine.
@@ -884,7 +910,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             ``"default"``, which resolves to the lone unnamed step for
             back-compat. When multiple named steps exist, pass the step's
             ``name`` here. An unknown variant raises ``ValueError`` listing
-            the available names.
+            the available names. See "``role`` vs ``variant``" above for how
+            this relates to the ``role`` parameter.
         env:
             Optional dict of extra environment variables merged into the process
             environment by the engine. Omit (or pass ``None``) to inherit the
@@ -980,7 +1007,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     def environment_stop(
         environment_id: Optional[str] = None,
         checkout_path: Optional[str] = None,
-        role: str = "main",
+        role: Optional[str] = None,
+        variant: Optional[str] = None,
         timeout: float = 10.0,
         kill_orphans: bool = False,
     ) -> Dict[str, Any]:
@@ -1009,6 +1037,32 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         -- see "If the target is not found" below) as an unknown
         ``environment_id`` rather than creating a record just to stop it.
 
+        ``role`` vs ``variant``
+        -----------------------
+        See ``environment_start``'s "``role`` vs ``variant``" section for the
+        full explanation of why these are independent (``role`` is the
+        addressing key a pid is tracked under; ``variant`` only selects which
+        contract step ran to start it). Here, ``variant`` lets you stop a
+        process **without knowing which role it was started under**:
+
+        - Neither ``role`` nor ``variant`` given: stops ``role="main"``,
+          exactly as before this parameter existed.
+        - ``variant`` given, ``role`` omitted: resolved against
+          ``record.variants`` (populated by a prior
+          ``environment_start(variant=...)`` call) to whichever currently-
+          running role was started with that variant, and that role is
+          stopped.
+        - Both given: they must agree -- ``variant`` must resolve to exactly
+          the role named by ``role``, or a ``ValueError`` is raised.
+
+        Resolution can fail three ways, all surfaced as ``ValueError`` (never
+        a soft error dict): the variant matches no currently-running role
+        (e.g. a typo, or a role started before this parameter existed and so
+        has no recorded variant), the variant matches more than one
+        currently-running role (ambiguous -- pass ``role=`` to disambiguate),
+        or an explicitly-given ``role`` disagrees with the role ``variant``
+        resolves to.
+
         Parameters
         ----------
         environment_id:
@@ -1018,7 +1072,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             The cold-start/primary way to address the target -- see
             "Addressing the target" above.
         role:
-            Logical role name of the process to stop; defaults to ``"main"``.
+            Logical role name of the process to stop. Omitting it (the
+            default, ``None``) means "use ``main``" *unless* ``variant`` is
+            also given, in which case ``variant`` alone resolves the role --
+            see "``role`` vs ``variant``" above.
+        variant:
+            Resolves to the role that was started with this variant (via
+            ``record.variants``), so a process started with
+            ``environment_start(variant=...)`` can be stopped without
+            separately tracking which role it used. Defaults to ``None``
+            (no resolution; ``role`` alone selects the target). See
+            "``role`` vs ``variant``" above for the full contract, including
+            its three ``ValueError`` failure modes.
         timeout:
             Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before
             the process is forcibly killed (SIGKILL/TerminateProcess). Defaults
@@ -1081,6 +1146,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 environment_id,
                 checkout_path=checkout_path,
                 role=role,
+                variant=variant,
                 timeout=timeout,
                 kill_orphans=kill_orphans,
             )
@@ -1104,6 +1170,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                         "checkout_path to address it directly."
                     ),
                 )
+            ) from exc
+        except VariantResolutionError as exc:
+            # VariantResolutionError subclasses WorktreeError, so this catch
+            # must come before the generic (WorktreeError, ProcessLifecycleError)
+            # tail below -- same MRO-ordering concern as CheckoutTargetError's
+            # catch above (ticket #119). The engine's own message already
+            # uses role=/variant= vocabulary, so it is passed through
+            # verbatim, with a short hint appended pointing at the fix.
+            raise ValueError(
+                f"{exc} (hint: pass role=<role> explicitly, or see "
+                f"environment_start's role-vs-variant docs)"
             ) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc

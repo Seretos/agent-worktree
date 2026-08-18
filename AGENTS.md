@@ -91,6 +91,15 @@ Every environment is addressed by one or both of:
 
 > **Deliberate, documented deviation from ticket #99.** The ticket specifies id-only `environment_start`/`environment_stop` signatures. That cannot satisfy the ticket's own AC1: cold-starting a primary that has never been started is structurally impossible with an id-only signature, for the one-way-hash reason above. `checkout_path` is a strict *superset* of the id-only surface — every existing id-only call keeps working byte-for-byte, and it is the only way to address a never-started primary.
 
+#### `role` vs `variant`
+
+These two parameters are independent and easy to conflate:
+
+- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would.
+- **`variant`** only selects *which* contract `start:` step is run (by its `name`). It has no effect on where the resulting pid is filed.
+
+Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
+
 #### environment_list
 
 ```
@@ -124,9 +133,9 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. |
+| `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. See "`role` vs `variant`" above. |
 | `cwd` | `str` | No | Working directory for the spawned process. When omitted, the environment's checkout path is used by the underlying engine. |
-| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. |
+| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. See "`role` vs `variant`" above. |
 | `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
 **The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` at `repo_root`.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
@@ -147,14 +156,15 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 #### environment_stop
 
 ```
-environment_stop(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: str = "main", timeout: float = 10.0, kill_orphans: bool = False) -> dict
+environment_stop(environment_id: Optional[str] = None, checkout_path: Optional[str] = None, role: Optional[str] = None, variant: Optional[str] = None, timeout: float = 10.0, kill_orphans: bool = False) -> dict
 ```
 
 See "Addressing an environment" above for `environment_id`/`checkout_path`. Unlike `environment_start`, stopping never materialises a primary record — an unstarted primary has nothing to stop, so it returns the same soft not-found dict as an unknown `environment_id`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `role` | `str` | No | Logical role name of the process to stop. Defaults to `"main"`. |
+| `role` | `Optional[str]` | No | Logical role name of the process to stop. Defaults to `None`, meaning "use `main`" *unless* `variant` is also given, in which case `variant` alone resolves the role. See "`role` vs `variant`" above. |
+| `variant` | `Optional[str]` | No | Resolves to the role that was started with this variant (via `record.variants`), so a process can be stopped without knowing which role it was started under. Defaults to `None`. See "`role` vs `variant`" above for the full resolution contract, including the three ways it can raise `ValueError`. |
 | `timeout` | `float` | No | Seconds to wait for graceful shutdown (SIGTERM/CtrlBreak) before the process is forcibly killed (SIGKILL/TerminateProcess). Defaults to `10.0`. |
 | `kill_orphans` | `bool` | No | When `True`, after the primary stop signal a cwd/open-file scan terminates orphaned grandchild processes that were reparented away from the tracked shell wrapper (e.g. a detached GUI started via `Start-Process -PassThru`). Defaults to `False` (backward-compatible). |
 
