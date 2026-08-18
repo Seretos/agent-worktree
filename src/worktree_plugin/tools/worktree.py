@@ -93,6 +93,44 @@ def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
     return asdict(record)
 
 
+def _addressing_error_text(
+    exc: CheckoutTargetError, *, tool_name: str, hint: str
+) -> str:
+    """Re-word the engine's ``CheckoutTargetError`` into a wrapper-native
+    addressing-error message for ``tool_name``.
+
+    The engine's own message names its internal ``worktree_id`` parameter
+    and describes the contract in engine-API vocabulary (``start()``/
+    ``stop()``/``remove()``), neither of which matches this wrapper's actual
+    ``environment_id`` parameter or the calling tool's own name. This
+    re-words the message to name ``environment_id`` and ``tool_name``
+    instead -- addressing BEHAVIOUR is entirely unchanged (resolution is
+    still the engine's job; this wrapper still performs no validation of the
+    pair itself), only the text presented to callers changes.
+
+    ``exc.reason`` is one of ``"missing"`` (neither ``environment_id`` nor
+    ``checkout_path`` was given) or ``"id_mismatch"`` (both were given but
+    disagree). Any other/future ``reason`` value falls through to a generic,
+    wrapper-native message -- deliberately never ``str(exc)``, which would
+    re-leak the engine's ``worktree_id`` wording straight through.
+    """
+    if exc.reason == "missing":
+        return (
+            f"{tool_name} requires either environment_id or checkout_path "
+            f"to address a target; neither was given. {hint}"
+        )
+    if exc.reason == "id_mismatch":
+        return (
+            f"checkout_path '{exc.checkout_path}' resolved to id "
+            f"'{exc.resolved_id}', which does not match the given "
+            f"environment_id '{exc.worktree_id}'."
+        )
+    return (
+        f"{tool_name} could not resolve environment_id/checkout_path to a "
+        f"single target. {hint}"
+    )
+
+
 def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
     """Make ``contract_dir`` (the ``.seretos/`` copy ``worktree_create``
     just wrote into a *new worktree checkout*) invisible to git.
@@ -470,11 +508,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         Neither is schema-required, but the engine (not this wrapper)
         enforces the resolution: passing both is fine only when they agree
-        (a mismatch raises ``ValueError``, from the engine's
-        ``CheckoutTargetError``); passing neither also raises ``ValueError``.
-        This wrapper performs no validation of the ``(environment_id,
-        checkout_path)`` pair itself -- every combination is forwarded
-        straight through to the engine.
+        (a mismatch raises ``ValueError``); passing neither also raises
+        ``ValueError``. This wrapper performs no validation of the
+        ``(environment_id, checkout_path)`` pair itself -- resolution is
+        entirely the engine's job, via its ``CheckoutTargetError`` -- but it
+        re-words that error's text before raising ``ValueError``: the
+        engine's own message names its internal ``worktree_id`` parameter
+        and engine-API vocabulary (``start()``/``stop()``/``remove()``),
+        so this wrapper replaces it with a ``worktree_remove``-specific
+        message naming ``environment_id`` and ``checkout_path`` instead.
 
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
@@ -561,6 +603,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             return {"error": error_text, "code": "not_found"}
         except WorktreeDirLockedError as exc:
             raise ValueError(str(exc)) from exc
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="worktree_remove",
+                    hint=(
+                        "Pass environment_id for a tracked checkout, or "
+                        "checkout_path for an untracked/orphan checkout."
+                    ),
+                )
+            ) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
@@ -712,12 +765,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           record here -- this is the **only** place a primary
           ``WorktreeRecord`` is ever written.
 
-        Neither is schema-required, but the engine (not this wrapper) enforces
-        the resolution: passing both is fine only when they agree (a mismatch
-        raises ``ValueError``, from the engine's ``CheckoutTargetError``);
-        passing neither also raises ``ValueError``. This wrapper performs no
-        validation of the ``(environment_id, checkout_path)`` pair itself --
-        every combination is forwarded straight through to the engine.
+        Neither is schema-required, but the engine (not this wrapper)
+        enforces the resolution: passing both is fine only when they agree
+        (a mismatch raises ``ValueError``); passing neither also raises
+        ``ValueError``. This wrapper performs no validation of the
+        ``(environment_id, checkout_path)`` pair itself -- resolution is
+        entirely the engine's job, via its ``CheckoutTargetError`` -- but it
+        re-words that error's text before raising ``ValueError``: the
+        engine's own message names its internal ``worktree_id`` parameter
+        and engine-API vocabulary (``start()``/``stop()``/``remove()``),
+        so this wrapper replaces it with an ``environment_start``-specific
+        message naming ``environment_id`` and ``checkout_path`` instead.
 
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
@@ -856,6 +914,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             }
         except ProcessAlreadyRunningError as exc:
             return {"error": str(exc), "code": "already_running"}
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="environment_start",
+                    hint=(
+                        "Pass environment_id for a known environment, or "
+                        "checkout_path to cold-start the primary/main clone."
+                    ),
+                )
+            ) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
@@ -877,9 +946,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         Same two ways as ``environment_start`` -- ``environment_id`` (the
         normal way) or ``checkout_path`` (the cold-start/primary way; see
         ``environment_start``'s docstring for the full rationale). Passing
-        neither, or both when they disagree, raises ``ValueError`` from the
-        engine's ``CheckoutTargetError`` -- this wrapper performs no
-        validation of the pair itself.
+        neither, or both when they disagree, raises ``ValueError``.
+        Resolution is entirely the engine's job, via its
+        ``CheckoutTargetError`` -- this wrapper performs no validation of
+        the pair itself -- but it re-words that error's text before
+        raising ``ValueError``: the engine's own message names its
+        internal ``worktree_id`` parameter and engine-API vocabulary
+        (``start()``/``stop()``/``remove()``), so this wrapper replaces it
+        with an ``environment_stop``-specific message naming
+        ``environment_id`` and ``checkout_path`` instead.
 
         Unlike ``environment_start``, stopping never materialises a primary
         record: an unstarted primary has nothing to stop, so it returns the
@@ -972,6 +1047,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             }
         except ProcessNotRunningError as exc:
             return {"error": str(exc), "code": "not_running"}
+        except CheckoutTargetError as exc:
+            raise ValueError(
+                _addressing_error_text(
+                    exc,
+                    tool_name="environment_stop",
+                    hint=(
+                        "Pass environment_id for a known environment, or "
+                        "checkout_path to address it directly."
+                    ),
+                )
+            ) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)

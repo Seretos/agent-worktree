@@ -496,8 +496,16 @@ def test_worktree_remove_checkout_path_and_id_mismatch_raises_valueerror(
     rec1 = mgr.create(str(repo1), "feature/wt1")
     mgr.create(str(repo2), "feature/wt2")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["worktree_remove"](environment_id=rec1.id, checkout_path=str(repo2))
+
+    # The message must be re-worded to name the wrapper's own
+    # `environment_id` parameter, not the engine-internal `worktree_id`
+    # (ticket #119).
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
     # Neither worktree was touched by the failed, mismatched call.
     assert Path(rec1.path).exists()
@@ -507,6 +515,23 @@ def test_worktree_remove_with_neither_target_raises_valueerror(tmp_path: Path):
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     with pytest.raises(ValueError):
         fns["worktree_remove"]()
+
+
+def test_worktree_remove_missing_target_error_names_environment_id(tmp_path: Path):
+    """Ticket #119: the ValueError raised when neither environment_id nor
+    checkout_path is given must be re-worded to name worktree_remove's own
+    parameters and itself by name -- not the engine-internal `worktree_id`
+    parameter or engine-API vocabulary (start()/stop()/remove())."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"]()
+
+    msg = str(excinfo.value)
+    assert "worktree_remove" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
 
 
 def test_worktree_remove_checkout_path_outside_any_repo(tmp_path: Path):
@@ -633,15 +658,40 @@ def test_environment_start_id_and_path_mismatch_raises(tmp_path: Path):
     with pytest.raises(ValueError) as excinfo:
         fns["environment_start"](environment_id=rec1.id, checkout_path=str(repo2))
 
-    # The message must originate from the engine's CheckoutTargetError, not
-    # wrapper-side validation -- assert on its distinctive wording.
-    assert "resolved to id" in str(excinfo.value)
+    # The underlying resolution still originates from the engine's
+    # CheckoutTargetError, but the tool re-words its text (ticket #119) to
+    # name the wrapper's own `environment_id` parameter instead of the
+    # engine-internal `worktree_id` -- assert on the distinctive "resolved
+    # to id" wording (preserved verbatim by the re-wording) plus the
+    # renamed parameter.
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_start_with_neither_target_raises(tmp_path: Path):
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     with pytest.raises(ValueError):
         fns["environment_start"]()
+
+
+def test_environment_start_missing_target_error_names_environment_id(
+    tmp_path: Path,
+):
+    """Ticket #119: same as worktree_remove's missing-target driving test,
+    but for environment_start -- must name environment_start itself and
+    environment_id/checkout_path, never worktree_id."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"]()
+
+    msg = str(excinfo.value)
+    assert "environment_start" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_stop_unmaterialised_primary_soft_error(
@@ -655,6 +705,43 @@ def test_environment_stop_unmaterialised_primary_soft_error(
     assert "error" in result
     assert "not found" in result["error"]
     assert mgr.state.list() == [], "stop() must never materialise a primary record"
+
+
+def test_environment_stop_missing_target_error_names_environment_id(tmp_path: Path):
+    """Ticket #119: same as worktree_remove's missing-target driving test,
+    but for environment_stop -- must name environment_stop itself and
+    environment_id/checkout_path, never worktree_id."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"]()
+
+    msg = str(excinfo.value)
+    assert "environment_stop" in msg
+    assert "environment_id" in msg
+    assert "checkout_path" in msg
+    assert "worktree_id" not in msg
+
+
+def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
+    tmp_path: Path,
+):
+    """Ticket #119: environment_stop's id/checkout_path mismatch error must
+    also be re-worded to name environment_id, not worktree_id."""
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](environment_id=rec1.id, checkout_path=str(repo2))
+
+    msg = str(excinfo.value)
+    assert "resolved to id" in msg
+    assert "environment_id" in msg
+    assert "worktree_id" not in msg
 
 
 def test_environment_start_contract_variant_and_env_injection_unchanged(
