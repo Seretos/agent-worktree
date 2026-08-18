@@ -26,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from lib_python_worktree import (
     InMemoryStateStore,
     ManagerConfig,
+    SetupOutcome,
     WorktreeManager,
     WorktreeRecord,
     YamlStateStore,
@@ -154,32 +155,132 @@ def test_environment_list_entry_shape(tmp_path: Path, temp_repo: Path):
             "pids",
             "ports",
             "setup_status",
+            "setup_outcome",
             "tracked",
         ):
             assert key in entry, f"{key!r} missing from entry: {entry}"
+        assert isinstance(entry["setup_outcome"], dict) or entry["setup_outcome"] is None, (
+            f"setup_outcome must be a nested dict (via asdict) or None: {entry['setup_outcome']!r}"
+        )
+
+
+# ---- Ticket #117: setup_status derived SOLELY from setup_outcome, never
+# from record.status (full decoupling) ----
 
 
 @pytest.mark.parametrize(
-    "status,expected_setup_status",
-    [
-        ("running", "running"),
-        ("ready", "ready"),
-        ("stopped", "unknown"),
-        ("created", "unknown"),
-        ("setup_failed", "failed"),
-    ],
+    "status",
+    ["created", "running", "ready", "stopped", "setup_failed"],
 )
-def test_environment_list_setup_status_derivations(
-    tmp_path: Path, temp_repo: Path, status: str, expected_setup_status: str
+def test_environment_list_setup_status_unknown_without_setup_outcome(
+    tmp_path: Path, temp_repo: Path, status: str
 ):
+    """A record with no ``setup_outcome`` (the ``setup:`` hook was never
+    reached -- a legacy record, an adopted record, or synthesised entry)
+    must report ``"unknown"`` regardless of ``status`` -- even
+    ``"setup_failed"``. This is the strict-decoupling/legacy-record case:
+    ``status`` must never be consulted as a fallback."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     rec = mgr.create(str(temp_repo), "feature/wt")
     rec.status = status
+    rec.setup_outcome = None
     mgr.state.update(rec)
 
     result = fns["environment_list"](path=str(temp_repo))
     entry = next(e for e in result if e["id"] == rec.id)
-    assert entry["setup_status"] == expected_setup_status
+    assert entry["setup_status"] == "unknown"
+
+
+def test_environment_list_setup_status_completed(tmp_path: Path, temp_repo: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    rec.setup_outcome = SetupOutcome(status="completed", steps_run=2)
+    # Prove decoupling: status has since moved on to something unrelated.
+    rec.status = "running"
+    mgr.state.update(rec)
+
+    result = fns["environment_list"](path=str(temp_repo))
+    entry = next(e for e in result if e["id"] == rec.id)
+    assert entry["setup_status"] == "completed"
+
+
+def test_environment_list_setup_status_failed_survives_status_rewrite(
+    tmp_path: Path, temp_repo: Path
+):
+    """The ticket's exact reported symptom: setup_status used to alias the
+    overall run status, so a "failed" setup outcome would disappear once
+    something else (e.g. a later stop) rewrote record.status. It must
+    survive that rewrite."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    rec.setup_outcome = SetupOutcome(
+        status="failed",
+        message="boom",
+        failed_step_index=1,
+        failed_step_name="install",
+        returncode=1,
+    )
+    rec.status = "stopped"
+    mgr.state.update(rec)
+
+    result = fns["environment_list"](path=str(temp_repo))
+    entry = next(e for e in result if e["id"] == rec.id)
+    assert entry["setup_status"] == "failed"
+
+
+def test_environment_list_setup_status_skipped_is_distinct_from_unknown(
+    tmp_path: Path
+):
+    repo_a = _make_repo(tmp_path, "repo-a")
+    _git("branch", "feature/a", cwd=repo_a)
+    repo_b = _make_repo(tmp_path, "repo-b")
+    _git("branch", "feature/b", cwd=repo_b)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec_skipped = mgr.create(str(repo_a), "feature/a")
+    rec_skipped.setup_outcome = SetupOutcome(status="skipped", steps_run=0)
+    mgr.state.update(rec_skipped)
+
+    rec_unknown = mgr.create(str(repo_b), "feature/b")
+    rec_unknown.setup_outcome = None
+    mgr.state.update(rec_unknown)
+
+    result_a = fns["environment_list"](path=str(repo_a))
+    entry_skipped = next(e for e in result_a if e["id"] == rec_skipped.id)
+    assert entry_skipped["setup_status"] == "skipped"
+
+    result_b = fns["environment_list"](path=str(repo_b))
+    entry_unknown = next(e for e in result_b if e["id"] == rec_unknown.id)
+    assert entry_unknown["setup_status"] == "unknown"
+
+
+def test_environment_list_setup_status_decoupling_holds_under_scope_all(
+    tmp_path: Path
+):
+    """The setup_outcome-based derivation isn't scope-local: it must hold
+    identically whether an entry is listed directly (scope="repo") or
+    fanned out from another repo's vantage point (scope="all")."""
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec1.setup_outcome = SetupOutcome(status="failed", message="boom")
+    rec1.status = "stopped"
+    mgr.state.update(rec1)
+
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+    rec2.setup_outcome = SetupOutcome(status="completed", steps_run=1)
+    rec2.status = "running"
+    mgr.state.update(rec2)
+
+    result_all = fns["environment_list"](path=str(repo1), scope="all")
+    entry1 = next(e for e in result_all if e["id"] == rec1.id)
+    entry2 = next(e for e in result_all if e["id"] == rec2.id)
+    assert entry1["setup_status"] == "failed"
+    assert entry2["setup_status"] == "completed"
 
 
 # ---- R3: the primary is synthesised without ever writing state ----
