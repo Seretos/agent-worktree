@@ -79,6 +79,17 @@ Each step under `setup:`, `start:`, `stop:`, or `teardown:` is a YAML mapping wi
 `name` as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch).
 An unknown variant raises a `ValueError` listing the available names.
 
+**`role` vs `variant`.** These are independent parameters, easy to conflate: `role` is
+the tracking key a process's pid is filed under (`pids[role]`), and it defaults to
+`"main"` **regardless of which `variant` was requested** — starting `variant="gui"`
+with no explicit `role` still records its pid under `role="main"`. `variant` only
+selects which `start:` step runs. Because they're independent, two variants started
+concurrently need two distinct `role`s, or the second call returns/errors with an
+`already_running` condition. Whichever `variant` started a given `role` is remembered
+(`record.variants`), so `environment_stop(variant=...)` can later stop that role
+without the caller separately tracking which role it used — see `environment_stop`'s
+own `variant` parameter below.
+
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
 
@@ -135,7 +146,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 |---|---|
 | `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status`; `scope="all"` fans out across every tracked repo |
 | `environment_start` | Launch a named `start:` variant as a tracked, detached process, against any checkout |
-| `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout |
+| `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout; accepts an optional `variant` to resolve the target `role` from `record.variants` instead of naming `role` directly (see "`role` vs `variant`" above) |
 
 ## Addressing an environment
 

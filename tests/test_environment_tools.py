@@ -1231,3 +1231,202 @@ def test_environment_start_docstring_lists_all_contract_keys(tmp_path: Path):
         "no_op_reason",
     ):
         assert token in doc, f"environment_start docstring missing {token!r}"
+
+
+# ---- Ticket #118: role vs variant addressing model ----
+#
+# environment_start's "role" and "variant" parameters are independent
+# (role is the tracking/addressing key a pid is filed under; variant only
+# selects which contract start: step ran) but were previously documented in
+# total isolation from each other, with no explanation of how they interact.
+# This block also drives environment_stop's new `variant` parameter (ticket
+# #104's engine-level `stop(variant=...)` resolution, newly exposed through
+# the MCP tool surface), including the `role=None` sentinel fix required to
+# forward "role omitted" vs "role explicitly main" correctly.
+
+
+def test_environment_start_docstring_explains_role_vs_variant(tmp_path: Path):
+    """The docstring must explain, in one connected section, that `role`
+    defaults to "main" regardless of which `variant` is requested -- not
+    just document each parameter in isolation."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+
+    assert "regardless" in doc.lower()
+
+    # Both "role" and "variant" must appear together within the same
+    # explanatory section (not just anywhere in the docstring, which the
+    # pre-existing isolated parameter entries would already satisfy).
+    idx = doc.lower().find("regardless")
+    assert idx != -1
+    window = doc[max(0, idx - 400) : idx + 400]
+    assert "role" in window
+    assert "variant" in window
+
+
+def test_environment_stop_docstring_documents_role_vs_variant(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+
+    assert "variant" in doc
+
+
+def _seed_record(
+    mgr: WorktreeManager,
+    *,
+    pids: dict,
+    variants: dict,
+    repo_root: str,
+    path: str,
+) -> WorktreeRecord:
+    record = WorktreeRecord(
+        id="wt-118-test",
+        repo_root=repo_root,
+        branch="feature/wt",
+        path=path,
+        status="running",
+        pids=dict(pids),
+        variants=dict(variants),
+    )
+    mgr.state.add(record)
+    return record
+
+
+def test_environment_stop_variant_resolves_to_started_role(
+    tmp_path: Path, temp_repo: Path
+):
+    """BR1+BR2 combined: calling environment_stop(variant=...) with NO role
+    given must resolve to the role that was actually started with that
+    variant (here "web", not the "main" default) -- this simultaneously
+    exercises the new variant-resolution behavior and the role=None sentinel
+    fix (forwarding a hardcoded "main" would have broken this)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"web": 99999},
+        variants={"web": "gui"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    captured: dict = {}
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.variants.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id, variant="gui")
+
+    assert "error" not in result
+    assert captured["role"] == "web"
+    assert "web" not in result.get("pids", {})
+
+
+def test_environment_stop_no_role_no_variant_still_stops_main(
+    tmp_path: Path, temp_repo: Path
+):
+    """Back-compat regression: environment_stop(environment_id=...) with
+    neither role nor variant given must still stop role="main", exactly as
+    before the role=None sentinel change."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"main": 12345},
+        variants={},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    captured: dict = {}
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id)
+
+    assert "error" not in result
+    assert captured["role"] == "main"
+    assert "main" not in result.get("pids", {})
+
+
+_VARIANT_RESOLUTION_FAILURE_CASES = [
+    pytest.param(
+        {"main": 1},
+        {},
+        None,
+        "nonexistent-variant",
+        id="zero-match-typo",
+    ),
+    pytest.param(
+        {"web": 1, "worker": 2},
+        {"web": "shared", "worker": "shared"},
+        None,
+        "shared",
+        id="ambiguous-multiple-roles",
+    ),
+    pytest.param(
+        {"web": 1},
+        {"web": "gui"},
+        "worker",
+        "gui",
+        id="role-variant-disagreement",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "pids,variants,role,variant",
+    _VARIANT_RESOLUTION_FAILURE_CASES,
+)
+def test_environment_stop_variant_resolution_failure_raises_valueerror(
+    tmp_path: Path,
+    temp_repo: Path,
+    pids: dict,
+    variants: dict,
+    role,
+    variant: str,
+):
+    """All three of the engine's variant-resolution failure modes (zero-
+    match/unknown variant, ambiguous/multiple-match, and role/variant
+    disagreement) must raise ValueError uniformly -- there is no soft
+    {"code": "not_running"}-style dict for any of them."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids=pids,
+        variants=variants,
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    kwargs = {"environment_id": record.id, "variant": variant}
+    if role is not None:
+        kwargs["role"] = role
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](**kwargs)
+
+    msg = str(excinfo.value)
+    # The engine's own message uses role=/variant= vocabulary; the wrapper's
+    # hint is appended, never replacing it.
+    assert variant in msg
+    assert "hint" in msg.lower()
+    assert "role=" in msg or "role" in msg.lower()

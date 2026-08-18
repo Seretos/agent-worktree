@@ -613,8 +613,17 @@ def test_tool_environment_stop_returns_record(tmp_path: Path):
     assert "error" not in result
     assert result["status"] == "stopped"
     assert result["pids"] == {}
+    # role=None is forwarded unchanged (ticket #118's role=None sentinel) --
+    # the engine itself defaults an omitted role to "main"; the wrapper no
+    # longer hardcodes "main" here so it can distinguish "role omitted" from
+    # "role explicitly main" when variant is also given.
     mgr.stop.assert_called_once_with(
-        "wt-id", checkout_path=None, role="main", timeout=10.0, kill_orphans=False
+        "wt-id",
+        checkout_path=None,
+        role=None,
+        variant=None,
+        timeout=10.0,
+        kill_orphans=False,
     )
 
 
@@ -741,7 +750,12 @@ def test_tool_environment_stop_custom_role_and_timeout_forwarded(tmp_path: Path)
     fns["environment_stop"](environment_id="wt-id", role="worker", timeout=5.0)
 
     mgr.stop.assert_called_once_with(
-        "wt-id", checkout_path=None, role="worker", timeout=5.0, kill_orphans=False
+        "wt-id",
+        checkout_path=None,
+        role="worker",
+        variant=None,
+        timeout=5.0,
+        kill_orphans=False,
     )
 
 
