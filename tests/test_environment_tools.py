@@ -703,7 +703,7 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["cmd"] = cmd
         captured["env"] = env
         record.status = "running"
@@ -765,7 +765,7 @@ def test_environment_start_with_start_step_reports_contract_read(
     )
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         rec = store.get(worktree_id)
         rec.status = "running"
         rec.pids = {role: 4242}
@@ -814,7 +814,7 @@ def test_environment_start_real_start_reports_steps_run_for_any_status(
     )
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         rec = store.get(worktree_id)
         # Mirrors the engine: pids is set unconditionally; only status and
         # returncode depend on surviving the early-exit wait.

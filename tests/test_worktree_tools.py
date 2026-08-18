@@ -1632,7 +1632,7 @@ def test_tool_environment_start_env_vars_reach_child(tmp_path: Path):
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["env"] = env
         # Return the record with status updated to "running" so the tool succeeds.
         record.status = "running"
@@ -1711,7 +1711,7 @@ def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
 
     captured: dict = {}
 
-    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd):
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
         captured["cmd"] = cmd
         record.status = "running"
         record.pids = {role: 99999}
