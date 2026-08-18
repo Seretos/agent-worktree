@@ -61,6 +61,7 @@ from lib_python_worktree import (
     WorktreeManager,
     WorktreeNotFoundError,
     WorktreeRecord,
+    WorktreeRemovalBlockedError,
     load as load_contract,
     primary_id_for,
 )
@@ -562,6 +563,19 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         worktree directory is still locked after attempting to kill blocking
         processes.
 
+        **Compound blocking is reported in one shot (ticket #120).** When
+        BOTH the directory lock AND uncommitted/untracked changes are
+        blocking removal at once, the engine raises
+        ``WorktreeRemovalBlockedError`` instead of the single-condition
+        exceptions above. This wrapper catches it explicitly and raises a
+        single ``ValueError`` naming every currently-blocking condition and
+        the flag needed to clear each -- ``(blocked_by: "dir_locked",
+        "uncommitted_changes"; required_flags: kill_blocking_processes=True,
+        force=True)`` -- so one informed retry (passing both flags at once)
+        suffices, instead of a caller discovering each condition
+        sequentially across up to three separate failed attempts. Filesystem
+        paths are deliberately never included in this message.
+
         **Primary checkouts are never removed.** Attempting to remove the
         primary/main clone's environment -- whether addressed by
         ``environment_id`` or by ``checkout_path``, and even with
@@ -601,6 +615,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             ):
                 error_text = f"{error_text}: {exc}"
             return {"error": error_text, "code": "not_found"}
+        except WorktreeRemovalBlockedError as exc:
+            # Ticket #120: WorktreeRemovalBlockedError subclasses BOTH
+            # WorktreeDirLockedError and DirtyWorktreeError, so this clause
+            # must come before the plain `except WorktreeDirLockedError`
+            # below -- otherwise that clause would silently swallow the
+            # compound case and only ever report the lock half of the
+            # picture. Surface both blocking conditions and both required
+            # flags in one message so a single informed retry suffices.
+            raise ValueError(
+                f'{exc} (blocked_by: "dir_locked", "uncommitted_changes"; '
+                f"required_flags: kill_blocking_processes=True, force=True)"
+            ) from exc
         except WorktreeDirLockedError as exc:
             raise ValueError(str(exc)) from exc
         except CheckoutTargetError as exc:

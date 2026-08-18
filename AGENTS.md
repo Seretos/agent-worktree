@@ -70,6 +70,8 @@ Removing the primary/main clone is never allowed regardless of how it is address
 
 **Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
 
+**Compound blocking, reported in one shot (ticket #120):** when the directory lock AND uncommitted/untracked changes are BOTH blocking removal at once, the engine raises `WorktreeRemovalBlockedError` instead of the single-condition exceptions above. The wrapper catches it explicitly and raises one `ValueError` naming every currently-blocking condition and the flag needed to clear each — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)` — so a single informed retry (passing both flags at once) suffices, instead of a caller discovering each condition sequentially across up to three separate failed attempts. Filesystem paths are never included in this message.
+
 **Primary refusal (hard, non-`force`-able):** attempting to remove the primary/main clone's environment — whether addressed by `environment_id` or by `checkout_path`, and even with `force=True` — raises `ValueError`. This is checked before any teardown work runs and can never be bypassed: a primary checkout IS the repo, so deleting it would be catastrophic. The raised message includes the engine's own text plus an explicit `backing: "primary"` token.
 
 ---
