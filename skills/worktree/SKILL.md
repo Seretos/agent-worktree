@@ -218,7 +218,10 @@ tool (`worktree_remove`, `environment_start`, `environment_stop`) re-words the e
 raw `CheckoutTargetError` text before raising `ValueError`: the engine's own message
 names its internal parameter and describes the contract in engine-API vocabulary
 (`start()`/`stop()`/`remove()`), so the wrapper replaces it with a message naming
-`environment_id`, `checkout_path`, and the calling tool itself.
+`environment_id`, `checkout_path`, and the calling tool itself. The same three tools
+also re-word the engine's `InvalidRepoError` (ticket #123), raised when `checkout_path`
+is given but isn't a usable git repository — its internal `repo_root` parameter name is
+replaced with `checkout_path`, with the full diagnostic reason preserved byte-for-byte.
 
 > **Spec-gap note (ticket #99).** The ticket's originally-specified surface is
 > id-only. That cannot satisfy the ticket's own AC1 — cold-starting a primary that has
