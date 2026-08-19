@@ -975,7 +975,7 @@ def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
 
 
 def test_environment_start_contract_variant_and_env_injection_unchanged(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
 ):
     """AC8 evidence: contract-driven start (real .seretos/worktree-setup.yml,
     unchanged v1 schema) still selects the correct named `start:` step and
@@ -1027,14 +1027,6 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
         record.pids = {role: 99999}
         return record
 
-    # ticket #129 fix-cycle (blocking finding): pin sys.platform so the
-    # -EncodedCommand argv shape asserted below is deterministic on both
-    # CI matrix legs (windows-latest, ubuntu-22.04) rather than ambient on
-    # whatever OS the test happens to run on -- see
-    # test_setup_runner.py::test_shell_auto_detect_uses_platform_default
-    # for the same seam/idiom.
-    monkeypatch.setattr(sys, "platform", "win32")
-
     with patch(
         "lib_python_worktree.core.manager._lifecycle_start",
         side_effect=_fake_lifecycle_start,
@@ -1042,19 +1034,36 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
         result = fn(environment_id=worktree_id, variant="worker")
 
     assert "error" not in result
-    # ticket #109 (upstream lib-python-worktree): the default win32 shell
-    # (powershell.exe) transports the run line as a base64
-    # -EncodedCommand blob rather than a raw -Command <text> argument, so
-    # decode it before checking which script was selected.
+    # ticket #137: do NOT pin sys.platform here (as ticket #129 did). Doing
+    # so forces core/manager.py's env=_build_worktree_env(record, env) --
+    # an *argument expression*, evaluated before the patched
+    # _lifecycle_start is ever entered -- down _get_user_profile_env's
+    # win32 branch, which does `import winreg` at
+    # lib_python_worktree/core/_env_utils.py:55. winreg is a Windows-only
+    # stdlib module, so pinning sys.platform to "win32" on the
+    # ubuntu-22.04 CI leg makes this test itself raise
+    # ModuleNotFoundError -- the #129 fix for a Linux regression was
+    # itself a Linux regression. Branch the assertion on the *ambient*
+    # sys.platform instead so each leg exercises (and strictly checks)
+    # its own real argv shape.
     cmd = captured["cmd"]
-    assert len(cmd) == 5
-    assert cmd[:4] == [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-    ]
-    decoded_run_line = base64.b64decode(cmd[4]).decode("utf-16-le")
+    if sys.platform == "win32":
+        # ticket #109 (upstream lib-python-worktree): the default win32
+        # shell (powershell.exe) transports the run line as a base64
+        # -EncodedCommand blob rather than a raw -Command <text>
+        # argument, so decode it before checking which script was
+        # selected.
+        assert len(cmd) == 5
+        assert cmd[:4] == [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+        ]
+        decoded_run_line = base64.b64decode(cmd[4]).decode("utf-16-le")
+    else:
+        assert cmd == ["bash", "-c", "start-worker.sh"]
+        decoded_run_line = cmd[2]
     assert "start-worker.sh" in decoded_run_line
     assert "start-web.sh" not in decoded_run_line
 
