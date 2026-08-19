@@ -16,9 +16,23 @@
 #   pwsh -File scripts/test.ps1 -v                  # verbose
 #   pwsh -File scripts/test.ps1 tests/test_config.py # single file
 #
+# Every argument after the script name is forwarded to pytest verbatim.
+#
+# Note (ticket #132): do NOT add [CmdletBinding()], nor a declared
+# [Parameter(...)] parameter (e.g. [Parameter(ValueFromRemainingArguments
+# =$true)]). Either one turns this script into a PowerShell "advanced
+# function", which adds PowerShell's own built-in common parameters
+# (-Verbose, -Debug, -OutVariable, -WarningAction, -PipelineVariable, ...).
+# Those common parameters prefix-match pytest's own short flags at
+# PowerShell's argument-binding stage, before this script's body ever runs:
+# "-v"/"-d" get silently absorbed as -Verbose/-Debug (never reaching
+# pytest, no error either), and "-o"/"-w"/"-p" are ambiguous prefixes that
+# hard-error. Keeping this a *simple* script (no CmdletBinding, no declared
+# parameters) is what lets the automatic $args variable below capture and
+# forward every argument untouched.
+#
 # Requires: Python 3.11+ on PATH.
 
-[CmdletBinding()]
 param()
 
 # Capture any extra args the caller passes after the script name.

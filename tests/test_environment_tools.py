@@ -36,7 +36,11 @@ from lib_python_worktree import (
     primary_id_for,
 )
 from lib_python_worktree.core.state import ShadowedContract
-from worktree_plugin.tools.worktree import _invalid_path_error_text, register
+from worktree_plugin.tools.worktree import (
+    _default_stop_variant,
+    _invalid_path_error_text,
+    register,
+)
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -141,8 +145,70 @@ def test_environment_list_invalid_path_raises_valueerror(tmp_path: Path):
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["environment_list"](path=str(non_repo))
+
+    # Additional edge-case coverage (ticket #139 Part A), extending this
+    # existing test rather than duplicating it: an existing-but-not-a-git-
+    # repo directory produces a reason with only ONE `repo_root` token
+    # (the engine's "not a git repository: ..." text has no second
+    # occurrence), unlike the nonexistent-directory driving test below
+    # where the token appears twice.
+    msg = str(excinfo.value)
+    assert msg.startswith("invalid path '"), f"got: {msg!r}"
+    assert re.search(r"\brepo_root\b", msg) is None, f"got: {msg!r}"
+
+
+def test_environment_list_invalid_target_error_names_the_tool_parameter(
+    tmp_path: Path,
+):
+    """Driving test (ticket #139 Part A): environment_list's own parameter
+    is `path`, not `repo_root` -- but today it bare-re-raises the engine's
+    `InvalidRepoError` verbatim, which names the engine-internal
+    `repo_root`. A NONEXISTENT directory is used deliberately: the engine's
+    reason for that case is `f"repo_root does not exist: {path}"`, i.e.
+    `repo_root` appears TWICE (once in the message prefix built from
+    `exc.repo_root`, once again inside the reason text) -- proving that a
+    prefix-only fix would be insufficient; the mechanical `_invalid_path_
+    error_text` rewording (already used by worktree_remove/environment_
+    start/environment_stop, ticket #123) must catch both occurrences.
+
+    RED (pre-fix): `environment_list`'s `except InvalidRepoError` clause
+    re-raises `str(exc)` unchanged, so the message both starts with
+    `invalid repo_root '...'` (fails the `invalid path '` prefix check) and
+    still contains a bare `repo_root` token in the reason (fails the
+    sanitized-absence check).
+
+    Temp-dir trap guard (mandatory per the #123 reviewer's catch): pytest
+    bakes this test function's own name into `tmp_path`, so (i) the target
+    directory is named neutrally (`not-a-repo`, no `path`/`repo_root`
+    substring) and this test's own name contains neither token either;
+    (ii) every assertion below sanitises the given path, its `Path.resolve()`
+    form, AND the backslash-doubled repr form of both (the message embeds a
+    Windows path via `repr()`, which doubles backslashes) out of the message
+    before checking for a stray `repo_root` token -- the raw string is never
+    asserted on directly.
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing_dir = tmp_path / "not-a-repo"  # neutral name; deliberately never created
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_list"](path=str(missing_dir))
+
+    msg = str(excinfo.value)
+    sanitized = msg
+    for token in (
+        str(missing_dir),
+        str(missing_dir.resolve()),
+        str(missing_dir).replace("\\", "\\\\"),
+        str(missing_dir.resolve()).replace("\\", "\\\\"),
+    ):
+        sanitized = sanitized.replace(token, "<DIR>")
+
+    assert re.search(r"\brepo_root\b", sanitized) is None, (
+        f"leaked repo_root token in sanitized message: {sanitized!r}"
+    )
+    assert re.match(r"^invalid path '", msg), f"got: {msg!r}"
 
 
 def test_environment_list_entry_shape(tmp_path: Path, temp_repo: Path):
@@ -1539,10 +1605,12 @@ def test_environment_stop_docstring_documents_role_vs_variant(tmp_path: Path):
 # `start:` step regardless of whether it carries a `name:` key -- but the
 # wrapper's own docstrings, AGENTS.md, and SKILL.md still claimed the
 # narrower, unnamed-only behaviour. These tests protect the corrected
-# claim, and the previously-undocumented consequence: when the fallback
-# resolves a *named* step, `record.variants[role]` stores that step's own
-# name (not the literal string `"default"`), so a later
-# `environment_stop(variant="default")` will not resolve against it.
+# claim, and the once-undocumented consequence: when the fallback resolves
+# a *named* step, `record.variants[role]` stores that step's own name (not
+# the literal string `"default"`). Ticket #139 Part B closed the gap this
+# left open -- `environment_stop(variant="default")` now DOES resolve
+# against that role anyway, via this wrapper's compensating pre-resolution
+# (see `_default_stop_variant` and the "symmetry" tests below).
 
 
 def test_environment_start_docstring_documents_lone_named_step_default_fallback(
@@ -1577,34 +1645,53 @@ def test_environment_start_docstring_documents_lone_named_step_default_fallback(
     )
 
 
-def test_stop_variant_default_asymmetry_is_documented(tmp_path: Path):
-    """Claim under protection: when the tier-3 lone-step `variant="default"`
-    fallback resolves a NAMED step, the engine records
-    `record.variants[role] = step.name`, not the literal string
-    `"default"` -- so a later `environment_stop(variant="default")` does
-    NOT resolve against that role. Both `environment_start`'s and
-    `environment_stop`'s docstrings must document this asymmetry
+def test_stop_variant_default_symmetry_is_documented(tmp_path: Path):
+    """Claim under protection (ticket #139 Part B, rewritten from the former
+    test_stop_variant_default_asymmetry_is_documented): when the tier-3
+    lone-step `variant="default"` fallback resolves a NAMED step, the
+    *engine* records `record.variants[role] = step.name`, not the literal
+    string `"default"` -- but `environment_stop(variant="default")`
+    afterwards DOES resolve against that role anyway, because this wrapper
+    pre-resolves a bare `"default"` to the contract's lone named step
+    before ever calling the engine. Both `environment_start`'s and
+    `environment_stop`'s docstrings must document this corrected symmetry
     explicitly, not just describe the two tools' `variant` behaviour in
-    isolation from each other."""
+    isolation from each other -- and the stale "will not resolve" claim
+    must be gone from both.
+
+    RED (pre-fix): the docstrings state the opposite ("will not resolve"),
+    so the affirmative-resolve pattern below finds nothing and the
+    stale-claim assertion fires on both docstrings.
+    """
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
 
     for tool_name in ("environment_start", "environment_stop"):
         doc = fns[tool_name].__doc__ or ""
         norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
 
-        found = False
+        found_symmetry = False
+        found_stale = False
         for m in re.finditer(r"default", norm):
             idx = m.start()
             window = norm[max(0, idx - 500) : idx + 500]
-            if "variants" in window and re.search(
+            if "variants" not in window:
+                continue
+            if re.search(r"\b(does|will|can)\b[^.]{0,120}resolv", window):
+                found_symmetry = True
+            if re.search(
                 r"(will not|does not|won't|cannot|never)[^.]{0,120}resolv", window
             ):
-                found = True
-                break
-        assert found, (
+                found_stale = True
+        assert found_symmetry, (
             f"{tool_name}'s docstring must document that the lone-step "
-            "default fallback's recorded variant name breaks a later "
-            'environment_stop(variant="default") resolution'
+            'default fallback\'s recorded variant name still lets a later '
+            'environment_stop(variant="default") resolve, via this '
+            "wrapper's compensating pre-resolution (ticket #139 Part B)"
+        )
+        assert not found_stale, (
+            f"{tool_name}'s docstring still contains the stale asymmetry "
+            'claim (environment_stop(variant="default") will not resolve) '
+            "-- must be fully replaced, not merely supplemented"
         )
 
 
@@ -1627,6 +1714,373 @@ def _seed_record(
     )
     mgr.state.add(record)
     return record
+
+
+# ---- Ticket #139 Part B: environment_stop(variant="default") resolves a
+# lone-named-step environment (wrapper-side compensation for the engine's
+# documented start()/stop() asymmetry) ----
+
+
+def test_stop_variant_default_resolves_lone_named_start_step_end_to_end(
+    tmp_path: Path, temp_repo: Path
+):
+    """Driving test: the ticket's verbatim reproduction. A contract with a
+    single `start:` step named `main`; `environment_start(...)` with no
+    explicit `variant` succeeds (resolving via the engine's own tier-3
+    lone-step fallback); `environment_stop(..., variant="default")` must
+    resolve and stop it.
+
+    Real `WorktreeManager` + `InMemoryStateStore` via `_make_tool_fixtures`;
+    a real contract written with `_write_contract`. Only the process
+    spawn/kill primitives (`_lifecycle_start`/`_lifecycle_stop`) are
+    patched -- with fakes that record `rec.pids[role]`/
+    `rec.variants[role] = variant` exactly as the real engine call sites do
+    -- so no real process is spawned (cross-platform, no leaks; no
+    sys.platform pinning, #137) while every bit of `manager.start()`'s/
+    `manager.stop()`'s own real variant-resolution logic (including the
+    `variant=step.name or variant` substitution) still runs unpatched.
+    Asserting the start fake received `variant == "main"` pins that engine
+    substitution, so a future engine bump (e.g. #138's v0.3.6) that changes
+    it would surface here.
+
+    RED (pre-fix): `record.variants == {"main": "main"}` after start, so
+    `manager.stop(..., variant="default")` finds zero matches in
+    `record.variants` and raises `VariantResolutionError` ->
+    `environment_stop` raises `ValueError` -- the `"error" not in
+    stop_result` assertion below never even gets that far; the call raises
+    before returning.
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _write_contract(
+        temp_repo,
+        """
+version: 1
+isolation: full
+start:
+  - name: main
+    run: irrelevant-command
+""",
+    )
+
+    captured_start: dict = {}
+    captured_stop: dict = {}
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, variant, env, cwd):
+        captured_start["variant"] = variant
+        captured_start["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids[role] = 99999
+        rec.variants[role] = variant
+        rec.status = "running"
+        store.update(rec)
+        return rec
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured_stop["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.variants.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        start_result = fns["environment_start"](checkout_path=str(temp_repo))
+
+    assert "error" not in start_result
+    # Pins the engine's own tier-3 substitution (manager.py's
+    # `variant=step.name or variant`): a bare variant="default" call
+    # resolved to the step's own name "main", not the literal "default".
+    assert captured_start["variant"] == "main"
+    assert start_result["variants"] == {"main": "main"}
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        stop_result = fns["environment_stop"](
+            environment_id=start_result["id"], variant="default"
+        )
+
+    assert "error" not in stop_result
+    assert captured_stop["role"] == "main"
+    assert "main" not in stop_result.get("pids", {})
+
+
+def test_default_stop_variant_lone_unnamed_step_already_recorded_as_default(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (already passes): a lone UNNAMED start
+    step is recorded by the engine under the literal "default" itself
+    (tier 2 of the engine's own resolution, unrelated to the ticket #112
+    tier-3 fallback this ticket is about) -- precedence rule 2 leaves this
+    untouched: record.variants already contains "default", so the helper
+    returns "default" unchanged without even reading the contract."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    seeded = _seed_record(
+        mgr,
+        pids={"main": 1},
+        variants={"main": "default"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    result = _default_stop_variant(mgr, seeded.id, None)
+    assert result == "default"
+
+
+def test_default_stop_variant_step_literally_named_default_already_recorded(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (already passes): a start step whose
+    own name literally IS "default" is, likewise, already recorded under
+    "default" by the engine's exact-match tier -- precedence rule 2 again
+    leaves this untouched."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    seeded = _seed_record(
+        mgr,
+        pids={"web": 1},
+        variants={"web": "default"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    result = _default_stop_variant(mgr, seeded.id, None)
+    assert result == "default"
+
+
+def test_default_stop_variant_multi_step_contract_degrades_to_default(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (already passes): a contract with TWO
+    OR MORE start: steps must not be resolved by this helper (mirrors the
+    engine's own tier-3 rule, which only ever fires for a single step) --
+    degrades to "default" unchanged, preserving today's
+    VariantResolutionError failure mode for this case
+    (test_environment_stop_variant_resolution_failure_raises_valueerror
+    already covers that failure end-to-end)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _write_contract(
+        temp_repo,
+        """
+version: 1
+isolation: full
+start:
+  - name: web
+    run: irrelevant-command
+  - name: worker
+    run: irrelevant-command
+""",
+    )
+    seeded = _seed_record(
+        mgr,
+        pids={"web": 1},
+        variants={"web": "web"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    result = _default_stop_variant(mgr, seeded.id, None)
+    assert result == "default"
+
+
+def test_default_stop_variant_no_contract_degrades_to_default(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (ticket #139 Part B risk: 'best-effort
+    lookup raising'): no contract at all at repo_root must degrade silently
+    to "default" -- the helper must never raise, and the original engine
+    error text for whatever is actually wrong must survive verbatim at the
+    call site (this is exercised end-to-end by
+    test_environment_stop_variant_resolution_failure_raises_valueerror's
+    zero-match-typo case, which never even reaches this helper's contract
+    read since role/variant resolution happens inside manager.stop()
+    itself; this test isolates the helper's own degrade-on-no-contract
+    path directly)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    seeded = _seed_record(
+        mgr,
+        pids={"main": 1},
+        variants={"main": "main"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    result = _default_stop_variant(mgr, seeded.id, None)
+    assert result == "default"
+
+
+def test_default_stop_variant_unreadable_contract_degrades_to_default(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (ticket #139 Part B risk: 'best-effort
+    lookup raising'): a contract that exists but fails to parse must also
+    degrade silently to "default" rather than raising out of this
+    best-effort helper and breaking environment_stop for an unrelated
+    reason."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _write_contract(temp_repo, "not: [valid, yaml, contract")
+    seeded = _seed_record(
+        mgr,
+        pids={"main": 1},
+        variants={"main": "main"},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    result = _default_stop_variant(mgr, seeded.id, None)
+    assert result == "default"
+
+
+def test_default_stop_variant_unknown_environment_id_degrades_to_default(
+    tmp_path: Path,
+):
+    """Additional edge-case coverage: an unknown environment_id (no record
+    to look up) must degrade to "default" unchanged, so the engine's own
+    not-found handling at the environment_stop call site is entirely
+    unaffected."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = _default_stop_variant(mgr, "no-such-id", None)
+    assert result == "default"
+
+
+def test_default_stop_variant_resolves_via_checkout_path_for_primary(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage: the helper's second addressing path
+    (environment_id omitted, checkout_path given) must resolve a lone
+    named start step for the PRIMARY checkout too, mirroring
+    environment_start's own checkout_path cold-start addressing. Exercises
+    classify_checkout() -> primary_id_for() -> manager.state.get(), the
+    branch none of the other _default_stop_variant tests reach (they all
+    address by environment_id)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _write_contract(
+        temp_repo,
+        """
+version: 1
+isolation: full
+start:
+  - name: main
+    run: irrelevant-command
+""",
+    )
+    primary_id = primary_id_for(temp_repo)
+    seeded = WorktreeRecord(
+        id=primary_id,
+        repo_root=str(temp_repo),
+        branch=None,
+        path=str(temp_repo),
+        status="running",
+        backing="primary",
+        pids={"main": 1},
+        variants={"main": "main"},
+    )
+    mgr.state.add(seeded)
+
+    result = _default_stop_variant(mgr, None, str(temp_repo))
+    assert result == "main"
+
+
+def test_default_stop_variant_resolves_via_checkout_path_for_linked_worktree(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage: the helper's checkout_path fallback
+    path match over manager.state.list() (no environment_id, checkout_path
+    doesn't resolve to a primary) must also resolve a lone named start step
+    for a LINKED worktree, exercising the resolved-path-match branch none
+    of the other tests reach.
+
+    Ticket #139 fix-cycle regression guard: also seeds the repo's PRIMARY
+    record *first*, with `variants` already containing `"default"` (a
+    plausible prior state -- e.g. started via the unnamed-step tier).
+    `classify_checkout()` documents that `repo_root` is always the main
+    clone's root regardless of which checkout `checkout_path` belongs to
+    (`checkout.py:63-64`), so before the fix,
+    `_default_stop_variant`'s checkout_path resolution did
+    `manager.state.get(primary_id_for(info.repo_root))` unconditionally --
+    returning this SAME primary id whether `checkout_path` pointed at the
+    primary or at a linked worktree of that repo -- so it found the
+    primary's record instead of the linked worktree's own, and precedence
+    rule 2 (`"default" in record.variants.values()`) short-circuited to
+    `"default"` unchanged instead of resolving to the linked worktree's own
+    `"main"` step. The fix must check `info.backing` before doing the
+    primary lookup, mirroring `WorktreeManager._resolve_target()`."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    _write_contract(
+        temp_repo,
+        """
+version: 1
+isolation: full
+start:
+  - name: main
+    run: irrelevant-command
+""",
+    )
+    primary_id = primary_id_for(temp_repo)
+    primary_record = WorktreeRecord(
+        id=primary_id,
+        repo_root=str(temp_repo),
+        branch=None,
+        path=str(temp_repo),
+        status="running",
+        backing="primary",
+        pids={"main": 1},
+        variants={"main": "default"},
+    )
+    mgr.state.add(primary_record)
+
+    created = mgr.create(str(temp_repo), "feature/wt")
+    seeded = mgr.state.get(created.id)
+    seeded.pids["main"] = 1
+    seeded.variants["main"] = "main"
+    mgr.state.update(seeded)
+
+    result = _default_stop_variant(mgr, None, created.path)
+    assert result == "main"
+
+
+def test_environment_stop_variant_none_path_unaffected_by_default_helper(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional edge-case coverage (already passes): variant=None (the
+    parameter's actual default -- i.e. variant omitted entirely) must never
+    engage _default_stop_variant at all; only an explicit variant="default"
+    does. Regression guard for the call site's `if variant == "default":`
+    guard, distinct from test_environment_stop_no_role_no_variant_still_
+    stops_main which covers the same scenario from the role-resolution
+    side."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"main": 12345},
+        variants={},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    captured: dict = {}
+
+    def _fake_lifecycle_stop(worktree_id, *, store, role, timeout, kill_orphans):
+        captured["role"] = role
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.status = "stopped" if not rec.pids else rec.status
+        store.update(rec)
+        return rec
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_fake_lifecycle_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id, variant=None)
+
+    assert "error" not in result
+    assert captured["role"] == "main"
 
 
 def test_environment_stop_variant_resolves_to_started_role(
@@ -1905,6 +2359,146 @@ def test_environment_stop_docstring_distinguishes_primary_from_linked(tmp_path: 
         "environment_stop docstring's not_running paragraph must name "
         "ProcessNotRunningError to scope it against the linked-worktree "
         "graceful no-op path"
+    )
+
+
+# ---- Ticket #139 Part C: code: "not_running" reachability ----
+
+
+def test_environment_stop_not_running_is_reachable_via_concurrent_pid_removal(
+    tmp_path: Path, temp_repo: Path
+):
+    """Driving test: `code: "not_running"` (mapping the engine's
+    `ProcessNotRunningError`) is a genuinely LIVE branch for the pinned
+    engine v0.3.5, not dead code -- it fires when the pid entry for the
+    resolved role disappears between `WorktreeManager.stop()`'s own
+    snapshot check (record fetched early via `_resolve_target()`,
+    manager.py ~:1510) and the delegated `process_lifecycle.stop()`'s own,
+    independent, fresh `store.get(worktree_id)` re-read (process_lifecycle.py
+    ~:2802) immediately before it decides whether to raise
+    (`role not in record.pids`, ~:2809). A concurrent writer -- another
+    `environment_stop` call for the same role, or an `environment_list`
+    reconcile pass pruning a dead pid -- can close that window; the
+    `YamlStateStore` is explicitly designed for multi-process access
+    (portalocker-guarded re-reads on every `.get()`, yaml_store.py ~:542-545
+    / ~:634-650).
+
+    Only the concurrent MUTATION is simulated here (removing the pid/variant
+    entry from the store between the two reads, as a real concurrent writer
+    would); `ProcessNotRunningError` itself is raised by real, unpatched
+    engine code (`lib_python_worktree.core.process_lifecycle.stop`), so this
+    is genuine evidence the branch is reachable, not a construction that
+    merely asserts what the wrapper does with an exception it invented.
+
+    This requirement's "RED" is reachability itself, not a code change: it
+    passes on today's code by design, which IS the evidence that keeping
+    the branch (rather than removing it as suspected-dead) is correct. Its
+    documentation counterpart (test_environment_stop_docstring_scopes_
+    not_running_reachability below) is the driving test with a genuine RED.
+
+    Nothing spawns a real process (the seeded pid is never touched -- it is
+    removed from the store before process_lifecycle.stop's own read), so
+    this is fast and OS-agnostic; no sys.platform pinning (#137).
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    record = _seed_record(
+        mgr,
+        pids={"main": 99999},
+        variants={},
+        repo_root=str(temp_repo),
+        path=str(temp_repo),
+    )
+
+    from lib_python_worktree.core import process_lifecycle as _real_process_lifecycle
+
+    def _concurrent_removal_then_real_stop(
+        worktree_id, *, store, role, timeout, kill_orphans
+    ):
+        # Simulate the concurrent writer: a second environment_stop call (or
+        # an environment_list reconcile pass) that removed this role's pid
+        # entry between manager.stop()'s snapshot and this function's own
+        # fresh re-read below.
+        rec = store.get(worktree_id)
+        rec.pids.pop(role, None)
+        rec.variants.pop(role, None)
+        store.update(rec)
+        # Delegate to the REAL engine function -- ProcessNotRunningError is
+        # raised by unpatched code, not fabricated here.
+        return _real_process_lifecycle.stop(
+            worktree_id,
+            store=store,
+            role=role,
+            timeout=timeout,
+            kill_orphans=kill_orphans,
+        )
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_stop",
+        side_effect=_concurrent_removal_then_real_stop,
+    ):
+        result = fns["environment_stop"](environment_id=record.id)
+
+    assert result.get("code") == "not_running"
+    assert "error" in result
+
+
+def test_environment_stop_never_started_role_is_no_op_not_not_running(
+    tmp_path: Path, temp_repo: Path
+):
+    """Additional coverage (ticket #139 Part C): the OTHER, non-concurrent
+    path to a missing pid -- a role that was simply never started on a
+    tracked linked worktree -- must NOT take the not_running branch at all.
+    `manager.stop()`'s own pre-emption (manager.py ~:1556,
+    `effective_role not in record.pids`) catches this before ever
+    delegating to `process_lifecycle.stop()`, returning the graceful
+    `no_process_recorded` no-op instead. No patching: a real
+    `WorktreeManager`, a real tracked linked worktree, a role that was
+    never started. This test may already pass -- it pins the pre-emption so
+    a future removal of it would be caught (only a docstring test,
+    test_environment_stop_docstring_documents_role_vs_variant, exists for
+    this today)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    mgr.create(str(temp_repo), "feature/wt")
+    record = next(r for r in mgr.state.list() if r.backing == "worktree")
+
+    result = fns["environment_stop"](environment_id=record.id, role="never-started")
+
+    assert "code" not in result
+    assert result["stop_attempt"]["outcome"] == "no_process_recorded"
+
+
+def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Path):
+    """Driving test (docs, ticket #139 Part C2): environment_stop's
+    docstring must scope not_running's reachability to a concrete
+    concurrent-pid-removal window, version-scoped to the pinned engine, and
+    distinguish it from the tracked-but-never-started no_process_recorded
+    no-op -- replacing the prior honest-but-non-committal framing that
+    merely listed not_running as one of several soft outcomes without ever
+    saying when it can actually occur.
+
+    RED (pre-fix): the docstring names not_running/ProcessNotRunningError
+    but never uses the word "concurrent" near it, and states no
+    version-scoping -- the assertion below fails.
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    found = False
+    for m in re.finditer(r"not_running", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 400) : idx + 900]
+        if (
+            "concurrent" in window
+            and "no_process_recorded" in window
+            and re.search(r"v0\.3\.5|version-scoped", window)
+        ):
+            found = True
+            break
+    assert found, (
+        "environment_stop docstring must scope not_running's reachability "
+        "to a concrete concurrent-pid-removal window, version-scoped to "
+        "the pinned engine, and distinguish it from no_process_recorded"
     )
 
 

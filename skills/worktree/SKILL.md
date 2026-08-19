@@ -109,13 +109,18 @@ concurrently need two distinct `role`s, or the second call returns/errors with a
 without the caller separately tracking which role it used — see `environment_stop`'s
 own `variant` parameter below.
 
-**Asymmetry warning.** When tier 3 above (the lone-step fallback) resolves a
-*named* step from a bare `variant="default"` call, `record.variants[role]`
-stores that step's own name (e.g. `"main"`) — never the literal string
-`"default"`. A later `environment_stop(variant="default")` **will not
-resolve** against that role, since `record.variants[role]` is never
-`"default"` in that case. Use `role="main"` (the default) or pass the
-step's actual name as `variant` instead.
+**Symmetry with environment_stop.** When tier 3 above (the lone-step
+fallback) resolves a *named* step from a bare `variant="default"` call, the
+*engine* records that step's own name in `record.variants[role]` (e.g.
+`"main"`) — never the literal string `"default"`. `environment_stop`
+compensates for this: `environment_stop(variant="default")` **does
+resolve** against that role — it pre-resolves a bare `"default"` to the
+contract's single named `start:` step (mirroring this same tier-3 rule)
+before ever calling the engine, so the same lone-step contract that started
+under its own name can be stopped without the caller tracking or passing
+that name. Passing the step's actual name as `variant`, or omitting
+`variant` and relying on `role="main"` (the default), both keep working
+exactly as before.
 
 **Log-file naming caveat.** `pids`/`record.variants` key on the **verbatim**
 `role` string, but the engine's captured startup log filename does not: it is
