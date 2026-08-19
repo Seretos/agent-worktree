@@ -102,7 +102,7 @@ Because the two are independent, two variants started concurrently against the s
 
 **Resolving `variant="default"`.** Three tiers, tried in order: (1) an exact `name:` match against `variant`; (2) exactly one **unnamed** `start:` step — implicitly the `"default"` variant, for back-compat; (3) exactly one `start:` step overall — even if that single step is named rather than unnamed (upstream lib-python-worktree#112, shipped in the pinned v0.3.5) — so a contract whose sole step carries a `name:` other than `"default"` still resolves without the caller passing `variant` explicitly. Two or more `start:` steps with none of them named `"default"` still raise `ValueError` listing the available names, even under tier 3.
 
-**Asymmetry warning.** When tier 3 (the lone-step fallback) resolves a *named* step from a bare `variant="default"` call, `record.variants[role]` stores that step's own name (e.g. `"main"`) — never the literal string `"default"` — because the engine records `variant=step.name or variant`. A later `environment_stop(variant="default")` **will not resolve** against that role, since `record.variants[role]` is never `"default"` in that case. Use `role="main"` (the default) or pass the step's actual name as `variant` instead.
+**Symmetry with environment_stop (ticket #139).** When tier 3 (the lone-step fallback) resolves a *named* step from a bare `variant="default"` call, the *engine* records that step's own name in `record.variants[role]` (e.g. `"main"`) — never the literal string `"default"` — because the engine itself records `variant=step.name or variant`. This wrapper compensates: `environment_stop(variant="default")` **does resolve** against that role — before calling the engine, `environment_stop` pre-resolves a bare `"default"` to the contract's single named `start:` step (mirroring `environment_start`'s own tier-3 rule), so the call that started a lone named step can stop it the same way, with no need to track or pass the step's actual name. Passing the step's actual name as `variant`, or omitting `variant` and relying on `role="main"` (the default), both keep working exactly as before.
 
 #### environment_list
 
@@ -123,7 +123,7 @@ This tool replaces the old unfiltered discovery listing (no `repo_root` filter m
 
 This call **never writes state** — listing the primary before it has ever started does not create a record for it.
 
-**Errors:** raises `ValueError` for an unknown `scope`, or when `path` itself is not a valid, existing git repository (mapped from `InvalidRepoError`). Under `scope="all"`, a *different*, previously tracked repo whose clone has since vanished from disk is skipped gracefully; only a bad `path` argument raises.
+**Errors:** raises `ValueError` for an unknown `scope`, or when `path` itself is not a valid, existing git repository (mapped from `InvalidRepoError`, re-worded per ticket #123's pattern to replace the engine's internal `repo_root` parameter name with `path`, with the full diagnostic reason preserved). Under `scope="all"`, a *different*, previously tracked repo whose clone has since vanished from disk is skipped gracefully; only a bad `path` argument raises.
 
 ---
 

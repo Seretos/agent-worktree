@@ -273,11 +273,14 @@ def test_docs_document_lone_start_step_default_variant_fallback():
        lone-step fallback fires for a single `start:` step regardless of
        whether it is named or unnamed, not only for a lone *unnamed* step
        (the stale claim both docs previously carried).
-    2. Both docs must also document the `environment_stop(variant=
-       "default")` asymmetry: when the fallback resolves a NAMED step,
-       `record.variants[role]` stores that step's own name, never the
-       literal `"default"`, so a later `environment_stop(variant=
-       "default")` will not resolve.
+    2. Both docs must also document the ticket #139 Part B fix: when the
+       fallback resolves a NAMED step, the *engine* records that step's own
+       name in `record.variants[role]`, never the literal `"default"` --
+       but `environment_stop(variant="default")` afterwards DOES resolve
+       against that role anyway, because the wrapper pre-resolves a bare
+       `"default"` to the contract's lone named step before ever calling
+       the engine. The stale "will not resolve" claim must be gone from
+       both docs.
     3. SKILL.md's `## Pitfalls` section specifically (not just its earlier
        contract prose) must gain an entry: a multi-step contract with no
        step named `default` makes the *first* `environment_start` call
@@ -287,7 +290,11 @@ def test_docs_document_lone_start_step_default_variant_fallback():
         r"\b(single|lone|exactly one)\b[^.]{0,160}"
         r"\b(regardless|even if|whether it is named|named or unnamed)\b"
     )
-    asymmetry_pattern = re.compile(
+    # Ticket #139: the corrected claim is now an AFFIRMATIVE resolve claim
+    # (environment_stop(variant="default") DOES resolve), not the old
+    # negative one -- see stale_asymmetry_pattern below, asserted absent.
+    symmetry_pattern = re.compile(r"\b(does|will|can)\b[^.]{0,120}resolv")
+    stale_asymmetry_pattern = re.compile(
         r"\b(will not|does not|won't|cannot|never)\b[^.]{0,120}resolv"
     )
     stale_claims = {
@@ -308,17 +315,32 @@ def test_docs_document_lone_start_step_default_variant_fallback():
             f"{path.name} still contains the stale claim: {stale!r}"
         )
 
-        found_asymmetry = False
+        found_symmetry = False
+        found_stale_asymmetry = False
         for m in re.finditer(r"default", norm):
             idx = m.start()
             window = norm[max(0, idx - 500) : idx + 500]
-            if "variants" in window and asymmetry_pattern.search(window):
-                found_asymmetry = True
-                break
-        assert found_asymmetry, (
+            if "variants" not in window:
+                continue
+            if symmetry_pattern.search(window):
+                found_symmetry = True
+            if stale_asymmetry_pattern.search(window):
+                found_stale_asymmetry = True
+        assert found_symmetry, (
             f'{path.name} must document that environment_stop(variant='
-            '"default") does not resolve when the lone-step fallback '
-            "resolved a named step"
+            '"default") DOES resolve when the lone-step fallback resolved '
+            "a named step (ticket #139 Part B)"
+        )
+        # Negative assertion: a reworded-but-still-stale paragraph could in
+        # principle satisfy found_symmetry above via some other affirmative
+        # sentence while the old negative claim survives untouched
+        # elsewhere nearby -- guard against that explicitly so a stale copy
+        # in either file can't slip through.
+        assert not found_stale_asymmetry, (
+            f"{path.name} still documents the stale asymmetry claim "
+            '(environment_stop(variant="default") will not resolve) near a '
+            '"default"/"variants" mention -- this must be fully replaced, '
+            "not merely supplemented"
         )
 
     skill_text = SKILL_MD.read_text(encoding="utf-8")
