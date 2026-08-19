@@ -47,8 +47,16 @@ worktree's own copy. `worktree_create` copies `.seretos/` into a new worktree as
 create-time convenience (so it is visible from inside the checkout), but that copy is
 *not* what `environment_start`/`environment_stop` actually read. Placing the contract
 only in a worktree checkout, and never at `<repo_root>/.seretos/worktree-setup.yml`,
-produces a silent no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
-with no error, indistinguishable from "no contract configured" (issue #87).
+still produces a no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
+— but it is **not silent** and **not** indistinguishable from "no contract configured"
+(issue #87): the same response carries `contract_found: false`, `steps_run: 0`, and
+`no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-unconfigured
+case) — ticket #103's contract diagnostics. The engine (`lib-python-worktree`, upstream
+#100) additionally sets `shadowed_contract` on the response — `None`, or `{path,
+used_path, reason, message}` with `reason` either `"differs"` or `"unreadable"` —
+whenever a checkout-local copy exists that is not the file it read. It is transient
+(never written to `state.yaml`) and is `None` for a primary, for `checkout ==
+repo_root`, and for the identical copy `worktree_create` writes.
 
 The contract declares up to five lifecycle hooks, each fired by a distinct MCP tool:
 
@@ -108,6 +116,18 @@ stores that step's own name (e.g. `"main"`) — never the literal string
 resolve** against that role, since `record.variants[role]` is never
 `"default"` in that case. Use `role="main"` (the default) or pass the
 step's actual name as `variant` instead.
+
+**Log-file naming caveat.** `pids`/`record.variants` key on the **verbatim**
+`role` string, but the engine's captured startup log filename does not: it is
+`start-<slug(role)>.log`, where the slug is `role` **lower-cased**, with
+non-alphanumeric runs collapsed to `-` and truncated to 40 characters. Two
+roles differing only in case (e.g. `"API"` vs `"api"`) become two distinct
+`pids` keys sharing one append-mode log file, interleaving their output.
+Always read the log path from `environment_start`'s `start_log_path` field
+rather than deriving it yourself. Documented, not fixed — this is an upstream
+engine defect tracked as `Seretos/lib-python-worktree#111` — not to be
+confused with this repository's own already-closed issue of the same
+number, an unrelated thread-leak ticket.
 
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
@@ -275,6 +295,14 @@ Processes whose working directory sits inside the worktree can prevent directory
 deletion. Pass `kill_blocking_processes=True` to `worktree_remove` to have the tool
 terminate those foreign processes automatically before removal:
 
+**Tracked vs. foreign.** Your own `environment_start` process is not what this flag is
+for — `worktree_remove` stops every tracked role (from `pids`) as its first step,
+before this flag's scan ever runs, so it does not need `kill_blocking_processes`. The
+flag exists for genuinely foreign holders: an editor, a shell whose cwd is in the
+checkout, a build/indexing tool, or a reparented orphan. The tracked stop is
+best-effort, though — a tracked process that refuses to die still blocks removal and
+does then need this flag.
+
 ```
 worktree_remove(<id>, kill_blocking_processes=True)
 ```
@@ -323,10 +351,14 @@ running under the given `role`).
 
 ## Pitfalls
 
-1. **Contract in the wrong location is a silent no-op.** The engine reads
-   `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's copy. A
-   contract placed only in the worktree checkout produces no error — just an
-   indistinguishable-from-unconfigured `{"status": "ready", "pids": {}}` response.
+1. **Contract in the wrong location is a no-op — but a *diagnosable* one.** The engine
+   reads `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's
+   copy. A contract placed only in the worktree checkout still produces
+   `{"status": "ready", "pids": {}}`, but `environment_start`'s response also carries
+   `no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-
+   unconfigured case) — branch on that instead of inferring from `status`/`pids`. If
+   instead the checkout-local copy was *edited* while a valid repo-root contract
+   started normally, look for `shadowed_contract` in the response.
 2. **`isolation: none` forbids every block.** Adding `setup:`, `start:`, `stop:`,
    `teardown:`, or `ports:` under `isolation: none` raises `ContractValidationError` —
    switch to `isolation: full` first.
@@ -337,7 +369,9 @@ running under the given `role`).
    recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
    `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
-   fighting the lock manually. If the directory lock and uncommitted changes are
+   fighting the lock manually. This flag is not for a process you started yourself
+   with `environment_start` — removal stops every tracked role first, before this
+   flag's scan runs. If the directory lock and uncommitted changes are
    BOTH blocking removal, the error names both conditions and both required
    flags (`blocked_by`/`required_flags`) in one message — set both flags in a
    single retry instead of discovering each condition one at a time.

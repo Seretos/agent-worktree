@@ -34,6 +34,7 @@ from lib_python_worktree import (
     YamlStateStore,
     primary_id_for,
 )
+from lib_python_worktree.core.state import ShadowedContract
 from worktree_plugin.tools.worktree import register
 
 
@@ -1631,3 +1632,203 @@ def test_environment_stop_variant_resolution_failure_raises_valueerror(
     assert variant in msg
     assert "hint" in msg.lower()
     assert "role=" in msg or "role" in msg.lower()
+
+
+# ---- Ticket #130: docstring / SKILL / README sweep ----
+#
+# Four re-sliced findings originally filed as #124 (misplaced-contract
+# CAUTION is a silent no-op), #125 (environment_stop primary-vs-linked /
+# environment_start's three addressing outcomes), #128 (start_log_path
+# role-casing mismatch). This block covers #124, #125, and #128's
+# environment_start/environment_stop side; #126 and #128's SKILL/AGENTS.md/
+# README.md side live in tests/test_plugin_manifest.py, and #126's
+# worktree_remove side lives in tests/test_worktree_tools.py.
+
+
+def test_environment_start_docstring_no_longer_claims_silent_misplaced_contract(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #124): a contract
+    placed only in a worktree checkout (not at repo_root) is still a
+    {"status": "ready", "pids": {}} no-op, but it is a diagnosable one --
+    the same response carries no_op_reason: "contract-misplaced" (distinct
+    from "no-contract") -- and the stale "silent .../no error to indicate
+    the misplacement" claim must be gone."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert "no_op_reason" in norm
+    assert "contract-misplaced" in norm
+    assert "with no error to indicate the misplacement" not in norm
+
+    found_silent_far_from_diagnosis = False
+    for m in re.finditer(r"(?<!not )\bsilent\b", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 300) : idx + 300]
+        if "contract-misplaced" in window or "misplacement" in window:
+            found_silent_far_from_diagnosis = True
+    assert not found_silent_far_from_diagnosis, (
+        "docstring must not describe the misplaced-contract case as "
+        "(unqualified) 'silent' near its diagnosis -- it is diagnosable "
+        "via no_op_reason; 'not silent' is fine"
+    )
+
+
+def test_environment_start_response_carries_engine_shadowed_contract(tmp_path: Path):
+    """Tripwire for the engine-owned shadowed_contract diagnostic documented
+    in ticket #130 (upstream lib-python-worktree #100). This wrapper only
+    passes the field through via _record_to_dict's asdict(record) -- it
+    does not compute it -- so this test already passes today (it is not the
+    driving test for the docs). Its purpose is to fail loudly if a future
+    lib-python-worktree bump renames, drops, or stops populating
+    WorktreeRecord.shadowed_contract, which would otherwise leave the
+    newly-added documentation silently lying."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    record = WorktreeRecord(
+        id="wt-130-shadow-test",
+        repo_root=str(tmp_path / "repo-root"),
+        branch="feature/shadow",
+        path=str(tmp_path / "store" / "wt-130-shadow-test"),
+        status="running",
+        pids={"main": 4242},
+    )
+    record.shadowed_contract = ShadowedContract(
+        path="/wt/.seretos/worktree-setup.yml",
+        used_path="/repo-root/.seretos/worktree-setup.yml",
+        reason="differs",
+        message="checkout-local contract differs from the one used",
+    )
+
+    with patch.object(mgr, "start", return_value=record):
+        result = fns["environment_start"](environment_id=record.id)
+
+    assert "shadowed_contract" in result
+    shadowed = result["shadowed_contract"]
+    assert isinstance(shadowed, dict)
+    assert set(shadowed.keys()) == {"path", "used_path", "reason", "message"}
+    assert shadowed["reason"] == "differs"
+
+    # Second case: the engine leaves shadowed_contract unset (None) --
+    # the key must still be present, just with a None value.
+    record_no_shadow = WorktreeRecord(
+        id="wt-130-noshadow-test",
+        repo_root=str(tmp_path / "repo-root2"),
+        branch="feature/noshadow",
+        path=str(tmp_path / "store" / "wt-130-noshadow-test"),
+        status="running",
+        pids={"main": 4243},
+    )
+    assert record_no_shadow.shadowed_contract is None
+
+    with patch.object(mgr, "start", return_value=record_no_shadow):
+        result_none = fns["environment_start"](environment_id=record_no_shadow.id)
+
+    assert "shadowed_contract" in result_none
+    assert result_none["shadowed_contract"] is None
+
+
+def test_environment_stop_docstring_distinguishes_primary_from_linked(tmp_path: Path):
+    """Claim under protection (ticket #130, re-slicing #125 section 2a; fix
+    #130 blocking finding 1): a linked worktree's tracked-but-never-started
+    role is not a not-found condition -- the engine's graceful no-op path
+    runs contract stop: steps best-effort and always sets
+    stop_attempt.outcome == "no_process_recorded", but status only becomes
+    "stopped" if no other role is still tracked in pids (and the record
+    wasn't already "stop_incomplete"/"orphaned"); otherwise status is left
+    unchanged. Only the primary (no record until its first environment_start)
+    and a genuinely unknown target yield the soft not-found dict."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    found = False
+    for m in re.finditer(r"not_found", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 600) : idx + 600]
+        if "linked" in window and "stopped" in window and "no_process_recorded" in window:
+            found = True
+            break
+    assert found, (
+        "environment_stop docstring must contrast a linked worktree's "
+        "tracked-but-never-started role (no_process_recorded, status "
+        "stopped) against the primary/unknown-target not_found case, "
+        "within the same section"
+    )
+
+    # E8: the not_running paragraph must be scoped so it does not read as
+    # contradicting the linked-worktree paragraph above.
+    found_scoping = False
+    for m in re.finditer(r"not_running", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 600) : idx + 600]
+        if "processnotrunningerror" in window:
+            found_scoping = True
+            break
+    assert found_scoping, (
+        "environment_stop docstring's not_running paragraph must name "
+        "ProcessNotRunningError to scope it against the linked-worktree "
+        "graceful no-op path"
+    )
+
+
+def test_environment_start_docstring_consolidates_three_addressing_outcomes(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #125 section 2b): all
+    three addressing outcomes -- ValueError (neither given), ValueError
+    (both given, disagree), and the soft not_found dict (well-formed pair,
+    target doesn't exist) -- must be named within the "Addressing the
+    target" section itself, not merely present ~180 lines apart elsewhere
+    in the docstring."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+
+    start_idx = doc.find("Addressing the target")
+    end_idx = doc.find("Multiple named ``start:`` steps")
+    assert start_idx != -1 and end_idx != -1 and end_idx > start_idx
+    section = doc[start_idx:end_idx]
+
+    assert "not_found" in section, (
+        "the Addressing the target section must name the soft not_found "
+        "outcome, not just the two ValueError outcomes"
+    )
+    assert section.count("ValueError") >= 2, (
+        "the Addressing the target section must still name both "
+        "ValueError outcomes (neither given; both given but disagreeing)"
+    )
+
+
+def test_environment_start_docstring_documents_start_log_path_role_casing(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #128): start_log_path's
+    filename is a lower-cased slug of role, while pids/record.variants key
+    on role verbatim -- documented (not fixed; upstream lib-python-worktree
+    defect), fully-qualified as Seretos/lib-python-worktree#111 so it is
+    never confused with this repo's own closed #111 (thread-leak ticket)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    occurrences = list(re.finditer(r"start_log_path", norm))
+    assert occurrences
+
+    found = False
+    for m in occurrences:
+        idx = m.start()
+        window = norm[max(0, idx - 100) : idx + 900]
+        if (
+            "seretos/lib-python-worktree#111" in window
+            and ("lower" in window or "slug" in window)
+            and "pids" in window
+        ):
+            found = True
+            break
+
+    assert found, (
+        "docstring must have at least one start_log_path mention whose "
+        "surrounding window fully-qualifies the upstream #111 reference, "
+        "names the lower-case/slug behaviour, and mentions pids"
+    )

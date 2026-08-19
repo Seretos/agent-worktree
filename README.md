@@ -103,6 +103,8 @@ State is persistent and disk-backed (`~/.agent-worktree/state.yaml`), reconciled
 
 On Windows, processes whose working directory is set to a path inside the worktree can prevent directory deletion. Pass `kill_blocking_processes=True` to `worktree_remove` to have the tool automatically terminate those foreign processes before removal:
 
+A tracked process started via `environment_start` is stopped by `worktree_remove` itself before deletion and normally does not need this flag; it is for genuinely foreign holders instead — an editor, a shell whose cwd is in the checkout, a build tool. That tracked stop is best-effort, though: a tracked process that refuses to die degrades into the same blocking condition and *does* then need this flag.
+
 ```
 worktree_remove(<id>, kill_blocking_processes=True)
 ```

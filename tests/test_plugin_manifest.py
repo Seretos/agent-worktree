@@ -18,6 +18,7 @@ PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
+README_MD = REPO_ROOT / "README.md"
 
 
 def _read_frontmatter_and_body(text: str) -> tuple[dict, str]:
@@ -328,3 +329,185 @@ def test_docs_document_lone_start_step_default_variant_fallback():
         "contract with no step named default failing the first "
         "environment_start call unless variant= is passed"
     )
+
+
+# ---- Ticket #130: docstring / SKILL / README sweep ----
+#
+# Four re-sliced findings originally filed as #124 (misplaced-contract
+# CAUTION is a silent no-op), #125 (environment_stop primary-vs-linked /
+# environment_start's three addressing outcomes), #126 (kill_blocking_
+# processes tracked vs foreign), #128 (start_log_path role-casing
+# mismatch). This file covers the Markdown-doc side (SKILL.md/AGENTS.md/
+# README.md) plus the shadowed_contract cross-file claim; docstring-only
+# claims live in tests/test_environment_tools.py and
+# tests/test_worktree_tools.py.
+
+
+def test_docs_no_longer_claim_misplaced_contract_is_silent():
+    """Claim under protection (ticket #130, re-slicing #124): SKILL.md's
+    "Critical:" contract block and its Pitfalls section must both describe
+    the misplaced-contract case as diagnosable (no_op_reason:
+    "contract-misplaced"), not silent/indistinguishable-from-unconfigured."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    norm = _normalize(text)
+
+    assert "no_op_reason" in norm
+    assert "contract-misplaced" in norm
+    assert "with no error" not in norm
+
+    found_silent_far_from_diagnosis = False
+    for m in re.finditer(r"(?<!not )\bsilent\b", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 300) : idx + 300]
+        if "contract-misplaced" in window or "misplacement" in window:
+            found_silent_far_from_diagnosis = True
+    assert not found_silent_far_from_diagnosis, (
+        "SKILL.md must not describe the misplaced-contract case as "
+        "(unqualified) 'silent' near its diagnosis -- it is diagnosable "
+        "via no_op_reason; 'not silent' is fine"
+    )
+
+
+def test_docs_document_engine_shadowed_contract_diagnostic():
+    """Claim under protection (ticket #130, requirement 1b): worktree.py,
+    SKILL.md, and AGENTS.md must each document the engine-owned
+    shadowed_contract diagnostic (lib-python-worktree, upstream #100),
+    including both reason values and its non-persistence, and must
+    attribute it to the engine layer rather than to this wrapper's own
+    ticket-#103 diagnostics."""
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"shadowed_contract", norm))
+        assert occurrences, f"{path.name} must document shadowed_contract"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 900) : idx + 900]
+
+            if "used_path" not in window:
+                continue
+            if "differs" not in window:
+                continue
+            if "unreadable" not in window:
+                continue
+            if "lib-python-worktree" not in window and "engine" not in window:
+                continue
+            if path in (WORKTREE_PY, SKILL_MD) and not (
+                "state.yaml" in window
+                or "not persisted" in window
+                or "transient" in window
+            ):
+                continue
+            found = True
+            break
+
+        assert found, (
+            f"{path.name} must have at least one shadowed_contract mention "
+            "whose surrounding window documents used_path, both reason "
+            "values (differs/unreadable), engine attribution, and (for "
+            "worktree.py/SKILL.md) non-persistence to state.yaml"
+        )
+
+
+# Matches the standalone word "tracked", but not as the tail of "untracked"
+# (e.g. "uncommitted/untracked changes") -- a negative lookbehind excludes
+# the "un" prefix so an unrelated "untracked" mention can't satisfy this.
+_TRACKED_WORD_RE = re.compile(r"(?<!un)tracked\b")
+
+
+def test_docs_document_tracked_vs_foreign_blocking_processes():
+    """Claim under protection (ticket #130, re-slicing #126): SKILL.md,
+    AGENTS.md, and README.md must each document that kill_blocking_processes
+    is for foreign holders, not a process started via environment_start,
+    which removal stops first as a tracked role."""
+    for path in (SKILL_MD, AGENTS_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"kill_blocking_processes", norm))
+        assert occurrences, f"{path.name} must mention kill_blocking_processes"
+
+        # A coincidental, unrelated "tracked" mention (e.g. an "environment_list"
+        # entry's "tracked: false" field, discussed several paragraphs away in
+        # an orphan-worktree recipe) can fall inside a generously-sized window
+        # without actually being part of the same sentence/paragraph explaining
+        # the tracked-vs-foreign distinction. Requiring the standalone "tracked"
+        # word and "environment_start" to additionally sit close to each other
+        # (same sentence/paragraph, not just the same wide window) rules that
+        # out.
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window_start = max(0, idx - 1200)
+            window = norm[window_start : idx + 1200]
+            tracked_positions = [
+                mm.start() + window_start for mm in _TRACKED_WORD_RE.finditer(window)
+            ]
+            start_positions = [
+                mm.start() + window_start
+                for mm in re.finditer(r"environment_start", window)
+            ]
+            if any(
+                abs(t - s) <= 400 for t in tracked_positions for s in start_positions
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one kill_blocking_processes "
+            "mention whose surrounding window documents the tracked-vs-"
+            "foreign distinction (the standalone word 'tracked', not merely "
+            "'untracked') and references environment_start"
+        )
+
+
+def test_docs_document_start_log_path_role_casing():
+    """Claim under protection (ticket #130, re-slicing #128): SKILL.md and
+    AGENTS.md must document that start_log_path's filename is a lower-cased
+    slug of role while pids/record.variants key on role verbatim, citing
+    the fully-qualified upstream defect."""
+    for path in (SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"start_log_path", norm))
+        assert occurrences, f"{path.name} must mention start_log_path"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 900]
+            if (
+                "seretos/lib-python-worktree#111" in window
+                and ("lower" in window or "slug" in window)
+                and "pids" in window
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one start_log_path mention "
+            "whose surrounding window fully-qualifies the upstream #111 "
+            "reference, names the lower-case/slug behaviour, and mentions "
+            "pids"
+        )
+
+
+def test_upstream_issue_111_reference_is_fully_qualified():
+    """Guard (ticket #130): every occurrence of '#111' in the four edited
+    doc/docstring files must be immediately preceded by
+    'Seretos/lib-python-worktree', so it is never confused with this repo's
+    own closed #111 (a thread-leak ticket cited by
+    tests/test_thread_leak_regression.py, deliberately excluded here)."""
+    bare_111 = re.compile(r"(?<!Seretos/lib-python-worktree)#111")
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+        match = bare_111.search(text)
+        assert match is None, (
+            f"{path.name} contains a bare '#111' not qualified with "
+            f"'Seretos/lib-python-worktree' near: "
+            f"{text[max(0, match.start() - 40) if match else 0:(match.end() + 40) if match else 0]!r}"
+        )
