@@ -157,7 +157,12 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
 
 
 def test_shell_override_pwsh(monkeypatch):
-    assert _resolve_shell("pwsh") == ["pwsh", "-NoProfile", "-Command"]
+    assert _resolve_shell("pwsh") == [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+    ]
 
 
 def test_shell_override_bash():
@@ -172,6 +177,7 @@ def test_shell_override_powershell():
     assert _resolve_shell("powershell") == [
         "powershell.exe",
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
     ]
 

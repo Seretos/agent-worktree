@@ -13,8 +13,10 @@ addressing path, and the hard primary-removal refusal.
 
 from __future__ import annotations
 
+import base64
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator, Tuple
 from unittest.mock import patch
@@ -846,7 +848,7 @@ def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
 
 
 def test_environment_start_contract_variant_and_env_injection_unchanged(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ):
     """AC8 evidence: contract-driven start (real .seretos/worktree-setup.yml,
     unchanged v1 schema) still selects the correct named `start:` step and
@@ -898,6 +900,14 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
         record.pids = {role: 99999}
         return record
 
+    # ticket #129 fix-cycle (blocking finding): pin sys.platform so the
+    # -EncodedCommand argv shape asserted below is deterministic on both
+    # CI matrix legs (windows-latest, ubuntu-22.04) rather than ambient on
+    # whatever OS the test happens to run on -- see
+    # test_setup_runner.py::test_shell_auto_detect_uses_platform_default
+    # for the same seam/idiom.
+    monkeypatch.setattr(sys, "platform", "win32")
+
     with patch(
         "lib_python_worktree.core.manager._lifecycle_start",
         side_effect=_fake_lifecycle_start,
@@ -905,9 +915,21 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
         result = fn(environment_id=worktree_id, variant="worker")
 
     assert "error" not in result
-    cmd_str = " ".join(captured["cmd"])
-    assert "start-worker.sh" in cmd_str
-    assert "start-web.sh" not in cmd_str
+    # ticket #109 (upstream lib-python-worktree): the default win32 shell
+    # (powershell.exe) transports the run line as a base64
+    # -EncodedCommand blob rather than a raw -Command <text> argument, so
+    # decode it before checking which script was selected.
+    cmd = captured["cmd"]
+    assert len(cmd) == 5
+    assert cmd[:4] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ]
+    decoded_run_line = base64.b64decode(cmd[4]).decode("utf-16-le")
+    assert "start-worker.sh" in decoded_run_line
+    assert "start-web.sh" not in decoded_run_line
 
     env = captured["env"]
     assert env.get("WORKTREE_ID") == worktree_id

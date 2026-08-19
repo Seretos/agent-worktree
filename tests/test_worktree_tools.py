@@ -6,9 +6,11 @@ required by the planning comment's Verifikation section.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -1788,7 +1790,9 @@ def test_tool_environment_start_env_vars_reach_child(tmp_path: Path):
     )
 
 
-def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
+def test_tool_environment_start_variant_selects_correct_step(
+    tmp_path: Path, monkeypatch
+):
     """Verify that passing variant='worker' to worktree_start causes _lifecycle_start
     to receive a cmd that references start-worker.sh and not start-web.sh.
 
@@ -1844,6 +1848,14 @@ def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
         record.pids = {role: 99999}
         return record
 
+    # ticket #129 fix-cycle (blocking finding): pin sys.platform so the
+    # -EncodedCommand argv shape asserted below is deterministic on both
+    # CI matrix legs (windows-latest, ubuntu-22.04) rather than ambient on
+    # whatever OS the test happens to run on -- see
+    # test_setup_runner.py::test_shell_auto_detect_uses_platform_default
+    # for the same seam/idiom.
+    monkeypatch.setattr(sys, "platform", "win32")
+
     with patch(
         "lib_python_worktree.core.manager._lifecycle_start",
         side_effect=_fake_lifecycle_start,
@@ -1851,12 +1863,24 @@ def test_tool_environment_start_variant_selects_correct_step(tmp_path: Path):
         fn(environment_id=worktree_id, variant="worker")
 
     assert "cmd" in captured, "_lifecycle_start was not called"
-    cmd_str = " ".join(captured["cmd"])
-    assert "start-worker.sh" in cmd_str, (
-        f"Expected 'start-worker.sh' in cmd, got: {captured['cmd']!r}"
+    # ticket #109 (upstream lib-python-worktree): the default win32 shell
+    # (powershell.exe) transports the run line as a base64
+    # -EncodedCommand blob rather than a raw -Command <text> argument, so
+    # decode it before checking which script was selected.
+    cmd = captured["cmd"]
+    assert len(cmd) == 5, f"Expected a 5-element argv, got: {cmd!r}"
+    assert cmd[:4] == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+    ], f"Expected powershell -EncodedCommand prefix, got: {cmd!r}"
+    decoded_run_line = base64.b64decode(cmd[4]).decode("utf-16-le")
+    assert "start-worker.sh" in decoded_run_line, (
+        f"Expected 'start-worker.sh' in decoded cmd, got: {cmd!r}"
     )
-    assert "start-web.sh" not in cmd_str, (
-        f"Expected 'start-web.sh' NOT in cmd when variant='worker', got: {captured['cmd']!r}"
+    assert "start-web.sh" not in decoded_run_line, (
+        f"Expected 'start-web.sh' NOT in decoded cmd when variant='worker', got: {cmd!r}"
     )
 
 
