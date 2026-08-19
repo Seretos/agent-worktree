@@ -1705,6 +1705,37 @@ def test_id_instability_caution_prominent_in_docstrings(tmp_path: Path):
     )
 
 
+def test_worktree_remove_docstring_distinguishes_tracked_from_foreign_blockers(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #126): the
+    kill_blocking_processes flag is for *foreign* holders (an editor, a
+    shell whose cwd is in the checkout, a build tool, a reparented orphan),
+    not for a process this tool itself started via environment_start --
+    removal stops every tracked role first, before any FS delete, so a
+    tracked process is normally already gone. The tracked stop is
+    best-effort, so a tracked process that refuses to die still blocks."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    doc = fns["worktree_remove"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert "foreign" in norm
+    assert "tracked" in norm
+    assert "environment_start" in norm
+    assert re.search(r"(stops|terminates)[^.]{0,160}tracked[^.]{0,160}(first|before)", norm), (
+        "worktree_remove docstring must state that removal stops tracked "
+        "processes first/before the blocking-process scan"
+    )
+    assert "best-effort" in norm or "best effort" in norm
+
+    # Guard: this note belongs on worktree_remove's kill_blocking_processes
+    # parameter, not on environment_stop's docstring (a wording slip the
+    # ticket flagged and the plan explicitly declined to fix there).
+    stop_doc = fns["environment_stop"].__doc__ or ""
+    assert "kill_blocking_processes" not in stop_doc
+
+
 # ---- Ticket #60: env passthrough and variant selection verification ----
 
 

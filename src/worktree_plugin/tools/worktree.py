@@ -507,7 +507,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``<repo_root>/.seretos/`` into the new worktree checkout when it
         would not otherwise be tracked there (see below) -- but that copy is
         never what ``environment_start``/``environment_stop`` read; they
-        always read the ``repo_root`` original. The copy is marked ignored
+        always read the ``repo_root`` original. If you suspect the two have
+        drifted, which signal to check depends on whether ``repo_root``'s own
+        contract exists: if it is missing entirely while the checkout-local
+        copy is present, ``environment_start``'s response carries
+        ``no_op_reason: "contract-misplaced"``. If both exist but disagree,
+        ``no_op_reason`` stays ``None`` (the start proceeds normally against
+        ``repo_root``'s contract) -- check that response's
+        ``shadowed_contract`` field (``reason: "differs"``) instead; see
+        ``environment_start``'s docstring for its shape. The copy is marked ignored
         via a self-ignoring ``.gitignore`` written inside it, so it stays
         invisible to ``git status`` and the worktree remains removable with
         ``worktree_remove``'s default ``force=False`` (ticket #110).
@@ -620,11 +628,28 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             When ``True``, removes the worktree even if it contains
             uncommitted changes. Defaults to ``False``.
         kill_blocking_processes:
-            When ``True``, attempts to terminate foreign processes whose
+            When ``True``, attempts to terminate **foreign** processes whose
             current working directory is inside the worktree directory before
             removal. This is an opt-in safety valve, primarily relevant on
             Windows where open handles prevent directory deletion. Defaults
             to ``False`` (no-op when nothing is blocking).
+
+            **Tracked vs. foreign.** Removal stops every process *tracked* in
+            the environment's ``pids`` (each role started via
+            ``environment_start``) as its first step, before any contract
+            ``stop:``/``teardown:`` steps and before any filesystem delete --
+            so a tracked process is normally already gone by the time the
+            directory lock is evaluated, and never needs this flag. The flag
+            exists for a genuinely foreign holder instead: an editor, a
+            shell sitting in the checkout, a build/indexing tool, or an
+            orphaned grandchild reparented away from the tracked shell
+            wrapper (none of which are ever in ``pids``). Two caveats: (1)
+            the tracked stop is best-effort, so a tracked process that
+            refuses to die degrades into exactly the same blocking condition
+            and *does* then need this flag; and (2) the underlying scan
+            filters only the host process and its OS-level ancestors -- it
+            has no tracked-pid allow-list, so the exclusion in the normal
+            case is a matter of ordering, not filtering.
 
         Returns the removed worktree record on success. The ``ports`` field is
         a dict mapping port name to host port number; empty dict ``{}`` for
@@ -863,9 +888,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         that copy is not what the engine reads.
 
         CAUTION: placing the contract only in a worktree checkout (and not at
-        ``<repo_root>/.seretos/worktree-setup.yml``) produces a silent
-        ``{"status": "ready", "pids": {}}`` no-op -- indistinguishable from "no
-        contract configured" -- with no error to indicate the misplacement.
+        ``<repo_root>/.seretos/worktree-setup.yml``) still produces a
+        ``{"status": "ready", "pids": {}}`` no-op -- but it is **not silent**
+        and **not** indistinguishable from "no contract configured": the same
+        response carries ``contract_found: false``, ``steps_run: 0``, and
+        ``no_op_reason: "contract-misplaced"`` (vs ``"no-contract"`` for the
+        genuinely-unconfigured case). Callers should branch on ``no_op_reason``
+        rather than inferring the cause from ``status``/``pids`` alone -- see
+        the "Contract diagnostics" block below for the full five-key set. The
+        engine may additionally set ``shadowed_contract`` on the response in
+        this case -- see the sixth diagnostic bullet below.
 
         Addressing the target
         ----------------------
@@ -903,6 +935,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         surface cannot satisfy the ticket's own AC1, and why ``checkout_path``
         is a strict superset that keeps every existing id-only call working
         unchanged.)
+
+        All three addressing outcomes in one place: neither given raises
+        ``ValueError``; both given but disagreeing raises ``ValueError``; and
+        -- when the ``(environment_id, checkout_path)`` pair is well-formed
+        but resolves to nothing the engine knows about -- the *target* is
+        soft-not-found, returning ``{"error": "...", "code": "not_found"}``
+        rather than raising (see "If the target is not found" below for the
+        full contract). Not every addressing failure raises: only a
+        malformed pair does; an unresolvable-but-well-formed pair does not.
 
         Multiple named ``start:`` steps are supported; ``variant`` selects the
         step by its ``name``. Resolving ``variant="default"`` (the
@@ -962,7 +1003,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           ``"main"`` **regardless of which** ``variant`` was requested --
           starting ``variant="worker"`` with no explicit ``role`` still
           records its pid under ``role="main"``, exactly like starting
-          ``variant="default"`` would.
+          ``variant="default"`` would. ``record.pids[role]`` and
+          ``record.variants[role]`` are both keyed by this **verbatim**
+          ``role`` string -- which is *not* how the start-log filename is
+          derived; see the ``start_log_path`` casing caveat below.
         - ``variant`` only selects *which* contract ``start:`` step is run
           (by its ``name``). It has no effect on where the resulting pid is
           filed.
@@ -1041,7 +1085,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``start_log_path``: filesystem path to the engine's captured
           startup log for the spawned process; useful for diagnosing a
           process that exits immediately. May be absent/``null`` on a no-op
-          ``"ready"`` start where nothing was spawned.
+          ``"ready"`` start where nothing was spawned. **Role-casing
+          caveat:** the filename is ``start-<slug(role)>.log``, where the
+          slug is the ``role`` **lower-cased**, with non-alphanumeric runs
+          collapsed to ``-`` and truncated to 40 characters -- unlike
+          ``pids``/``record.variants``, which key on the **verbatim**
+          ``role`` string. Example: ``role="API Server"`` files its pid
+          under ``pids["API Server"]`` but logs to
+          ``start-api-server.log``. Two roles differing only in case (e.g.
+          ``"API"`` and ``"api"``) become two distinct ``pids`` keys that
+          share one append-mode log file, interleaving their output. Never
+          derive the log path by slugging a ``pids``/``variants`` key
+          yourself -- always read ``start_log_path`` from the response.
+          Documented here, not fixed: this is an upstream engine defect,
+          tracked as ``Seretos/lib-python-worktree#111`` -- not to be
+          confused with this repository's own already-closed issue of the
+          same number, an unrelated thread-leak ticket.
 
         Contract diagnostics (ticket #103) -- five additive keys that make a
         real start distinguishable from every "nothing ran" flavour,
@@ -1065,6 +1124,44 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           (contract read, isolation allows it, but no ``start:`` step ran),
           or ``"contract-unreadable"`` (the contract exists but could not be
           read/parsed).
+
+        The record additionally carries one diagnostic produced by the
+        **engine itself** (``lib-python-worktree``, upstream #100) rather
+        than re-derived by this tool; it is passed through verbatim from the
+        engine's ``WorktreeRecord``:
+
+        - ``shadowed_contract`` (dict or ``None``): non-``None`` when a
+          checkout-local ``.seretos/worktree-setup.yml`` exists that is
+          **not** the file the engine actually read. Shape: ``{"path": <the
+          shadowing checkout-local copy>, "used_path": <the repo_root
+          contract path compared against -- the file the engine read there
+          when one exists; when none exists, this is merely the path that
+          would hold it, standing in for the engine's implicit
+          ``isolation: none`` fallback contract, since nothing is literally
+          read from a missing file>, "reason": <"differs" | "unreadable">,
+          "message": <human-readable text naming both paths>}``.
+          ``"differs"`` means the checkout copy parsed to something other
+          than what was used; ``"unreadable"`` means it exists but could not
+          be read/parsed. It is **transient**: computed fresh on every
+          ``environment_start`` call and never persisted to ``state.yaml``.
+          It is ``None`` for a primary checkout, ``None`` when the checkout
+          *is* ``repo_root``, and ``None`` for the byte-identical
+          convenience copy ``worktree_create`` writes -- so a non-``None``
+          value always means a genuine divergence.
+
+          This is complementary to, not redundant with, ``no_op_reason``: it
+          fires whenever the contract actually used for comparison -- a real
+          ``repo_root`` file, or, when none exists, the engine's implicit
+          ``isolation: none`` fallback -- differs from a non-trivial
+          checkout-local copy. That includes the case where a repo-root
+          contract exists and starts *normally* while the checkout-local
+          copy was separately edited to differ (``no_op_reason`` is
+          ``null`` there, and the five wrapper-derived keys above see
+          nothing wrong) -- but it fires just as readily alongside a
+          non-``null`` ``no_op_reason``, notably ``"contract-misplaced"``:
+          no file exists at ``repo_root``, the implicit fallback contract is
+          what gets compared, and a checkout-local copy that diverges from
+          that fallback still shadows it.
 
         If the target is not found, returns ``{"error": "...", "code":
         "not_found"}`` instead of raising, so callers can treat not-found as
@@ -1141,6 +1238,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         same soft not-found dict (``{"error": "...", "code": "not_found"}``
         -- see "If the target is not found" below) as an unknown
         ``environment_id`` rather than creating a record just to stop it.
+
+        A *linked* worktree differs: ``worktree_create`` already persisted
+        its record, so stopping a role that was never started there is not a
+        not-found condition. The engine takes its graceful no-op path
+        instead -- any contract ``stop:`` steps still run best-effort and no
+        signal is sent -- and this tool returns a normal environment record
+        whose ``stop_attempt`` is always ``{"outcome": "no_process_recorded",
+        ...}``, but whose ``status`` depends on what else is tracked:
+        ``"stopped"`` only if popping this role leaves ``pids`` empty *and*
+        the record wasn't already ``"stop_incomplete"``/``"orphaned"`` (those
+        two are sticky and are never overwritten back to ``"stopped"`` by
+        this no-op path); otherwise ``status`` is left unchanged -- e.g.
+        still ``"running"`` when another role's process is still tracked.
+        Only the *primary* (no record until its first ``environment_start``)
+        and a genuinely unknown ``environment_id``/``checkout_path`` yield
+        the soft not-found dict.
 
         ``role`` vs ``variant``
         -----------------------
@@ -1236,12 +1349,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         under the given ``role``, this tool returns a soft error dict
         ``{"error": "...", "code": "not_running"}`` rather than raising, so
         callers can treat the already-stopped case gracefully and branch on
-        ``code`` rather than parsing the error text.
+        ``code`` rather than parsing the error text. ``code: "not_running"``
+        maps the engine's ``ProcessNotRunningError``; it is *not* what a
+        tracked-but-never-started role on a linked worktree returns -- that
+        case takes the graceful no-op path described above
+        (``stop_attempt.outcome: "no_process_recorded"`` always;
+        ``status: "stopped"`` only when no other role is still tracked in
+        ``pids``), not this one.
 
         On success returns the canonical environment record dict. Fields of
         note:
 
-        - ``status``: ``"stopped"`` after the process has been terminated.
+        - ``status``: ``"stopped"`` after the process has been terminated (see
+          the tracked-but-never-started no-op case above for when a linked
+          worktree's ``status`` does not unconditionally end up ``"stopped"``).
         - ``backing``: ``"primary"`` for the main clone, ``"worktree"`` for a
           linked worktree.
         - ``pids``: a dict mapping role name to PID; the stopped role's entry

@@ -60,7 +60,7 @@ Removing the primary/main clone is never allowed regardless of how it is address
 | `environment_id` | `str` | No* | The id of a *tracked* checkout to remove (as returned by `worktree_create` or `environment_list`). |
 | `checkout_path` | `str` | No* | The path of the checkout to remove — the only way to address an untracked/orphan checkout. |
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
-| `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
+| `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate **foreign** processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). Not needed for a process you started via `environment_start` — removal stops every tracked role first; best-effort, so a tracked process that refuses to die still blocks. |
 
 \* At least one of `environment_id`/`checkout_path` is required; passing neither raises `ValueError`. Passing both is fine only when they agree — a mismatch also raises `ValueError`. Resolution is entirely the engine's job (via its `CheckoutTargetError`), and the wrapper performs no validation of the pair itself — but it re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a `worktree_remove`-specific message naming `environment_id` and `checkout_path`.
 
@@ -95,7 +95,7 @@ Every environment is addressed by one or both of:
 
 These two parameters are independent and easy to conflate:
 
-- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would.
+- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would. `record.pids`/`record.variants` key on this **verbatim** `role` string, which is not how the start-log filename is derived — see `start_log_path` below; the mismatch is an upstream defect tracked as `Seretos/lib-python-worktree#111` — not this repository's own already-closed issue of the same number, an unrelated thread-leak ticket.
 - **`variant`** only selects *which* contract `start:` step is run (by its `name`). It has no effect on where the resulting pid is filed.
 
 Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
@@ -150,6 +150,9 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 - `backing` — `"primary"` for the main clone, `"worktree"` for a linked worktree.
 - `pids` — dict mapping role name to PID (e.g. `{"main": 12345}`).
 - `ports` — dict mapping port name to host port number; `{}` before port setup runs.
+- `start_log_path` — filesystem path to the captured startup log. **Casing caveat:** the filename is `start-<slug(role)>.log`, lower-cased with non-alphanumeric runs collapsed to `-` and truncated to 40 chars — unlike `pids`/`record.variants`, which key on the verbatim `role`. Two roles differing only in case share one append-mode log file. Documented, not fixed; tracked as `Seretos/lib-python-worktree#111`.
+- Contract diagnostics (ticket #103) — five additive keys computed by this wrapper: `contract_found`, `contract_path`, `contract_isolation`, `steps_run`, `no_op_reason`.
+- `shadowed_contract` — a **separate, engine-produced** diagnostic (`lib-python-worktree`, upstream #100), not derived by this wrapper: `None` or `{path, used_path, reason, message}` with `reason` ∈ `{"differs", "unreadable"}`. Transient — never written to `state.yaml`. `None` for a primary, for `checkout == repo_root`, and for the identical copy `worktree_create` writes.
 
 **Soft errors:** if the target is not found, returns `{"error": "...", "code": "not_found"}`; if a process is already running under the given `role`, returns `{"error": "...", "code": "already_running"}` — both instead of raising, so callers can branch on `code` rather than parsing the error text. The not-found message names whichever target identifier was supplied (`environment_id` if given, else `checkout_path`).
 
