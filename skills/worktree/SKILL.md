@@ -323,6 +323,70 @@ force=True)`. Read both tokens off that one error and retry once with both
 flags set, rather than discovering each condition across separate failed
 attempts (plain retry → `kill_blocking_processes=True` → `force=True`).
 
+**Transport failure ("Connection closed"): confirm before retrying (ticket #116)**
+
+A tool call can die with `Connection closed` / `MCP error -32000` before its
+response is written. The response is lost; the operation may have fully landed.
+Never blind-retry a mutating call — read back first. `environment_list` never
+writes state, so retrying *it* is always safe, which is what makes it the
+read-back tool.
+
+1. **`worktree_create`** — `environment_list(path=<the same repo_root>)`; find the
+   entry with your `branch` and `tracked: true`. Its `id` is what the lost
+   response carried, and the id's 8-hex suffix is random, so read-back is the
+   only way to recover it; `setup_status` says how the `setup:` steps ended. A
+   blind retry is non-destructive (the duplicate guard fires before any
+   worktree-creating git command — only a read-only `git rev-parse` for repo
+   classification has run at that point) and self-diagnosing: the raised
+   error carries `(existing_environment_id: "<id>", existing_path:
+   "<path>")` — best-effort only; if the landed record can't be looked up,
+   the bare engine text is raised instead, with no id invented.
+2. **`worktree_remove`** — read back from the **repo root**, never from the removed
+   checkout path. That path is gone if the removal landed, so passing it back
+   raises `invalid checkout_path '<p>': checkout_path does not exist: ...` —
+   byte-for-byte what a typo produces, and therefore no evidence at all. Entry
+   absent = landed; entry present with `status: "orphaned"` = partially landed
+   (directory gone, record survives), finish it with
+   `worktree_remove(environment_id=<that id>)`; entry unchanged = did not land.
+   **Retry by `environment_id`, not `checkout_path`** — the id form is
+   self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
+3. **`environment_start`** — `environment_list(...)`, then `pids`. Unambiguous
+   case first: your `role` (default `"main"`) present as a key means the start
+   landed and the process is alive, and `variants[<role>]` names the variant. If
+   the role is absent the reading is ambiguous — never started, or started and
+   since exited (the listing reconciles dead pids away). The
+   `returncode`/`start_log_path` heuristic breaks the tie only for a role never
+   started before: for such a role non-`null` values prove a spawn happened,
+   while for a role started at any earlier point they are stale leftovers that
+   reconciliation does not clear and that decide nothing — inspect the file at
+   `start_log_path` instead. A blind retry is protected by `code:
+   "already_running"` only while the pid is **alive**; a landed-then-exited
+   start will be started a second time.
+4. **`environment_stop`** — `environment_list(...)`, then `pids`: role absent = no
+   live tracked process remains; role present = did not land. The listing cannot
+   tell you whether the contract's `stop:` steps ran — only the persisted
+   `stop_detail` (and a sticky `status: "stop_incomplete"`) survives there. A
+   blind retry that *returns* is safe: `code: "not_found"`, `code:
+   "not_running"`, or a graceful no-op reported as `stop_attempt.outcome:
+   "no_process_recorded"`. But it can also **raise `ValueError`** instead of
+   returning — a bad `checkout_path`, a missing/disagreeing `environment_id`/
+   `checkout_path` pair, or a `variant` that fails to resolve all raise
+   rather than come back as a soft `code`. Branching on `code` only makes
+   sense for a call that returned.
+
+**Fields that can never serve as read-back evidence.** `stop_attempt`,
+`killed_pids` and `shadowed_contract` are transient: they are never written to
+`state.yaml`, and `environment_list` rebuilds every entry from persisted state,
+so those keys are always `null`/`[]` there no matter what happened. Read them
+only from the response of the call that produced them.
+
+**What this does and does not fix.** The transport drop itself is outside this
+plugin's reach. The Windows `SIGBREAK` guard (ticket #112) addresses one
+mechanism — a server killed by a `CTRL_BREAK_EVENT` during a stop/remove — and
+is already in place; it does not eliminate transport drops, and it does not
+explain a dropped *first* `environment_start` call, which fails during argument
+resolution before any signal code runs at all.
+
 **Orphan worktree recovery**
 
 An orphan is a linked worktree that exists on disk (`git worktree list --porcelain`
