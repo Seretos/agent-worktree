@@ -250,3 +250,81 @@ def test_docs_document_setup_status_derived_from_setup_outcome():
                 f"{path.name} still contains the stale setup_status claim: "
                 f"{stale!r}"
             )
+
+
+# ---- Ticket #127 ----
+
+
+def _normalize(text: str) -> str:
+    """Strip Markdown emphasis/code markup and collapse whitespace, so
+    prose assertions match semantic tokens via regex alternation rather
+    than depending on exact wording/formatting surviving a future edit."""
+    stripped = text.replace("``", "").replace("`", "").replace("**", "")
+    return re.sub(r"\s+", " ", stripped).lower()
+
+
+def test_docs_document_lone_start_step_default_variant_fallback():
+    """Claims under protection:
+
+    1. AGENTS.md and SKILL.md must teach the corrected v0.3.5 / upstream
+       lib-python-worktree#112 semantics -- the `variant="default"`
+       lone-step fallback fires for a single `start:` step regardless of
+       whether it is named or unnamed, not only for a lone *unnamed* step
+       (the stale claim both docs previously carried).
+    2. Both docs must also document the `environment_stop(variant=
+       "default")` asymmetry: when the fallback resolves a NAMED step,
+       `record.variants[role]` stores that step's own name, never the
+       literal `"default"`, so a later `environment_stop(variant=
+       "default")` will not resolve.
+    3. SKILL.md's `## Pitfalls` section specifically (not just its earlier
+       contract prose) must gain an entry: a multi-step contract with no
+       step named `default` makes the *first* `environment_start` call
+       fail unless `variant=` is passed explicitly.
+    """
+    fallback_pattern = re.compile(
+        r"\b(single|lone|exactly one)\b[^.]{0,160}"
+        r"\b(regardless|even if|whether it is named|named or unnamed)\b"
+    )
+    asymmetry_pattern = re.compile(
+        r"\b(will not|does not|won't|cannot|never)\b[^.]{0,120}resolv"
+    )
+    stale_claims = {
+        AGENTS_MD: "resolves to the lone unnamed step for back-compat",
+        SKILL_MD: "a single unnamed step is the implicit",
+    }
+
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        assert fallback_pattern.search(norm), (
+            f"{path.name} must document that the default variant fallback "
+            "covers a lone NAMED step too, not only a lone unnamed one"
+        )
+        stale = stale_claims[path]
+        assert stale not in norm, (
+            f"{path.name} still contains the stale claim: {stale!r}"
+        )
+
+        found_asymmetry = False
+        for m in re.finditer(r"default", norm):
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 500]
+            if "variants" in window and asymmetry_pattern.search(window):
+                found_asymmetry = True
+                break
+        assert found_asymmetry, (
+            f'{path.name} must document that environment_stop(variant='
+            '"default") does not resolve when the lone-step fallback '
+            "resolved a named step"
+        )
+
+    skill_text = SKILL_MD.read_text(encoding="utf-8")
+    pitfalls_idx = skill_text.find("## Pitfalls")
+    assert pitfalls_idx != -1, "SKILL.md must have a '## Pitfalls' heading"
+    pitfalls_section = _normalize(skill_text[pitfalls_idx:])
+    assert "default" in pitfalls_section and "variant=" in pitfalls_section, (
+        "SKILL.md's Pitfalls section must gain an entry about a multi-step "
+        "contract with no step named default failing the first "
+        "environment_start call unless variant= is passed"
+    )

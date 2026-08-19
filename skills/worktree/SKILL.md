@@ -71,13 +71,24 @@ Each step under `setup:`, `start:`, `stop:`, or `teardown:` is a YAML mapping wi
 
 - `run:` — **required**, the shell command to execute.
 - `name:` — optional; for `start:`/`stop:` steps this selects the step via
-  `environment_start`'s `variant` parameter (a single unnamed step is the implicit
-  `"default"` variant, for back-compat).
+  `environment_start`'s `variant` parameter (see the three-tier
+  `variant="default"` resolution below for when an unnamed — or even a
+  named — step becomes the implicit default).
 - `shell:` — optional override of the shell used to run the step.
 
 `environment_start` supports multiple **named** `start:` variants — pass the step's
 `name` as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch).
 An unknown variant raises a `ValueError` listing the available names.
+
+**Resolving `variant="default"`.** Three tiers, tried in order: (1) an exact
+`name:` match against `variant`; (2) exactly one **unnamed** `start:` step —
+implicitly the `"default"` variant, for back-compat; (3) exactly one `start:`
+step overall — even if that single step is named rather than unnamed
+(upstream lib-python-worktree#112, shipped in the pinned v0.3.5) — so a
+contract whose sole step carries a `name:` other than `"default"` still
+resolves without passing `variant` explicitly. Two or more `start:` steps
+with none of them named `"default"` still raise `ValueError` listing the
+available names, even under tier 3.
 
 **`role` vs `variant`.** These are independent parameters, easy to conflate: `role` is
 the tracking key a process's pid is filed under (`pids[role]`), and it defaults to
@@ -89,6 +100,14 @@ concurrently need two distinct `role`s, or the second call returns/errors with a
 (`record.variants`), so `environment_stop(variant=...)` can later stop that role
 without the caller separately tracking which role it used — see `environment_stop`'s
 own `variant` parameter below.
+
+**Asymmetry warning.** When tier 3 above (the lone-step fallback) resolves a
+*named* step from a bare `variant="default"` call, `record.variants[role]`
+stores that step's own name (e.g. `"main"`) — never the literal string
+`"default"`. A later `environment_stop(variant="default")` **will not
+resolve** against that role, since `record.variants[role]` is never
+`"default"` in that case. Use `role="main"` (the default) or pass the
+step's actual name as `variant` instead.
 
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
@@ -335,3 +354,12 @@ running under the given `role`).
    at `repo_root` — you do not have to pass `base` just because the branch is new. This
    default still raises `ValueError` when `repo_root`'s HEAD is detached or unborn (no
    commits yet), since there is then no checked-out branch to default to.
+8. **A multi-step contract with no step named `default` fails the *first*
+   `environment_start` call from any agent, unless `variant=` is passed.**
+   The `variant="default"` lone-step fallback only ever fires when the
+   contract declares exactly one `start:` step total; the moment a second
+   named step is added, a bare `environment_start()` call raises
+   `ValueError` listing the available names instead of silently picking
+   one. Check `worktree_create`'s returned `start_variants` field (or this
+   contract's `start:` list) up front and pass `variant=<name>` explicitly
+   whenever more than one step exists.

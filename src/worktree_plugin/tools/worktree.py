@@ -314,6 +314,54 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
     }
 
 
+def _start_step_names(repo_root: str) -> Optional[List[str]]:
+    """Return the ``name:`` of every *named* ``start:`` step declared by the
+    contract at ``<repo_root>/.seretos/worktree-setup.yml`` (ticket #127),
+    so a caller of ``worktree_create`` can see up front which
+    ``environment_start(variant=...)`` values are valid, instead of only
+    discovering them from an ``UnknownVariantError`` on the first failed
+    call.
+
+    This is a byte-for-byte mirror of the engine's own ``available``
+    computation in ``UnknownVariantError`` (``[s.name for s in
+    contract.start if s.name]``) -- unnamed steps are deliberately excluded,
+    exactly as the engine excludes them from its own error message.
+
+    Sentinel semantics -- the two ``None``/``[]`` return values are NOT
+    interchangeable:
+
+    - ``None`` -- there is no contract file to read, or the contract exists
+      but could not be read/parsed (``OSError``/``ContractError``). Callers
+      cannot distinguish "no contract" from "unreadable contract" from this
+      return value alone (mirrors ``_contract_diagnostics``'s no-raise
+      posture) -- if that distinction matters, cross-reference
+      ``contract_found``/``no_op_reason`` from a prior ``environment_start``
+      call instead.
+    - ``[]`` -- the contract was read successfully but declares no *named*
+      ``start:`` steps. Covers ``isolation: none`` (which forbids ``start:``
+      entirely), an empty ``start:`` list, and a ``start:`` list whose
+      entries are all unnamed.
+
+    Note the explicit ``.exists()`` guard below is required: unlike this
+    helper, ``load_contract`` on a **missing** file returns an implicit
+    ``isolation: none`` contract rather than raising, which would otherwise
+    make a genuinely absent contract indistinguishable from a validly-read
+    one with nothing to offer -- collapsing the ``None``-vs-``[]``
+    distinction above.
+
+    Never raises: any ``OSError``/``ContractError`` degrades to ``None``,
+    mirroring ``_contract_diagnostics``'s never-raise posture.
+    """
+    contract_path = Path(repo_root) / CONTRACT_FILENAME
+    try:
+        if not contract_path.exists():
+            return None
+        contract = load_contract(contract_path)
+        return [s.name for s in contract.start if s.name]
+    except (OSError, ContractError):
+        return None
+
+
 def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     """Shape one ``EnvironmentEntry`` (from ``WorktreeManager.list_repo``)
     into the flat dict returned by ``environment_list``.
@@ -416,6 +464,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``warning`` (optional): present when ``repo_root`` was silently
           re-rooted to the actual git repository root (e.g. when a subdirectory
           was passed). The field contains the original and resolved paths.
+        - ``start_variants`` (always present, unlike ``warning``): the raw
+          list of *named* ``start:`` step names declared by the contract
+          (unnamed steps excluded), so an agent can see up front which
+          ``environment_start(variant=...)`` values are valid instead of
+          only discovering a mismatch from an ``UnknownVariantError`` on
+          the first failed call. ``None`` when there is no contract file to
+          read (or it exists but could not be read/parsed); an empty list
+          ``[]`` when the contract was read successfully but declares no
+          *named* ``start:`` steps (e.g. ``isolation: none``, an empty
+          ``start:`` list, or a ``start:`` list whose entries are all
+          unnamed) -- these two states are deliberately distinct and must
+          not be conflated. This is purely the contract's declared names,
+          **not** a prediction of which step a bare
+          ``variant="default"`` call to ``environment_start`` will
+          actually select -- see that tool's docstring for the three-tier
+          resolution rule.
 
         Contract file (``.seretos/worktree-setup.yml``)
         -------------------------------------------------
@@ -484,6 +548,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             result["warning"] = (
                 f"repo_root was re-rooted from '{repo_root}' to '{record.repo_root}'"
             )
+
+        # Ticket #127: surface the contract's declared *named* start: steps
+        # up front, so a contract author naming their sole step something
+        # other than "default" discovers the available variant names here
+        # instead of only from an UnknownVariantError on the first
+        # environment_start call. Read from record.repo_root (never the
+        # caller's repo_root argument) -- the engine may have re-rooted it,
+        # per the warning block above.
+        result["start_variants"] = _start_step_names(record.repo_root)
 
         return result
 
@@ -832,16 +905,31 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         unchanged.)
 
         Multiple named ``start:`` steps are supported; ``variant`` selects the
-        step by its ``name``. A single **unnamed** ``start:`` step is
-        implicitly the ``"default"`` variant, for back-compat, so
-        ``variant="default"`` (the parameter's own default) resolves to it
-        without needing a ``name:`` key at all. An unknown variant surfaces
-        as a ``ValueError`` listing the available names.
+        step by its ``name``. Resolving ``variant="default"`` (the
+        parameter's own default) works in three tiers, tried in order:
+
+        1. An exact ``name:`` match against ``variant``.
+        2. Exactly one **unnamed** ``start:`` step -- implicitly the
+           ``"default"`` variant, for back-compat.
+        3. Exactly one ``start:`` step overall -- **even if that single
+           step is named rather than unnamed** (upstream
+           lib-python-worktree #112, shipped in the pinned v0.3.5) -- so a
+           contract whose sole step carries a ``name:`` other than
+           ``"default"`` still resolves without the caller needing to pass
+           ``variant`` explicitly.
+
+        Two or more ``start:`` steps with none of them named ``"default"``
+        still raise ``ValueError`` even under tier 3 -- the lone-step
+        fallback only ever fires when the contract declares exactly one
+        step. An unknown variant surfaces as a ``ValueError`` listing the
+        available *named* steps (unnamed steps are never listed, since they
+        have no name to list).
 
         Step schema: each ``start:`` entry is a YAML mapping with a required
         ``run:`` key (the shell command to execute) and an optional ``name:``
-        key (used by ``variant`` to select that step). A single unnamed step
-        is the ``"default"`` variant, for back-compat.
+        key (used by ``variant`` to select that step). See the three-tier
+        resolution above for how a contract with only one ``start:`` step
+        total -- named or not -- is matched by ``variant="default"``.
 
         Contract file schema (``<repo_root>/.seretos/worktree-setup.yml``)
         ----------------------------------------------------------------
@@ -889,6 +977,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         call can address that role without the caller having to separately
         track which role it used -- see ``environment_stop``'s docstring.
 
+        **Asymmetry warning:** when tier 3 of the variant resolution above
+        (the lone-step fallback) resolves a *named* step from a bare
+        ``variant="default"`` call, the value recorded in
+        ``record.variants[role]`` is that step's own name (e.g.
+        ``"main"``) -- never the literal string ``"default"`` -- because
+        the engine records ``variant=step.name or variant``. A later
+        ``environment_stop(variant="default")`` will not resolve against
+        that role, since ``record.variants[role]`` is never ``"default"``
+        in that case. To stop it, either omit ``variant`` entirely
+        (``role`` alone defaults to ``"main"``) or pass the step's actual
+        name, e.g. ``environment_stop(variant="main")``.
+
         Parameters
         ----------
         environment_id:
@@ -907,11 +1007,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             environment's checkout path is used by the underlying engine.
         variant:
             Selects which named ``start:`` step to run. Defaults to
-            ``"default"``, which resolves to the lone unnamed step for
-            back-compat. When multiple named steps exist, pass the step's
-            ``name`` here. An unknown variant raises ``ValueError`` listing
-            the available names. See "``role`` vs ``variant``" above for how
-            this relates to the ``role`` parameter.
+            ``"default"``, which resolves via the three-tier rule above: an
+            exact ``name:`` match; else the lone unnamed step, if there is
+            exactly one; else the lone step overall -- regardless of
+            whether it is named or unnamed -- if the contract declares
+            exactly one ``start:`` step total. Two or more steps with none
+            named ``"default"`` still raise ``ValueError`` listing the
+            available names. See "``role`` vs ``variant``" above for how
+            this relates to the ``role`` parameter, including the
+            asymmetry warning about ``environment_stop(variant="default")``
+            when the lone-step fallback resolves a named step.
         env:
             Optional dict of extra environment variables merged into the process
             environment by the engine. Omit (or pass ``None``) to inherit the
@@ -1054,6 +1159,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           stopped.
         - Both given: they must agree -- ``variant`` must resolve to exactly
           the role named by ``role``, or a ``ValueError`` is raised.
+
+        **Asymmetry warning:** ``environment_start``'s three-tier
+        ``variant="default"`` resolution includes a lone-step fallback that
+        can fire for a *named* step (see ``environment_start``'s "``role``
+        vs ``variant``" section). When it does, ``record.variants[role]``
+        stores that step's own name -- never the literal string
+        ``"default"``. As a result, calling
+        ``environment_stop(variant="default")`` afterwards **will not
+        resolve** against that role: ``record.variants`` never contains
+        ``"default"`` in that case. Use ``role="main"`` (the default) or
+        pass the step's actual name as ``variant`` instead.
 
         Resolution can fail three ways, all surfaced as ``ValueError`` (never
         a soft error dict): the variant matches no currently-running role

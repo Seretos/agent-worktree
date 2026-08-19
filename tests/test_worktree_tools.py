@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ from lib_python_worktree import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
     CheckoutTargetError,
+    ContractError,
     DuplicateWorktreeError,
     GitTimeoutError,
     InMemoryStateStore,
@@ -2654,3 +2656,170 @@ def test_soft_error_code_absent_on_success(tmp_path: Path):
     stop_result = fns["environment_stop"](environment_id="wt-id")
     assert "error" not in stop_result
     assert "code" not in stop_result
+
+
+# ---- Ticket #127 ----
+#
+# environment_start's `variant` defaults to "default", but the engine only
+# resolves that to a contract `start:` step under specific conditions (an
+# exact `name: default` match, a lone unnamed step, or -- as of upstream
+# lib-python-worktree #112, shipped in the pinned v0.3.5 -- a lone step
+# overall regardless of naming). Nothing in `worktree_create`'s returned
+# record surfaced the contract's actual named `start:` steps up front, so a
+# contract author naming their sole step something other than "default"
+# only discovered the mismatch from an `UnknownVariantError` on the first
+# `environment_start` call. `start_variants` closes that gap: it is the raw
+# list of declared `start:` step names (unnamed steps excluded, exactly
+# like the engine's own `UnknownVariantError.available`), always present in
+# `worktree_create`'s result, `None` when there is no contract to read (or
+# it could not be read), and `[]` when a contract was read successfully but
+# declares no *named* `start:` steps.
+
+
+def test_worktree_create_surfaces_start_step_names(tmp_path: Path, temp_repo: Path):
+    """Driving test: a single named `start:` step must surface verbatim as
+    `start_variants` on the record `worktree_create` returns -- the record
+    an agent already has in hand at create time, before it ever calls
+    `environment_start` and risks an `UnknownVariantError`."""
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n  - name: main\n    run: echo hi\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["start_variants"] == ["main"]
+
+
+def test_worktree_create_start_step_names_multi_step_preserves_order(
+    tmp_path: Path, temp_repo: Path
+):
+    """Multiple named steps must surface in declaration order."""
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n"
+        "  - name: web\n    run: echo web\n"
+        "  - name: worker\n    run: echo worker\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert result["start_variants"] == ["web", "worker"]
+
+
+def test_worktree_create_start_step_names_excludes_unnamed(
+    tmp_path: Path, temp_repo: Path
+):
+    """A step with no `name:` key must not appear in `start_variants` --
+    mirrors the engine's own `UnknownVariantError.available` computation,
+    which also omits unnamed steps."""
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n"
+        "  - name: web\n    run: echo web\n"
+        "  - run: echo unnamed\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert result["start_variants"] == ["web"]
+
+
+def test_worktree_create_start_step_names_all_unnamed_is_empty_list_not_none(
+    tmp_path: Path, temp_repo: Path
+):
+    """A contract with a single, unnamed `start:` step is still a
+    successfully-read contract with nothing named to offer -- `[]`, not
+    `None`. Conflating the two would make it indistinguishable from "no
+    contract file at all", which is a materially different situation for a
+    contract-authoring agent to diagnose."""
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n  - run: echo hi\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert result["start_variants"] == []
+    assert result["start_variants"] is not None
+
+
+def test_worktree_create_start_step_names_none_when_no_contract_file(
+    tmp_path: Path, temp_repo: Path
+):
+    """No contract file at all must surface `start_variants is None`, and
+    `worktree_create` must still succeed -- a missing contract is not an
+    error condition for the checkout lifecycle."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["start_variants"] is None
+
+
+def test_worktree_create_start_step_names_empty_for_isolation_none(
+    tmp_path: Path, temp_repo: Path
+):
+    """`isolation: none` forbids a `start:` block entirely, but the
+    contract itself was still read successfully -- `[]`, proving the
+    missing-file `None` case above is never conflated with a validly-read
+    contract that simply has nothing to offer."""
+    _write_contract(temp_repo, "version: 1\nisolation: none\n")
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert result["start_variants"] == []
+
+
+def test_worktree_create_start_step_names_none_when_contract_unreadable(
+    tmp_path: Path, temp_repo: Path
+):
+    """A contract that exists and is perfectly valid on disk, but whose
+    read fails specifically inside the new helper (the documented TOCTOU
+    idiom -- see test_environment_tools.py's equivalent
+    `load_contract`-patching tests) must degrade to `start_variants is
+    None` without `worktree_create` raising. Uses a VALID contract on disk
+    and patches `worktree_plugin.tools.worktree.load_contract` rather than
+    writing malformed YAML: a genuinely malformed contract on disk would
+    make `manager.create()`'s own internal load fail one frame earlier
+    (inside its rollback `try`), so `worktree_create` itself would raise
+    and the helper's except clause would never be reached at all."""
+    from unittest.mock import patch
+
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n  - name: main\n    run: echo hi\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    with patch(
+        "worktree_plugin.tools.worktree.load_contract",
+        side_effect=ContractError("boom"),
+    ):
+        result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["start_variants"] is None
+
+
+def test_worktree_create_docstring_documents_start_variants(tmp_path: Path):
+    """worktree_create's docstring must document the new `start_variants`
+    field and both of its sentinel states (`None`/`null` for "no contract
+    to read", `[]`/"empty list" for "contract read, nothing named")."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    doc = fns["worktree_create"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    idx = norm.find("start_variants")
+    assert idx != -1, "worktree_create docstring must mention start_variants"
+    window = norm[max(0, idx - 300) : idx + 900]
+    assert re.search(r"null|none", window)
+    assert re.search(r"empty list|\[\]", window)
