@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 from lib_python_worktree import (
     InMemoryStateStore,
+    InvalidRepoError,
     ManagerConfig,
     SetupOutcome,
     WorktreeManager,
@@ -35,7 +36,7 @@ from lib_python_worktree import (
     primary_id_for,
 )
 from lib_python_worktree.core.state import ShadowedContract
-from worktree_plugin.tools.worktree import register
+from worktree_plugin.tools.worktree import _invalid_path_error_text, register
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -639,17 +640,64 @@ def test_worktree_remove_missing_target_error_names_environment_id(tmp_path: Pat
 
 
 def test_worktree_remove_checkout_path_outside_any_repo(tmp_path: Path):
+    """Ticket #123: classify_checkout() raises InvalidRepoError (a
+    WorktreeError) before any store/removal logic runs when checkout_path
+    isn't a usable git repository. Before the fix, the wrapper's catch-all
+    `except WorktreeError` passed the engine's message through verbatim,
+    which names the engine-internal `repo_root` parameter even though the
+    caller passed `checkout_path` -- this tool has no `repo_root`
+    parameter at all. The re-worded message must name `checkout_path`
+    instead, never leak `repo_root`, and still carry the offending path
+    (as its basename, since `!r` doubles backslashes on Windows) and the
+    rejection reason."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
 
-    # Observed engine behaviour: classify_checkout() raises InvalidRepoError
-    # (a WorktreeError) before any store/removal logic runs, which the tool
-    # wrapper's catch-all `except WorktreeError` maps to a raised
-    # ValueError -- not a soft error dict, since this isn't a "target not
-    # found" condition but an invalid argument.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["worktree_remove"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_worktree_remove_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: a checkout_path that does not exist on disk
+    produces reason text `repo_root does not exist: ...` from the engine --
+    this proves the fix's token substitution rewrites the reason *body*,
+    not just the `invalid repo_root ...:` prefix (a prefix-only fix would
+    still leak `repo_root` here)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
+
+
+def test_worktree_remove_checkout_path_is_a_file(tmp_path: Path):
+    """Ticket #123 edge case: a checkout_path pointing at a file (not a
+    directory) produces reason text `repo_root is not a directory: ...`."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("hi", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](checkout_path=str(a_file))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert a_file.name in msg
+    assert "not a directory" in msg
 
 
 @pytest.mark.parametrize("pre_start", [False, True])
@@ -798,6 +846,47 @@ def test_environment_start_missing_target_error_names_environment_id(
     assert "worktree_id" not in msg
 
 
+def test_environment_start_invalid_checkout_path_names_checkout_path(
+    tmp_path: Path,
+):
+    """Ticket #123: an unusable checkout_path leaks via classify_checkout()'s
+    InvalidRepoError, caught by environment_start's catch-all
+    `except (WorktreeError, ProcessLifecycleError)` before the fix -- which
+    passes the engine's `repo_root`-naming text straight through even
+    though environment_start has no `repo_root` parameter. The re-worded
+    message must name `checkout_path`, never leak `repo_root`, and still
+    carry the offending path's basename and the rejection reason."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_environment_start_invalid_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: proves the reason-body rewrite, not just the
+    `invalid repo_root ...:` prefix -- same rationale as
+    test_worktree_remove_checkout_path_nonexistent."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
+
+
 def test_environment_stop_unmaterialised_primary_soft_error(
     tmp_path: Path, temp_repo: Path
 ):
@@ -825,6 +914,43 @@ def test_environment_stop_missing_target_error_names_environment_id(tmp_path: Pa
     assert "environment_id" in msg
     assert "checkout_path" in msg
     assert "worktree_id" not in msg
+
+
+def test_environment_stop_invalid_checkout_path_names_checkout_path(
+    tmp_path: Path,
+):
+    """Ticket #123: empirically confirmed (repro script) that
+    environment_stop raises here rather than returning a soft not-found
+    dict -- classify_checkout() runs, and fails, before any state-store
+    lookup. Same leak/fix rationale as environment_start's counterpart."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_environment_stop_invalid_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: proves the reason-body rewrite, not just the
+    `invalid repo_root ...:` prefix."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
 
 
 def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
@@ -1832,3 +1958,126 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
         "surrounding window fully-qualifies the upstream #111 reference, "
         "names the lower-case/slug behaviour, and mentions pids"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #123: InvalidRepoError re-wording (_invalid_path_error_text)
+# ---------------------------------------------------------------------------
+#
+# R1-R3 above cover the wrapper-level behaviour (worktree_remove,
+# environment_start, environment_stop each re-word the engine's
+# InvalidRepoError to name checkout_path). R4 below unit-tests the
+# rewording helper directly; R5 covers its identity guard (never rename a
+# path the wrapper didn't itself receive); R6 is the negative control
+# proving worktree_create's genuinely-named `repo_root` parameter is left
+# alone.
+
+
+def test_invalid_path_error_text_preserves_reason_without_token(tmp_path: Path):
+    """R4: a reason with no `repo_root` token at all (e.g. an unexpected
+    'git rev-parse' output failure) must survive completely intact -- the
+    mechanical `\\brepo_root\\b` substitution is a no-op here, proving no
+    diagnostic detail is ever silently dropped for a reason shape the
+    rewording helper doesn't specifically know about."""
+    exc = InvalidRepoError("/x/y", "unexpected 'git rev-parse' output: 'garbage'")
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert msg == "invalid checkout_path '/x/y': unexpected 'git rev-parse' output: 'garbage'"
+
+
+def test_invalid_path_error_text_rewrites_token_in_future_reason(tmp_path: Path):
+    """R4: an invented reason (standing in for a future engine reason not
+    enumerated anywhere in this wrapper) that DOES contain the `repo_root`
+    token must still have it rewritten -- the substitution is mechanical,
+    not an allow-list of known reasons, so it keeps working for engine
+    reasons that don't exist yet."""
+    exc = InvalidRepoError("/x/y", "repo_root failed an invented future check: /x/y")
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert "repo_root" not in msg
+    assert "checkout_path failed an invented future check: /x/y" in msg
+
+
+def test_invalid_path_error_text_word_boundary_leaves_lookalikes_alone(tmp_path: Path):
+    """R4 edge case: `repo_roots` and `my_repo_root` must NOT be touched by
+    the substitution -- proves the `\\b` word-boundary anchors are doing
+    real work, not a bare (unanchored) string replace that would also
+    mangle these lookalike identifiers."""
+    exc = InvalidRepoError(
+        "/x/y", "repo_roots list exhausted; my_repo_root was already tried"
+    )
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert "repo_roots list exhausted; my_repo_root was already tried" in msg
+
+
+def test_worktree_remove_invalid_checkout_path_identity_guard_different_path(
+    tmp_path: Path,
+):
+    """R5: the wrapper must never rename a path it did not itself receive.
+    If the engine's InvalidRepoError names some OTHER path (e.g. one it
+    resolved internally) than the checkout_path the caller actually
+    passed, the wrapper must leave the engine's message untouched --
+    including its `repo_root` wording -- rather than mislabelling a path
+    that isn't the one the caller gave it.
+
+    This test may already pass before the production fix: the identity
+    guard is new code, but the pre-fix generic `except WorktreeError`
+    catch-all already passes str(exc) through verbatim too, so this is an
+    expected-already-passing regression guard, not a false RED."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    other_path = str(tmp_path / "some-other-place")
+
+    def _fake_remove(*args, **kwargs):
+        raise InvalidRepoError(other_path, f"repo_root does not exist: {other_path}")
+
+    with patch.object(mgr, "remove", side_effect=_fake_remove):
+        with pytest.raises(ValueError) as excinfo:
+            fns["worktree_remove"](checkout_path=str(tmp_path / "not-what-was-raised"))
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+
+
+def test_environment_start_invalid_checkout_path_identity_guard_checkout_path_none(
+    tmp_path: Path,
+):
+    """R5 additional edge case: exercises the `checkout_path is not None`
+    short-circuit -- when the caller addressed the target purely by
+    environment_id (checkout_path=None), the guard must not even attempt
+    the equality comparison, and the engine's message passes through
+    unchanged. Also an expected-already-passing guard (see the docstring
+    above for why)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    other_path = str(tmp_path / "some-other-place")
+
+    def _fake_start(*args, **kwargs):
+        raise InvalidRepoError(other_path, f"repo_root does not exist: {other_path}")
+
+    with patch.object(mgr, "start", side_effect=_fake_start):
+        with pytest.raises(ValueError) as excinfo:
+            fns["environment_start"](environment_id="some-id")
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+
+
+def test_worktree_create_invalid_repo_root_still_names_repo_root(tmp_path: Path):
+    """R6 (negative control): worktree_create's parameter really is named
+    `repo_root` -- ticket #123's fix must be scoped to checkout_path-only
+    tools (worktree_remove, environment_start, environment_stop), never a
+    blanket string replacement that would also mangle worktree_create's
+    correctly-named error. Expected to pass both before and after the fix."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_create"](repo_root=str(non_repo), branch="feature/wt")
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+    assert "checkout_path" not in msg

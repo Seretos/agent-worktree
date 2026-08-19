@@ -134,6 +134,33 @@ def _addressing_error_text(
     )
 
 
+def _invalid_path_error_text(exc: InvalidRepoError, *, param_name: str) -> str:
+    """Re-word the engine's ``InvalidRepoError`` into a wrapper-native
+    invalid-path message naming ``param_name`` (e.g. ``checkout_path``)
+    instead of the engine-internal ``repo_root`` (ticket #123).
+
+    Deliberate divergence from ``_addressing_error_text``'s allow-list
+    policy above. ``_addressing_error_text`` can safely special-case (and
+    drop) unknown ``CheckoutTargetError`` reason text because that
+    exception carries *structured* reason codes (``"missing"`` /
+    ``"id_mismatch"``) plus separate ``worktree_id``/``checkout_path``/
+    ``resolved_id`` attributes it can rebuild a full message from.
+    ``InvalidRepoError`` has no such structure -- its ``reason`` string
+    *is* the entire diagnostic (e.g. ``"not a git repository: ..."``,
+    ``"unexpected 'git rev-parse' output: ..."``), so dropping or
+    generically replacing it would weaken the error, which this ticket
+    forbids. Instead this performs a mechanical, ``\\b``-anchored token
+    substitution applied to *every* reason -- known or unknown/future --
+    which satisfies "do not weaken the error" by construction (no detail
+    is ever lost) and keeps working for engine reasons that don't exist
+    yet. The f-string otherwise mirrors the engine's own
+    ``InvalidRepoError.__init__`` construction byte-for-byte apart from
+    the substituted token.
+    """
+    reason = re.sub(r"\brepo_root\b", param_name, exc.reason)
+    return f"invalid {param_name} {exc.repo_root!r}: {reason}"
+
+
 def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
     """Make ``contract_dir`` (the ``.seretos/`` copy ``worktree_create``
     just wrote into a *new worktree checkout*) invisible to git.
@@ -610,6 +637,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         so this wrapper replaces it with a ``worktree_remove``-specific
         message naming ``environment_id`` and ``checkout_path`` instead.
 
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository (e.g. it doesn't exist, isn't a directory, or isn't a
+        git repo at all), resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing the
+        engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
+
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
         surface cannot satisfy the ticket's own AC1, and why ``checkout_path``
@@ -748,6 +783,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                     ),
                 )
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except WorktreeError` tail below --
+            # same MRO-ordering concern as CheckoutTargetError's catch above
+            # (ticket #119) and WorktreeRemovalBlockedError's (ticket #120).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
@@ -929,6 +980,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         and engine-API vocabulary (``start()``/``stop()``/``remove()``),
         so this wrapper replaces it with an ``environment_start``-specific
         message naming ``environment_id`` and ``checkout_path`` instead.
+
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository, resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing
+        the engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
 
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
@@ -1201,6 +1259,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                     ),
                 )
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except (WorktreeError,
+            # ProcessLifecycleError)` tail below -- same MRO-ordering
+            # concern as CheckoutTargetError's catch above (ticket #119).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
@@ -1232,6 +1306,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         (``start()``/``stop()``/``remove()``), so this wrapper replaces it
         with an ``environment_stop``-specific message naming
         ``environment_id`` and ``checkout_path`` instead.
+
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository, resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing
+        the engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
 
         Unlike ``environment_start``, stopping never materialises a primary
         record: an unstarted primary has nothing to stop, so it returns the
@@ -1419,6 +1500,23 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 f"{exc} (hint: pass role=<role> explicitly, or see "
                 f"environment_start's role-vs-variant docs)"
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except (WorktreeError,
+            # ProcessLifecycleError)` tail below -- same MRO-ordering
+            # concern as CheckoutTargetError's and VariantResolutionError's
+            # catches above (tickets #119 / this module's own precedent).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
