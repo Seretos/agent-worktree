@@ -100,6 +100,10 @@ These two parameters are independent and easy to conflate:
 
 Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
 
+**Resolving `variant="default"`.** Three tiers, tried in order: (1) an exact `name:` match against `variant`; (2) exactly one **unnamed** `start:` step — implicitly the `"default"` variant, for back-compat; (3) exactly one `start:` step overall — even if that single step is named rather than unnamed (upstream lib-python-worktree#112, shipped in the pinned v0.3.5) — so a contract whose sole step carries a `name:` other than `"default"` still resolves without the caller passing `variant` explicitly. Two or more `start:` steps with none of them named `"default"` still raise `ValueError` listing the available names, even under tier 3.
+
+**Asymmetry warning.** When tier 3 (the lone-step fallback) resolves a *named* step from a bare `variant="default"` call, `record.variants[role]` stores that step's own name (e.g. `"main"`) — never the literal string `"default"` — because the engine records `variant=step.name or variant`. A later `environment_stop(variant="default")` **will not resolve** against that role, since `record.variants[role]` is never `"default"` in that case. Use `role="main"` (the default) or pass the step's actual name as `variant` instead.
+
 #### environment_list
 
 ```
@@ -135,7 +139,7 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 |-----------|------|----------|-------------|
 | `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. See "`role` vs `variant`" above. |
 | `cwd` | `str` | No | Working directory for the spawned process. When omitted, the environment's checkout path is used by the underlying engine. |
-| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. See "`role` vs `variant`" above. |
+| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves via the three-tier rule under "`role` vs `variant`" above (exact `name:` match; else the lone unnamed step; else the lone step overall, named or not, if the contract declares exactly one). Two or more steps with none named `"default"` still raise `ValueError` listing the available names. |
 | `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
 **The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` at `repo_root`.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.

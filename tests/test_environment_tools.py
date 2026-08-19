@@ -1394,6 +1394,84 @@ def test_environment_stop_docstring_documents_role_vs_variant(tmp_path: Path):
     assert "variant" in doc
 
 
+# ---- Ticket #127 ----
+#
+# `environment_start`'s `variant` parameter defaults to `"default"`, but
+# resolving that default was previously documented as limited to a lone
+# *unnamed* `start:` step. As of the pinned v0.3.5 (upstream
+# lib-python-worktree#112), the lone-step fallback fires for a single
+# `start:` step regardless of whether it carries a `name:` key -- but the
+# wrapper's own docstrings, AGENTS.md, and SKILL.md still claimed the
+# narrower, unnamed-only behaviour. These tests protect the corrected
+# claim, and the previously-undocumented consequence: when the fallback
+# resolves a *named* step, `record.variants[role]` stores that step's own
+# name (not the literal string `"default"`), so a later
+# `environment_stop(variant="default")` will not resolve against it.
+
+
+def test_environment_start_docstring_documents_lone_named_step_default_fallback(
+    tmp_path: Path,
+):
+    """Claim under protection: the `variant="default"` lone-step fallback
+    fires for a single `start:` step REGARDLESS of whether that step
+    carries a `name:` key (v0.3.5 / upstream lib-python-worktree#112) --
+    not only for a lone *unnamed* step, which is what the pre-#127 wording
+    claimed ("resolves to the lone unnamed step for back-compat"). The
+    multi-step failure mode (two-or-more steps with none named `"default"`
+    still raise `ValueError` listing the available names) must remain
+    documented alongside the correction."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert re.search(
+        r"\b(single|lone|exactly one)\b[^.]{0,160}"
+        r"\b(regardless|even if|whether it is named|named or unnamed)\b",
+        norm,
+    ), "docstring must state the lone-step fallback covers a named step too"
+
+    assert "resolves to the lone unnamed step for back-compat" not in norm, (
+        "stale claim: the lone-step default fallback is not limited to "
+        "unnamed steps as of v0.3.5 / upstream #112"
+    )
+
+    assert re.search(r"valueerror[^.]{0,200}available|available[^.]{0,200}valueerror", norm), (
+        "the multi-step-with-no-default-named-step failure mode "
+        "(ValueError listing available names) must stay documented"
+    )
+
+
+def test_stop_variant_default_asymmetry_is_documented(tmp_path: Path):
+    """Claim under protection: when the tier-3 lone-step `variant="default"`
+    fallback resolves a NAMED step, the engine records
+    `record.variants[role] = step.name`, not the literal string
+    `"default"` -- so a later `environment_stop(variant="default")` does
+    NOT resolve against that role. Both `environment_start`'s and
+    `environment_stop`'s docstrings must document this asymmetry
+    explicitly, not just describe the two tools' `variant` behaviour in
+    isolation from each other."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    for tool_name in ("environment_start", "environment_stop"):
+        doc = fns[tool_name].__doc__ or ""
+        norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+        found = False
+        for m in re.finditer(r"default", norm):
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 500]
+            if "variants" in window and re.search(
+                r"(will not|does not|won't|cannot|never)[^.]{0,120}resolv", window
+            ):
+                found = True
+                break
+        assert found, (
+            f"{tool_name}'s docstring must document that the lone-step "
+            "default fallback's recorded variant name breaks a later "
+            'environment_stop(variant="default") resolution'
+        )
+
+
 def _seed_record(
     mgr: WorktreeManager,
     *,
