@@ -48,6 +48,7 @@ from lib_python_worktree import (
     CONTRACT_FILENAME,
     CheckoutTargetError,
     ContractError,
+    DuplicateWorktreeError,
     EnvironmentEntry,
     InvalidRepoError,
     KilledProcessInfo,
@@ -64,6 +65,7 @@ from lib_python_worktree import (
     WorktreeNotFoundError,
     WorktreeRecord,
     WorktreeRemovalBlockedError,
+    classify_checkout,
     load as load_contract,
     primary_id_for,
 )
@@ -132,6 +134,33 @@ def _addressing_error_text(
         f"{tool_name} could not resolve environment_id/checkout_path to a "
         f"single target. {hint}"
     )
+
+
+def _invalid_path_error_text(exc: InvalidRepoError, *, param_name: str) -> str:
+    """Re-word the engine's ``InvalidRepoError`` into a wrapper-native
+    invalid-path message naming ``param_name`` (e.g. ``checkout_path``)
+    instead of the engine-internal ``repo_root`` (ticket #123).
+
+    Deliberate divergence from ``_addressing_error_text``'s allow-list
+    policy above. ``_addressing_error_text`` can safely special-case (and
+    drop) unknown ``CheckoutTargetError`` reason text because that
+    exception carries *structured* reason codes (``"missing"`` /
+    ``"id_mismatch"``) plus separate ``worktree_id``/``checkout_path``/
+    ``resolved_id`` attributes it can rebuild a full message from.
+    ``InvalidRepoError`` has no such structure -- its ``reason`` string
+    *is* the entire diagnostic (e.g. ``"not a git repository: ..."``,
+    ``"unexpected 'git rev-parse' output: ..."``), so dropping or
+    generically replacing it would weaken the error, which this ticket
+    forbids. Instead this performs a mechanical, ``\\b``-anchored token
+    substitution applied to *every* reason -- known or unknown/future --
+    which satisfies "do not weaken the error" by construction (no detail
+    is ever lost) and keeps working for engine reasons that don't exist
+    yet. The f-string otherwise mirrors the engine's own
+    ``InvalidRepoError.__init__`` construction byte-for-byte apart from
+    the substituted token.
+    """
+    reason = re.sub(r"\brepo_root\b", param_name, exc.reason)
+    return f"invalid {param_name} {exc.repo_root!r}: {reason}"
 
 
 def _ensure_contract_copy_ignored(contract_dir: Path) -> None:
@@ -314,6 +343,54 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
     }
 
 
+def _start_step_names(repo_root: str) -> Optional[List[str]]:
+    """Return the ``name:`` of every *named* ``start:`` step declared by the
+    contract at ``<repo_root>/.seretos/worktree-setup.yml`` (ticket #127),
+    so a caller of ``worktree_create`` can see up front which
+    ``environment_start(variant=...)`` values are valid, instead of only
+    discovering them from an ``UnknownVariantError`` on the first failed
+    call.
+
+    This is a byte-for-byte mirror of the engine's own ``available``
+    computation in ``UnknownVariantError`` (``[s.name for s in
+    contract.start if s.name]``) -- unnamed steps are deliberately excluded,
+    exactly as the engine excludes them from its own error message.
+
+    Sentinel semantics -- the two ``None``/``[]`` return values are NOT
+    interchangeable:
+
+    - ``None`` -- there is no contract file to read, or the contract exists
+      but could not be read/parsed (``OSError``/``ContractError``). Callers
+      cannot distinguish "no contract" from "unreadable contract" from this
+      return value alone (mirrors ``_contract_diagnostics``'s no-raise
+      posture) -- if that distinction matters, cross-reference
+      ``contract_found``/``no_op_reason`` from a prior ``environment_start``
+      call instead.
+    - ``[]`` -- the contract was read successfully but declares no *named*
+      ``start:`` steps. Covers ``isolation: none`` (which forbids ``start:``
+      entirely), an empty ``start:`` list, and a ``start:`` list whose
+      entries are all unnamed.
+
+    Note the explicit ``.exists()`` guard below is required: unlike this
+    helper, ``load_contract`` on a **missing** file returns an implicit
+    ``isolation: none`` contract rather than raising, which would otherwise
+    make a genuinely absent contract indistinguishable from a validly-read
+    one with nothing to offer -- collapsing the ``None``-vs-``[]``
+    distinction above.
+
+    Never raises: any ``OSError``/``ContractError`` degrades to ``None``,
+    mirroring ``_contract_diagnostics``'s never-raise posture.
+    """
+    contract_path = Path(repo_root) / CONTRACT_FILENAME
+    try:
+        if not contract_path.exists():
+            return None
+        contract = load_contract(contract_path)
+        return [s.name for s in contract.start if s.name]
+    except (OSError, ContractError):
+        return None
+
+
 def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     """Shape one ``EnvironmentEntry`` (from ``WorktreeManager.list_repo``)
     into the flat dict returned by ``environment_list``.
@@ -416,6 +493,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``warning`` (optional): present when ``repo_root`` was silently
           re-rooted to the actual git repository root (e.g. when a subdirectory
           was passed). The field contains the original and resolved paths.
+        - ``start_variants`` (always present, unlike ``warning``): the raw
+          list of *named* ``start:`` step names declared by the contract
+          (unnamed steps excluded), so an agent can see up front which
+          ``environment_start(variant=...)`` values are valid instead of
+          only discovering a mismatch from an ``UnknownVariantError`` on
+          the first failed call. ``None`` when there is no contract file to
+          read (or it exists but could not be read/parsed); an empty list
+          ``[]`` when the contract was read successfully but declares no
+          *named* ``start:`` steps (e.g. ``isolation: none``, an empty
+          ``start:`` list, or a ``start:`` list whose entries are all
+          unnamed) -- these two states are deliberately distinct and must
+          not be conflated. This is purely the contract's declared names,
+          **not** a prediction of which step a bare
+          ``variant="default"`` call to ``environment_start`` will
+          actually select -- see that tool's docstring for the three-tier
+          resolution rule.
 
         Contract file (``.seretos/worktree-setup.yml``)
         -------------------------------------------------
@@ -443,10 +536,49 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``<repo_root>/.seretos/`` into the new worktree checkout when it
         would not otherwise be tracked there (see below) -- but that copy is
         never what ``environment_start``/``environment_stop`` read; they
-        always read the ``repo_root`` original. The copy is marked ignored
+        always read the ``repo_root`` original. If you suspect the two have
+        drifted, which signal to check depends on whether ``repo_root``'s own
+        contract exists: if it is missing entirely while the checkout-local
+        copy is present, ``environment_start``'s response carries
+        ``no_op_reason: "contract-misplaced"``. If both exist but disagree,
+        ``no_op_reason`` stays ``None`` (the start proceeds normally against
+        ``repo_root``'s contract) -- check that response's
+        ``shadowed_contract`` field (``reason: "differs"``) instead; see
+        ``environment_start``'s docstring for its shape. The copy is marked ignored
         via a self-ignoring ``.gitignore`` written inside it, so it stays
         invisible to ``git status`` and the worktree remains removable with
         ``worktree_remove``'s default ``force=False`` (ticket #110).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        If this call dies with a transport error ("Connection closed",
+        "MCP error -32000"), you do NOT know whether it landed: the
+        worktree may exist and its record may be persisted even though no
+        response ever reached you. **Read back before retrying.** Call
+        ``environment_list(path=<the same repo_root>)`` and look for the
+        entry whose ``branch`` equals the ``branch`` you passed AND whose
+        ``tracked`` is ``true``. If it is there the create landed: that
+        entry's ``id`` is exactly what the lost response carried -- and
+        since the id's 8-hex suffix is random, read-back is the ONLY way
+        to recover it -- while ``setup_status`` reports how the contract's
+        ``setup:`` steps ended.
+
+        A blind retry is non-destructive: the duplicate-branch guard fires
+        before any worktree-creating git command runs -- only a read-only
+        ``git rev-parse`` (repo classification via ``_validate_repo()`` /
+        ``classify_checkout()``) has executed by that point -- so no second
+        worktree is ever created. It does report as a failure -- ``ValueError("A worktree
+        for branch '...' already exists in ...")`` -- but that message
+        also carries the landed environment's identity as machine-readable
+        tokens, ``(existing_environment_id: "<id>", existing_path:
+        "<path>")``, so a blind retry is self-diagnosing; parse those
+        tokens instead of treating the error as fatal. The tokens are
+        best-effort: when the existing record cannot be looked up, only
+        the engine's own text is raised and no id is invented.
+
+        Honest limit: this tells you the worktree exists and what the
+        persisted ``setup_status`` says; it cannot tell you whether a
+        setup step was interrupted mid-command.
         """
 
         try:
@@ -455,6 +587,36 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             raise ValueError(
                 f"Setup failed for worktree (left intact at path for inspection): {exc}"
             ) from exc
+        except DuplicateWorktreeError as exc:
+            # DuplicateWorktreeError subclasses WorktreeError, so this catch
+            # must come before the generic `except WorktreeError` tail below
+            # -- same MRO-ordering concern as CheckoutTargetError (#119),
+            # WorktreeRemovalBlockedError (#120) and InvalidRepoError (#123)
+            # in worktree_remove.
+            #
+            # Ticket #116: when a create's JSON-RPC response is lost to a
+            # transport drop ("Connection closed"), the caller loses the
+            # record's *random* 8-hex id suffix, which is not re-derivable
+            # from anything it holds. Naming the landed environment inline
+            # makes the blind retry self-diagnosing. Best-effort only: the
+            # lookup mirrors the engine's own key derivation
+            # (`_validate_repo` == classify_checkout(resolved path).repo_root),
+            # and any failure falls back to the engine's bare text -- an id
+            # is never invented.
+            existing = None
+            try:
+                resolved_root = classify_checkout(
+                    Path(repo_root).expanduser().resolve()
+                ).repo_root.as_posix()
+                existing = manager.state.find_by_branch(resolved_root, branch)
+            except Exception:  # noqa: BLE001 -- diagnostics must never re-fail
+                existing = None
+            if existing is not None:
+                raise ValueError(
+                    f'{exc} (existing_environment_id: "{existing.id}",'
+                    f' existing_path: "{existing.path}")'
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -484,6 +646,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             result["warning"] = (
                 f"repo_root was re-rooted from '{repo_root}' to '{record.repo_root}'"
             )
+
+        # Ticket #127: surface the contract's declared *named* start: steps
+        # up front, so a contract author naming their sole step something
+        # other than "default" discovers the available variant names here
+        # instead of only from an UnknownVariantError on the first
+        # environment_start call. Read from record.repo_root (never the
+        # caller's repo_root argument) -- the engine may have re-rooted it,
+        # per the warning block above.
+        result["start_variants"] = _start_step_names(record.repo_root)
 
         return result
 
@@ -529,6 +700,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         so this wrapper replaces it with a ``worktree_remove``-specific
         message naming ``environment_id`` and ``checkout_path`` instead.
 
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository (e.g. it doesn't exist, isn't a directory, or isn't a
+        git repo at all), resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing the
+        engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
+
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
         surface cannot satisfy the ticket's own AC1, and why ``checkout_path``
@@ -547,11 +726,28 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             When ``True``, removes the worktree even if it contains
             uncommitted changes. Defaults to ``False``.
         kill_blocking_processes:
-            When ``True``, attempts to terminate foreign processes whose
+            When ``True``, attempts to terminate **foreign** processes whose
             current working directory is inside the worktree directory before
             removal. This is an opt-in safety valve, primarily relevant on
             Windows where open handles prevent directory deletion. Defaults
             to ``False`` (no-op when nothing is blocking).
+
+            **Tracked vs. foreign.** Removal stops every process *tracked* in
+            the environment's ``pids`` (each role started via
+            ``environment_start``) as its first step, before any contract
+            ``stop:``/``teardown:`` steps and before any filesystem delete --
+            so a tracked process is normally already gone by the time the
+            directory lock is evaluated, and never needs this flag. The flag
+            exists for a genuinely foreign holder instead: an editor, a
+            shell sitting in the checkout, a build/indexing tool, or an
+            orphaned grandchild reparented away from the tracked shell
+            wrapper (none of which are ever in ``pids``). Two caveats: (1)
+            the tracked stop is best-effort, so a tracked process that
+            refuses to die degrades into exactly the same blocking condition
+            and *does* then need this flag; and (2) the underlying scan
+            filters only the host process and its OS-level ancestors -- it
+            has no tracked-pid allow-list, so the exclusion in the normal
+            case is a matter of ordering, not filtering.
 
         Returns the removed worktree record on success. The ``ports`` field is
         a dict mapping port name to host port number; empty dict ``{}`` for
@@ -595,6 +791,29 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         The raised message includes the engine's own text plus an explicit
         ``backing: "primary"`` token so callers can react programmatically
         without parsing prose.
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        Read back with ``environment_list(path=<the REPO ROOT>)`` -- never
+        with the removed checkout's own path. If the removal landed that
+        path is gone, and passing it back to any tool yields ``ValueError``
+        text of the form ``invalid checkout_path '<p>': checkout_path does
+        not exist: ...``, which is byte-for-byte what a simple typo
+        produces. That error is therefore NOT evidence that the removal
+        succeeded. From the repo root the reading is unambiguous:
+
+        - entry absent -> the removal landed; you are done.
+        - entry present with ``status: "orphaned"`` -> partially landed
+          (the directory is gone, the record survives). Finish it with
+          ``worktree_remove(environment_id=<that entry's id>)``.
+        - entry present and unchanged -> the removal did not land; retry.
+
+        A blind retry addressed by ``environment_id`` is self-diagnosing:
+        an already-removed target comes back as the soft ``{"error":
+        "...", "code": "not_found"}`` instead of raising. A blind retry
+        addressed by ``checkout_path`` is not -- it raises the misleading
+        "does not exist" text above. **Prefer ``environment_id`` for any
+        retry after a transport failure.**
         """
 
         try:
@@ -650,6 +869,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                     ),
                 )
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except WorktreeError` tail below --
+            # same MRO-ordering concern as CheckoutTargetError's catch above
+            # (ticket #119) and WorktreeRemovalBlockedError's (ticket #120).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)
@@ -738,6 +973,24 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         tracked repo whose on-disk clone has since vanished is skipped
         gracefully rather than failing the whole call -- only a bad ``path``
         argument raises.
+
+        **Retrying this call is always safe.** It never writes state, so a
+        transport-level failure ("Connection closed", "MCP error -32000")
+        can be retried unconditionally. That is precisely what makes it
+        the read-back tool for deciding whether a lost *mutating* call
+        landed -- see the "Transport-level failure" block in
+        ``worktree_create``, ``worktree_remove``, ``environment_start``
+        and ``environment_stop``.
+
+        **Fields this call never populates.** Each entry carries every
+        ``WorktreeRecord`` key, but three of them are transient by design
+        and are never persisted to ``state.yaml``: ``stop_attempt``,
+        ``killed_pids`` and ``shadowed_contract``. Because this call
+        rebuilds every entry from persisted state, those three are always
+        ``null``/``[]`` here regardless of what actually happened. They
+        are readable ONLY on the response of the call that produced them
+        (``environment_stop``, ``worktree_remove``,
+        ``environment_start``). Never use them as read-back evidence.
         """
         if scope not in ("repo", "all"):
             raise ValueError(
@@ -790,9 +1043,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         that copy is not what the engine reads.
 
         CAUTION: placing the contract only in a worktree checkout (and not at
-        ``<repo_root>/.seretos/worktree-setup.yml``) produces a silent
-        ``{"status": "ready", "pids": {}}`` no-op -- indistinguishable from "no
-        contract configured" -- with no error to indicate the misplacement.
+        ``<repo_root>/.seretos/worktree-setup.yml``) still produces a
+        ``{"status": "ready", "pids": {}}`` no-op -- but it is **not silent**
+        and **not** indistinguishable from "no contract configured": the same
+        response carries ``contract_found: false``, ``steps_run: 0``, and
+        ``no_op_reason: "contract-misplaced"`` (vs ``"no-contract"`` for the
+        genuinely-unconfigured case). Callers should branch on ``no_op_reason``
+        rather than inferring the cause from ``status``/``pids`` alone -- see
+        the "Contract diagnostics" block below for the full five-key set. The
+        engine may additionally set ``shadowed_contract`` on the response in
+        this case -- see the sixth diagnostic bullet below.
 
         Addressing the target
         ----------------------
@@ -825,23 +1085,54 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         so this wrapper replaces it with an ``environment_start``-specific
         message naming ``environment_id`` and ``checkout_path`` instead.
 
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository, resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing
+        the engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
+
         (Deliberate, documented deviation from ticket #99's originally
         id-only signature -- see this module's docstring for why an id-only
         surface cannot satisfy the ticket's own AC1, and why ``checkout_path``
         is a strict superset that keeps every existing id-only call working
         unchanged.)
 
+        All three addressing outcomes in one place: neither given raises
+        ``ValueError``; both given but disagreeing raises ``ValueError``; and
+        -- when the ``(environment_id, checkout_path)`` pair is well-formed
+        but resolves to nothing the engine knows about -- the *target* is
+        soft-not-found, returning ``{"error": "...", "code": "not_found"}``
+        rather than raising (see "If the target is not found" below for the
+        full contract). Not every addressing failure raises: only a
+        malformed pair does; an unresolvable-but-well-formed pair does not.
+
         Multiple named ``start:`` steps are supported; ``variant`` selects the
-        step by its ``name``. A single **unnamed** ``start:`` step is
-        implicitly the ``"default"`` variant, for back-compat, so
-        ``variant="default"`` (the parameter's own default) resolves to it
-        without needing a ``name:`` key at all. An unknown variant surfaces
-        as a ``ValueError`` listing the available names.
+        step by its ``name``. Resolving ``variant="default"`` (the
+        parameter's own default) works in three tiers, tried in order:
+
+        1. An exact ``name:`` match against ``variant``.
+        2. Exactly one **unnamed** ``start:`` step -- implicitly the
+           ``"default"`` variant, for back-compat.
+        3. Exactly one ``start:`` step overall -- **even if that single
+           step is named rather than unnamed** (upstream
+           lib-python-worktree #112, shipped in the pinned v0.3.5) -- so a
+           contract whose sole step carries a ``name:`` other than
+           ``"default"`` still resolves without the caller needing to pass
+           ``variant`` explicitly.
+
+        Two or more ``start:`` steps with none of them named ``"default"``
+        still raise ``ValueError`` even under tier 3 -- the lone-step
+        fallback only ever fires when the contract declares exactly one
+        step. An unknown variant surfaces as a ``ValueError`` listing the
+        available *named* steps (unnamed steps are never listed, since they
+        have no name to list).
 
         Step schema: each ``start:`` entry is a YAML mapping with a required
         ``run:`` key (the shell command to execute) and an optional ``name:``
-        key (used by ``variant`` to select that step). A single unnamed step
-        is the ``"default"`` variant, for back-compat.
+        key (used by ``variant`` to select that step). See the three-tier
+        resolution above for how a contract with only one ``start:`` step
+        total -- named or not -- is matched by ``variant="default"``.
 
         Contract file schema (``<repo_root>/.seretos/worktree-setup.yml``)
         ----------------------------------------------------------------
@@ -874,7 +1165,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           ``"main"`` **regardless of which** ``variant`` was requested --
           starting ``variant="worker"`` with no explicit ``role`` still
           records its pid under ``role="main"``, exactly like starting
-          ``variant="default"`` would.
+          ``variant="default"`` would. ``record.pids[role]`` and
+          ``record.variants[role]`` are both keyed by this **verbatim**
+          ``role`` string -- which is *not* how the start-log filename is
+          derived; see the ``start_log_path`` casing caveat below.
         - ``variant`` only selects *which* contract ``start:`` step is run
           (by its ``name``). It has no effect on where the resulting pid is
           filed.
@@ -888,6 +1182,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``record.variants[role]``, so a later ``environment_stop(variant=...)``
         call can address that role without the caller having to separately
         track which role it used -- see ``environment_stop``'s docstring.
+
+        **Asymmetry warning:** when tier 3 of the variant resolution above
+        (the lone-step fallback) resolves a *named* step from a bare
+        ``variant="default"`` call, the value recorded in
+        ``record.variants[role]`` is that step's own name (e.g.
+        ``"main"``) -- never the literal string ``"default"`` -- because
+        the engine records ``variant=step.name or variant``. A later
+        ``environment_stop(variant="default")`` will not resolve against
+        that role, since ``record.variants[role]`` is never ``"default"``
+        in that case. To stop it, either omit ``variant`` entirely
+        (``role`` alone defaults to ``"main"``) or pass the step's actual
+        name, e.g. ``environment_stop(variant="main")``.
 
         Parameters
         ----------
@@ -907,11 +1213,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             environment's checkout path is used by the underlying engine.
         variant:
             Selects which named ``start:`` step to run. Defaults to
-            ``"default"``, which resolves to the lone unnamed step for
-            back-compat. When multiple named steps exist, pass the step's
-            ``name`` here. An unknown variant raises ``ValueError`` listing
-            the available names. See "``role`` vs ``variant``" above for how
-            this relates to the ``role`` parameter.
+            ``"default"``, which resolves via the three-tier rule above: an
+            exact ``name:`` match; else the lone unnamed step, if there is
+            exactly one; else the lone step overall -- regardless of
+            whether it is named or unnamed -- if the contract declares
+            exactly one ``start:`` step total. Two or more steps with none
+            named ``"default"`` still raise ``ValueError`` listing the
+            available names. See "``role`` vs ``variant``" above for how
+            this relates to the ``role`` parameter, including the
+            asymmetry warning about ``environment_stop(variant="default")``
+            when the lone-step fallback resolves a named step.
         env:
             Optional dict of extra environment variables merged into the process
             environment by the engine. Omit (or pass ``None``) to inherit the
@@ -936,7 +1247,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``start_log_path``: filesystem path to the engine's captured
           startup log for the spawned process; useful for diagnosing a
           process that exits immediately. May be absent/``null`` on a no-op
-          ``"ready"`` start where nothing was spawned.
+          ``"ready"`` start where nothing was spawned. **Role-casing
+          caveat:** the filename is ``start-<slug(role)>.log``, where the
+          slug is the ``role`` **lower-cased**, with non-alphanumeric runs
+          collapsed to ``-`` and truncated to 40 characters -- unlike
+          ``pids``/``record.variants``, which key on the **verbatim**
+          ``role`` string. Example: ``role="API Server"`` files its pid
+          under ``pids["API Server"]`` but logs to
+          ``start-api-server.log``. Two roles differing only in case (e.g.
+          ``"API"`` and ``"api"``) become two distinct ``pids`` keys that
+          share one append-mode log file, interleaving their output. Never
+          derive the log path by slugging a ``pids``/``variants`` key
+          yourself -- always read ``start_log_path`` from the response.
+          Documented here, not fixed: this is an upstream engine defect,
+          tracked as ``Seretos/lib-python-worktree#111`` -- not to be
+          confused with this repository's own already-closed issue of the
+          same number, an unrelated thread-leak ticket.
 
         Contract diagnostics (ticket #103) -- five additive keys that make a
         real start distinguishable from every "nothing ran" flavour,
@@ -961,12 +1287,78 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           or ``"contract-unreadable"`` (the contract exists but could not be
           read/parsed).
 
+        The record additionally carries one diagnostic produced by the
+        **engine itself** (``lib-python-worktree``, upstream #100) rather
+        than re-derived by this tool; it is passed through verbatim from the
+        engine's ``WorktreeRecord``:
+
+        - ``shadowed_contract`` (dict or ``None``): non-``None`` when a
+          checkout-local ``.seretos/worktree-setup.yml`` exists that is
+          **not** the file the engine actually read. Shape: ``{"path": <the
+          shadowing checkout-local copy>, "used_path": <the repo_root
+          contract path compared against -- the file the engine read there
+          when one exists; when none exists, this is merely the path that
+          would hold it, standing in for the engine's implicit
+          ``isolation: none`` fallback contract, since nothing is literally
+          read from a missing file>, "reason": <"differs" | "unreadable">,
+          "message": <human-readable text naming both paths>}``.
+          ``"differs"`` means the checkout copy parsed to something other
+          than what was used; ``"unreadable"`` means it exists but could not
+          be read/parsed. It is **transient**: computed fresh on every
+          ``environment_start`` call and never persisted to ``state.yaml``.
+          It is ``None`` for a primary checkout, ``None`` when the checkout
+          *is* ``repo_root``, and ``None`` for the byte-identical
+          convenience copy ``worktree_create`` writes -- so a non-``None``
+          value always means a genuine divergence.
+
+          This is complementary to, not redundant with, ``no_op_reason``: it
+          fires whenever the contract actually used for comparison -- a real
+          ``repo_root`` file, or, when none exists, the engine's implicit
+          ``isolation: none`` fallback -- differs from a non-trivial
+          checkout-local copy. That includes the case where a repo-root
+          contract exists and starts *normally* while the checkout-local
+          copy was separately edited to differ (``no_op_reason`` is
+          ``null`` there, and the five wrapper-derived keys above see
+          nothing wrong) -- but it fires just as readily alongside a
+          non-``null`` ``no_op_reason``, notably ``"contract-misplaced"``:
+          no file exists at ``repo_root``, the implicit fallback contract is
+          what gets compared, and a checkout-local copy that diverges from
+          that fallback still shadows it.
+
         If the target is not found, returns ``{"error": "...", "code":
         "not_found"}`` instead of raising, so callers can treat not-found as
         a soft/idempotent condition, and can branch on ``code`` rather than
         parsing the error text. The message names whichever target
         identifier was supplied (``environment_id`` if given, else
         ``checkout_path``).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        A transport error tells you nothing about whether the start
+        landed. Read back with ``environment_list(path=<checkout path or
+        repo root>)`` and inspect the entry's ``pids``.
+
+        The unambiguous case first: if your ``role`` (default ``"main"``)
+        is a key in ``pids``, the start landed AND the process is still
+        alive -- ``variants[<role>]`` names the variant that was selected,
+        and there is nothing further to do.
+
+        If the role is absent the reading is ambiguous: either the start
+        never happened, or it happened and the process has since exited
+        (this listing reconciles dead pids away, so the two look
+        identical). A heuristic can sometimes break the tie, but only for
+        a role that was never started before -- for such a role a
+        non-``null`` ``returncode``/``start_log_path`` proves a spawn
+        occurred, whereas for a role that HAS been started at some earlier
+        point both fields are leftovers from that earlier run, are not
+        cleared by reconciliation, and therefore decide nothing at all; in
+        that case the only reliable evidence is the content and mtime of
+        the file at ``start_log_path``.
+
+        A blind retry is protected by ``{"error": "...", "code":
+        "already_running"}`` only while the previously started pid is
+        ALIVE. A start that landed and whose process then exited is not
+        protected: the blind retry starts a second process.
         """
 
         try:
@@ -999,6 +1391,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                     ),
                 )
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except (WorktreeError,
+            # ProcessLifecycleError)` tail below -- same MRO-ordering
+            # concern as CheckoutTargetError's catch above (ticket #119).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
@@ -1031,11 +1439,34 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         with an ``environment_stop``-specific message naming
         ``environment_id`` and ``checkout_path`` instead.
 
+        Similarly, when ``checkout_path`` is given but isn't a usable git
+        repository, resolution raises the engine's ``InvalidRepoError``
+        (ticket #123). This wrapper re-words that message too, replacing
+        the engine-internal ``repo_root`` parameter name -- which this tool
+        doesn't have -- with ``checkout_path``, while preserving every byte
+        of the underlying diagnostic reason.
+
         Unlike ``environment_start``, stopping never materialises a primary
         record: an unstarted primary has nothing to stop, so it returns the
         same soft not-found dict (``{"error": "...", "code": "not_found"}``
         -- see "If the target is not found" below) as an unknown
         ``environment_id`` rather than creating a record just to stop it.
+
+        A *linked* worktree differs: ``worktree_create`` already persisted
+        its record, so stopping a role that was never started there is not a
+        not-found condition. The engine takes its graceful no-op path
+        instead -- any contract ``stop:`` steps still run best-effort and no
+        signal is sent -- and this tool returns a normal environment record
+        whose ``stop_attempt`` is always ``{"outcome": "no_process_recorded",
+        ...}``, but whose ``status`` depends on what else is tracked:
+        ``"stopped"`` only if popping this role leaves ``pids`` empty *and*
+        the record wasn't already ``"stop_incomplete"``/``"orphaned"`` (those
+        two are sticky and are never overwritten back to ``"stopped"`` by
+        this no-op path); otherwise ``status`` is left unchanged -- e.g.
+        still ``"running"`` when another role's process is still tracked.
+        Only the *primary* (no record until its first ``environment_start``)
+        and a genuinely unknown ``environment_id``/``checkout_path`` yield
+        the soft not-found dict.
 
         ``role`` vs ``variant``
         -----------------------
@@ -1054,6 +1485,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           stopped.
         - Both given: they must agree -- ``variant`` must resolve to exactly
           the role named by ``role``, or a ``ValueError`` is raised.
+
+        **Asymmetry warning:** ``environment_start``'s three-tier
+        ``variant="default"`` resolution includes a lone-step fallback that
+        can fire for a *named* step (see ``environment_start``'s "``role``
+        vs ``variant``" section). When it does, ``record.variants[role]``
+        stores that step's own name -- never the literal string
+        ``"default"``. As a result, calling
+        ``environment_stop(variant="default")`` afterwards **will not
+        resolve** against that role: ``record.variants`` never contains
+        ``"default"`` in that case. Use ``role="main"`` (the default) or
+        pass the step's actual name as ``variant`` instead.
 
         Resolution can fail three ways, all surfaced as ``ValueError`` (never
         a soft error dict): the variant matches no currently-running role
@@ -1120,12 +1562,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         under the given ``role``, this tool returns a soft error dict
         ``{"error": "...", "code": "not_running"}`` rather than raising, so
         callers can treat the already-stopped case gracefully and branch on
-        ``code`` rather than parsing the error text.
+        ``code`` rather than parsing the error text. ``code: "not_running"``
+        maps the engine's ``ProcessNotRunningError``; it is *not* what a
+        tracked-but-never-started role on a linked worktree returns -- that
+        case takes the graceful no-op path described above
+        (``stop_attempt.outcome: "no_process_recorded"`` always;
+        ``status: "stopped"`` only when no other role is still tracked in
+        ``pids``), not this one.
 
         On success returns the canonical environment record dict. Fields of
         note:
 
-        - ``status``: ``"stopped"`` after the process has been terminated.
+        - ``status``: ``"stopped"`` after the process has been terminated (see
+          the tracked-but-never-started no-op case above for when a linked
+          worktree's ``status`` does not unconditionally end up ``"stopped"``).
         - ``backing``: ``"primary"`` for the main clone, ``"worktree"`` for a
           linked worktree.
         - ``pids``: a dict mapping role name to PID; the stopped role's entry
@@ -1139,6 +1589,38 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         parsing the error text. The message names whichever target
         identifier was supplied (``environment_id`` if given, else
         ``checkout_path``).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        Read back with ``environment_list(path=<checkout path or repo
+        root>)`` and inspect ``pids``: your ``role`` absent means no live
+        tracked process remains under it (the stop landed, or the process
+        was already gone); the role still present means the stop did not
+        land.
+
+        Honest limits: the listing cannot tell you whether the contract's
+        ``stop:`` steps ran. The persisted ``stop_detail`` (and a sticky
+        ``status: "stop_incomplete"``) is the only stop diagnostic that
+        survives into ``environment_list``; the richer ``stop_attempt``
+        exists ONLY on this call's own response and is never readable from
+        the listing -- so it can never serve as read-back evidence.
+
+        A blind retry that *returns* is safe: it comes back as one of three
+        soft outcomes -- ``{"error": "...", "code": "not_found"}`` (mapping
+        ``WorktreeNotFoundError``), ``{"error": "...", "code":
+        "not_running"}`` (mapping ``ProcessNotRunningError``), or a
+        graceful no-op reported as ``stop_attempt.outcome:
+        "no_process_recorded"``. But those three are not the only possible
+        outcomes -- this is not an exhaustive disjunction. The same call can
+        instead **raise ``ValueError``**
+        when the target itself fails to resolve: an invalid
+        ``checkout_path`` (``InvalidRepoError``, ticket #123), a missing or
+        mutually-disagreeing ``environment_id``/``checkout_path`` pair
+        (``CheckoutTargetError``), or a ``variant`` that fails to resolve to
+        a role (``VariantResolutionError`` -- see "``role`` vs ``variant``"
+        above for its three failure modes). Branching on ``code`` is only
+        meaningful for a call that *returned*; a raise is a separate path
+        the caller must handle independently, not a third value of ``code``.
         """
 
         try:
@@ -1182,6 +1664,23 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 f"{exc} (hint: pass role=<role> explicitly, or see "
                 f"environment_start's role-vs-variant docs)"
             ) from exc
+        except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError, so this catch must
+            # come before the generic `except (WorktreeError,
+            # ProcessLifecycleError)` tail below -- same MRO-ordering
+            # concern as CheckoutTargetError's and VariantResolutionError's
+            # catches above (tickets #119 / this module's own precedent).
+            # Ticket #123: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `checkout_path` only when the rejected path is the one
+            # this wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path is
+            # never mislabelled.
+            if checkout_path is not None and exc.repo_root == checkout_path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="checkout_path")
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
         return _record_to_dict(record)

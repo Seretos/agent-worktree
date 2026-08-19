@@ -18,6 +18,8 @@ PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
+README_MD = REPO_ROOT / "README.md"
+SPEC_FILE = REPO_ROOT / "worktree.spec"
 
 
 def _read_frontmatter_and_body(text: str) -> tuple[dict, str]:
@@ -250,3 +252,487 @@ def test_docs_document_setup_status_derived_from_setup_outcome():
                 f"{path.name} still contains the stale setup_status claim: "
                 f"{stale!r}"
             )
+
+
+# ---- Ticket #127 ----
+
+
+def _normalize(text: str) -> str:
+    """Strip Markdown emphasis/code markup and collapse whitespace, so
+    prose assertions match semantic tokens via regex alternation rather
+    than depending on exact wording/formatting surviving a future edit."""
+    stripped = text.replace("``", "").replace("`", "").replace("**", "")
+    return re.sub(r"\s+", " ", stripped).lower()
+
+
+def test_docs_document_lone_start_step_default_variant_fallback():
+    """Claims under protection:
+
+    1. AGENTS.md and SKILL.md must teach the corrected v0.3.5 / upstream
+       lib-python-worktree#112 semantics -- the `variant="default"`
+       lone-step fallback fires for a single `start:` step regardless of
+       whether it is named or unnamed, not only for a lone *unnamed* step
+       (the stale claim both docs previously carried).
+    2. Both docs must also document the `environment_stop(variant=
+       "default")` asymmetry: when the fallback resolves a NAMED step,
+       `record.variants[role]` stores that step's own name, never the
+       literal `"default"`, so a later `environment_stop(variant=
+       "default")` will not resolve.
+    3. SKILL.md's `## Pitfalls` section specifically (not just its earlier
+       contract prose) must gain an entry: a multi-step contract with no
+       step named `default` makes the *first* `environment_start` call
+       fail unless `variant=` is passed explicitly.
+    """
+    fallback_pattern = re.compile(
+        r"\b(single|lone|exactly one)\b[^.]{0,160}"
+        r"\b(regardless|even if|whether it is named|named or unnamed)\b"
+    )
+    asymmetry_pattern = re.compile(
+        r"\b(will not|does not|won't|cannot|never)\b[^.]{0,120}resolv"
+    )
+    stale_claims = {
+        AGENTS_MD: "resolves to the lone unnamed step for back-compat",
+        SKILL_MD: "a single unnamed step is the implicit",
+    }
+
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        assert fallback_pattern.search(norm), (
+            f"{path.name} must document that the default variant fallback "
+            "covers a lone NAMED step too, not only a lone unnamed one"
+        )
+        stale = stale_claims[path]
+        assert stale not in norm, (
+            f"{path.name} still contains the stale claim: {stale!r}"
+        )
+
+        found_asymmetry = False
+        for m in re.finditer(r"default", norm):
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 500]
+            if "variants" in window and asymmetry_pattern.search(window):
+                found_asymmetry = True
+                break
+        assert found_asymmetry, (
+            f'{path.name} must document that environment_stop(variant='
+            '"default") does not resolve when the lone-step fallback '
+            "resolved a named step"
+        )
+
+    skill_text = SKILL_MD.read_text(encoding="utf-8")
+    pitfalls_idx = skill_text.find("## Pitfalls")
+    assert pitfalls_idx != -1, "SKILL.md must have a '## Pitfalls' heading"
+    pitfalls_section = _normalize(skill_text[pitfalls_idx:])
+    assert "default" in pitfalls_section and "variant=" in pitfalls_section, (
+        "SKILL.md's Pitfalls section must gain an entry about a multi-step "
+        "contract with no step named default failing the first "
+        "environment_start call unless variant= is passed"
+    )
+
+
+# ---- Ticket #130: docstring / SKILL / README sweep ----
+#
+# Four re-sliced findings originally filed as #124 (misplaced-contract
+# CAUTION is a silent no-op), #125 (environment_stop primary-vs-linked /
+# environment_start's three addressing outcomes), #126 (kill_blocking_
+# processes tracked vs foreign), #128 (start_log_path role-casing
+# mismatch). This file covers the Markdown-doc side (SKILL.md/AGENTS.md/
+# README.md) plus the shadowed_contract cross-file claim; docstring-only
+# claims live in tests/test_environment_tools.py and
+# tests/test_worktree_tools.py.
+
+
+def test_docs_no_longer_claim_misplaced_contract_is_silent():
+    """Claim under protection (ticket #130, re-slicing #124): SKILL.md's
+    "Critical:" contract block and its Pitfalls section must both describe
+    the misplaced-contract case as diagnosable (no_op_reason:
+    "contract-misplaced"), not silent/indistinguishable-from-unconfigured."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    norm = _normalize(text)
+
+    assert "no_op_reason" in norm
+    assert "contract-misplaced" in norm
+    assert "with no error" not in norm
+
+    found_silent_far_from_diagnosis = False
+    for m in re.finditer(r"(?<!not )\bsilent\b", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 300) : idx + 300]
+        if "contract-misplaced" in window or "misplacement" in window:
+            found_silent_far_from_diagnosis = True
+    assert not found_silent_far_from_diagnosis, (
+        "SKILL.md must not describe the misplaced-contract case as "
+        "(unqualified) 'silent' near its diagnosis -- it is diagnosable "
+        "via no_op_reason; 'not silent' is fine"
+    )
+
+
+def test_docs_document_engine_shadowed_contract_diagnostic():
+    """Claim under protection (ticket #130, requirement 1b): worktree.py,
+    SKILL.md, and AGENTS.md must each document the engine-owned
+    shadowed_contract diagnostic (lib-python-worktree, upstream #100),
+    including both reason values and its non-persistence, and must
+    attribute it to the engine layer rather than to this wrapper's own
+    ticket-#103 diagnostics."""
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"shadowed_contract", norm))
+        assert occurrences, f"{path.name} must document shadowed_contract"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 900) : idx + 900]
+
+            if "used_path" not in window:
+                continue
+            if "differs" not in window:
+                continue
+            if "unreadable" not in window:
+                continue
+            if "lib-python-worktree" not in window and "engine" not in window:
+                continue
+            if path in (WORKTREE_PY, SKILL_MD) and not (
+                "state.yaml" in window
+                or "not persisted" in window
+                or "transient" in window
+            ):
+                continue
+            found = True
+            break
+
+        assert found, (
+            f"{path.name} must have at least one shadowed_contract mention "
+            "whose surrounding window documents used_path, both reason "
+            "values (differs/unreadable), engine attribution, and (for "
+            "worktree.py/SKILL.md) non-persistence to state.yaml"
+        )
+
+
+# Matches the standalone word "tracked", but not as the tail of "untracked"
+# (e.g. "uncommitted/untracked changes") -- a negative lookbehind excludes
+# the "un" prefix so an unrelated "untracked" mention can't satisfy this.
+_TRACKED_WORD_RE = re.compile(r"(?<!un)tracked\b")
+
+
+def test_docs_document_tracked_vs_foreign_blocking_processes():
+    """Claim under protection (ticket #130, re-slicing #126): SKILL.md,
+    AGENTS.md, and README.md must each document that kill_blocking_processes
+    is for foreign holders, not a process started via environment_start,
+    which removal stops first as a tracked role."""
+    for path in (SKILL_MD, AGENTS_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"kill_blocking_processes", norm))
+        assert occurrences, f"{path.name} must mention kill_blocking_processes"
+
+        # A coincidental, unrelated "tracked" mention (e.g. an "environment_list"
+        # entry's "tracked: false" field, discussed several paragraphs away in
+        # an orphan-worktree recipe) can fall inside a generously-sized window
+        # without actually being part of the same sentence/paragraph explaining
+        # the tracked-vs-foreign distinction. Requiring the standalone "tracked"
+        # word and "environment_start" to additionally sit close to each other
+        # (same sentence/paragraph, not just the same wide window) rules that
+        # out.
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window_start = max(0, idx - 1200)
+            window = norm[window_start : idx + 1200]
+            tracked_positions = [
+                mm.start() + window_start for mm in _TRACKED_WORD_RE.finditer(window)
+            ]
+            start_positions = [
+                mm.start() + window_start
+                for mm in re.finditer(r"environment_start", window)
+            ]
+            if any(
+                abs(t - s) <= 400 for t in tracked_positions for s in start_positions
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one kill_blocking_processes "
+            "mention whose surrounding window documents the tracked-vs-"
+            "foreign distinction (the standalone word 'tracked', not merely "
+            "'untracked') and references environment_start"
+        )
+
+
+def test_docs_document_start_log_path_role_casing():
+    """Claim under protection (ticket #130, re-slicing #128): SKILL.md and
+    AGENTS.md must document that start_log_path's filename is a lower-cased
+    slug of role while pids/record.variants key on role verbatim, citing
+    the fully-qualified upstream defect."""
+    for path in (SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"start_log_path", norm))
+        assert occurrences, f"{path.name} must mention start_log_path"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 900]
+            if (
+                "seretos/lib-python-worktree#111" in window
+                and ("lower" in window or "slug" in window)
+                and "pids" in window
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one start_log_path mention "
+            "whose surrounding window fully-qualifies the upstream #111 "
+            "reference, names the lower-case/slug behaviour, and mentions "
+            "pids"
+        )
+
+
+def test_upstream_issue_111_reference_is_fully_qualified():
+    """Guard (ticket #130): every occurrence of '#111' in the four edited
+    doc/docstring files must be immediately preceded by
+    'Seretos/lib-python-worktree', so it is never confused with this repo's
+    own closed #111 (a thread-leak ticket cited by
+    tests/test_thread_leak_regression.py, deliberately excluded here)."""
+    bare_111 = re.compile(r"(?<!Seretos/lib-python-worktree)#111")
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+        match = bare_111.search(text)
+        assert match is None, (
+            f"{path.name} contains a bare '#111' not qualified with "
+            f"'Seretos/lib-python-worktree' near: "
+            f"{text[max(0, match.start() - 40) if match else 0:(match.end() + 40) if match else 0]!r}"
+        )
+
+
+# ---- Ticket #116: transport-level "Connection closed" read-back docs ----
+
+
+def test_transport_failure_readback_documented_in_markdown():
+    """Claim under protection (ticket #116): SKILL.md and README.md must
+    each document the "Connection closed" transport-drop read-back recipe --
+    mentioning environment_list as the read-back tool, the
+    existing_environment_id token a lost worktree_create retry surfaces, and
+    that retrying by environment_id (not checkout_path) is the safe way to
+    retry a worktree_remove. AGENTS.md must additionally state, using a
+    unique case-sensitive token, that the first-environment_start
+    sub-symptom is NOT explained by #112's SIGBREAK fix.
+
+    RED (pre-fix): none of these tokens/mentions exist in any of the three
+    docs yet -- 'Connection closed' appears nowhere outside AGENTS.md's
+    pre-existing #112 signal-handling paragraph."""
+    for path in (SKILL_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+        assert "Connection closed" in text, (
+            f"{path.name} must mention the literal transport-drop error "
+            f"text 'Connection closed'"
+        )
+        assert "environment_list" in text
+        assert "existing_environment_id" in text
+
+        norm = _normalize(text)
+        assert re.search(r"environment_id", norm) and re.search(
+            r"not.{0,40}checkout_path|checkout_path.{0,40}not", norm
+        ), (
+            f"{path.name} must state that retrying worktree_remove is safer "
+            f"by environment_id than by checkout_path"
+        )
+
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    assert "Connection closed" in agents_text
+    assert "environment_list" in agents_text
+    assert "NOT explained by #112" in agents_text, (
+        "AGENTS.md must state, using the exact case-sensitive token "
+        "'NOT explained by #112', that the first-environment_start "
+        "sub-symptom is not accounted for by the #112 SIGBREAK fix"
+    )
+    assert agents_text.count("NOT explained by #112") == 1, (
+        "the 'NOT explained by #112' token must be unique in AGENTS.md"
+    )
+
+
+def test_pyinstaller_lead_is_labelled_unverified_and_contained():
+    """Claim under protection (ticket #116): the PyInstaller
+    bootloader_ignore_signals lead must be recorded in AGENTS.md as an
+    explicitly-labelled UNVERIFIED lead (never acted on), must state that
+    the pytest suite cannot verify it, must NOT appear in README.md or
+    SKILL.md, and worktree.spec must still carry the literal
+    'bootloader_ignore_signals=False' unchanged -- pinning that the lead was
+    recorded and NOT acted on.
+
+    A proximity window (not the exact heading string) is asserted around
+    the token, so a harmless rewording of the heading doesn't break this
+    test -- but dropping the 'unverified' labelling, or the
+    cannot-be-verified-by-tests caveat, does."""
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    norm = _normalize(agents_text)
+
+    match = re.search(r"bootloader_ignore_signals", norm)
+    assert match, "AGENTS.md must mention bootloader_ignore_signals"
+
+    window = norm[max(0, match.start() - 400) : match.start() + 400]
+    assert "unverified" in window, (
+        "AGENTS.md's bootloader_ignore_signals passage must be labelled "
+        "'unverified' within 400 chars"
+    )
+
+    full_window = norm[max(0, match.start() - 400) : match.start() + 2000]
+    assert re.search(
+        r"cannot.{0,40}(be )?verif|test suite cannot verify", full_window
+    ), (
+        "AGENTS.md's bootloader_ignore_signals passage must state that the "
+        "pytest suite cannot verify this lead"
+    )
+
+    for path in (README_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        assert "bootloader_ignore_signals" not in text, (
+            f"{path.name} must not mention bootloader_ignore_signals -- the "
+            f"lead is deliberately contained to AGENTS.md only"
+        )
+
+    spec_text = SPEC_FILE.read_text(encoding="utf-8")
+    assert "bootloader_ignore_signals=False" in spec_text, (
+        "worktree.spec must still contain the literal "
+        "'bootloader_ignore_signals=False' -- the lead was recorded, not "
+        "acted on, so this flag must stay unchanged"
+    )
+
+
+def test_build_provenance_archaeology_recorded_as_unreleased():
+    """Claim under protection (correction 2, follow-up on ticket #116):
+    AGENTS.md must record which build the #116 sweep actually ran against
+    (v0.1.16 / commit 00adeab6cfd3) AND must not let that turn into a claim
+    that #116 itself is fixed/resolved -- the #112 fix that would be
+    relevant to #116's symptom has never shipped in a released build.
+
+    Requires BOTH a build-identity cue (v0.1.16 or the pinned commit hash)
+    AND an unreleased/unverified qualifier to appear together, so a future
+    edit that keeps the build identity but drops the "not fixed" caveat --
+    or vice versa -- fails this test. Also forbids an outright
+    "#116 is fixed/resolved" claim anywhere in the file, and keeps the
+    archaeology contained to AGENTS.md (not user-facing README.md/SKILL.md),
+    mirroring the PyInstaller unverified-leads containment test above.
+    """
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    norm = _normalize(agents_text)
+
+    build_cue = re.compile(r"00adeab6cfd3|v0\.1\.16")
+    match = build_cue.search(norm)
+    assert match, (
+        "AGENTS.md must name the actual installed build (v0.1.16 / "
+        "00adeab6cfd3) that the #116 sweep ran against"
+    )
+
+    window = norm[max(0, match.start() - 800) : match.start() + 2000]
+    assert re.search(r"\bunreleased\b|\bunverified\b", window), (
+        "AGENTS.md's build-provenance passage must state that the #112 fix "
+        "is unreleased/unverified in the field -- it must not silently "
+        "imply the fix shipped"
+    )
+
+    # A bare "#116 ... fixed/resolved" claim is forbidden UNLESS it is
+    # itself negated nearby (e.g. "does not mean #116 is fixed or
+    # resolved") -- the correct text asserts the negation, so a plain
+    # substring/regex ban would flag its own correct wording as a
+    # violation. Require an explicit negation cue in the 40 chars
+    # preceding any such match instead of banning the phrase outright.
+    forbidden = re.compile(
+        r"#116.{0,60}\b(is|was)\s+(now\s+)?(fixed|resolved)\b"
+        r"|\b(fixed|resolved)\b.{0,60}#116"
+    )
+    negation_cue = re.compile(r"\bnot\b|\bnever\b|\bn't\b|does not")
+    for m in forbidden.finditer(norm):
+        preceding = norm[max(0, m.start() - 40) : m.start()]
+        assert negation_cue.search(preceding), (
+            "AGENTS.md must not describe #116 as fixed/resolved without an "
+            "explicit negation nearby -- the #112 fix has never shipped in "
+            f"a released build: found {norm[max(0, m.start() - 60): m.end() + 20]!r}"
+        )
+
+    for path in (README_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        assert "00adeab6cfd3" not in text and "df0d8eb" not in text, (
+            f"{path.name} must not carry the #116 build-archaeology detail "
+            f"-- it is repo archaeology, contained to AGENTS.md only"
+        )
+
+
+# ---- Ticket #116 fix cycle (review round 2): best-effort caveat + ----
+# ---- environment_stop exhaustiveness one-sidedness -------------------
+
+
+def test_docs_state_existing_id_tokens_are_best_effort():
+    """Claim under protection (review finding 1, ticket #116): README.md,
+    SKILL.md, and AGENTS.md all state the worktree_create duplicate-retry
+    token-naming (existing_environment_id / existing_path) as if it always
+    happens. But the handler in worktree.py is explicitly best-effort: when
+    the record lookup misses or raises, it falls back to the engine's bare
+    message with no tokens at all -- see
+    test_duplicate_create_lookup_miss_falls_back_to_bare_message and
+    test_duplicate_create_lookup_raise_falls_back_to_bare_message in
+    tests/test_transport_failure_readback.py. Each summary doc must carry a
+    best-effort/fallback cue near its existing_environment_id mention so a
+    caller is never told to unconditionally expect a token that may be
+    absent."""
+    for path in (README_MD, SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"existing_environment_id", norm))
+        assert occurrences, f"{path.name} must mention existing_environment_id"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 400) : idx + 400]
+            if re.search(r"best.effort", window):
+                found = True
+                break
+        assert found, (
+            f"{path.name} must have at least one existing_environment_id "
+            f"mention whose surrounding window carries a best-effort/"
+            f"fallback cue -- the token-naming is not unconditional"
+        )
+
+
+def test_skill_environment_stop_recipe_documents_raise_path():
+    """Claim under protection (review finding 2, ticket #116): SKILL.md's
+    environment_stop recipe (item 4) used to read, in substance, as an
+    exhaustive disjunction -- 'a blind retry is safe: code: not_running, or
+    a graceful no-op' -- directly contradicting the environment_stop
+    docstring in worktree.py, which was already corrected this round to
+    document a third, RAISING path: CheckoutTargetError,
+    VariantResolutionError, InvalidRepoError, and the generic
+    (WorktreeError, ProcessLifecycleError) tail all raise ValueError rather
+    than return a soft dict. SKILL.md's recipe must name that raising path
+    too, mirroring the docstring's own corrected assertion (see
+    test_environment_stop_transport_block_documents_the_raise_path in
+    tests/test_transport_failure_readback.py)."""
+    text = SKILL_MD.read_text(encoding="utf-8")
+    norm = _normalize(text)
+
+    idx = norm.find("4. environment_stop")
+    assert idx != -1, "SKILL.md must have an environment_stop recipe item (4.)"
+    end_idx = norm.find("fields that can never serve", idx)
+    window = norm[idx : end_idx if end_idx != -1 else idx + 1200]
+
+    assert re.search(r"\bvalueerror\b", window), (
+        "SKILL.md's environment_stop recipe must name ValueError as a "
+        "possible outcome of a blind retry, not only the soft `code` "
+        "outcomes"
+    )
+    assert re.search(r"\braises?\b", window), (
+        "SKILL.md's environment_stop recipe must state that a blind retry "
+        "can RAISE, not only return a soft code -- branching on `code` is "
+        "only meaningful for a call that returned"
+    )

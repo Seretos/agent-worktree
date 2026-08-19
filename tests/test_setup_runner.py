@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from lib_python_worktree.setup.runner import (
     SetupFailedError,
     SetupRunner,
     _PlainStep,
+    _build_step_command,
     _resolve_shell,
     log_dir_for,
 )
@@ -157,7 +159,12 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
 
 
 def test_shell_override_pwsh(monkeypatch):
-    assert _resolve_shell("pwsh") == ["pwsh", "-NoProfile", "-Command"]
+    assert _resolve_shell("pwsh") == [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+    ]
 
 
 def test_shell_override_bash():
@@ -172,6 +179,7 @@ def test_shell_override_powershell():
     assert _resolve_shell("powershell") == [
         "powershell.exe",
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
     ]
 
@@ -186,6 +194,38 @@ def test_shell_auto_detect_uses_platform_default(monkeypatch):
     assert _resolve_shell(None)[0] == "powershell.exe"
     monkeypatch.setattr(sys, "platform", "linux")
     assert _resolve_shell(None) == ["bash", "-c"]
+
+
+def test_step_command_argv_shape_per_platform(monkeypatch):
+    """Ticket #137 drift guard: assert the *full* argv literal
+    `_build_step_command(_resolve_shell(None), ...)` produces for both the
+    win32 and non-win32 shapes.
+
+    Pinning `sys.platform` here (unlike in
+    test_environment_tools.py::test_environment_start_contract_variant_and_env_injection_unchanged
+    and test_worktree_tools.py::test_tool_environment_start_variant_selects_correct_step)
+    is safe: this seam is `_resolve_shell`/`_build_step_command` directly,
+    which never reaches `core/_env_utils.py::_get_user_profile_env` and its
+    Windows-only `import winreg` -- so pinning to "win32" cannot break this
+    test on the ubuntu-22.04 CI leg the way it broke those two. This test
+    keeps both the win32 and linux argv shapes drift-guarded on both CI
+    legs, strictly more #109 coverage than the pre-#137 state.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    win32_shell = _resolve_shell(None)
+    win32_cmd = _build_step_command(win32_shell, "start-worker.sh")
+    assert win32_cmd == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        base64.b64encode("start-worker.sh".encode("utf-16-le")).decode("ascii"),
+    ]
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    linux_shell = _resolve_shell(None)
+    linux_cmd = _build_step_command(linux_shell, "start-worker.sh")
+    assert linux_cmd == ["bash", "-c", "start-worker.sh"]
 
 
 def test_shell_override_used_for_step(tmp_path: Path):

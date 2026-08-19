@@ -103,6 +103,8 @@ State is persistent and disk-backed (`~/.agent-worktree/state.yaml`), reconciled
 
 On Windows, processes whose working directory is set to a path inside the worktree can prevent directory deletion. Pass `kill_blocking_processes=True` to `worktree_remove` to have the tool automatically terminate those foreign processes before removal:
 
+A tracked process started via `environment_start` is stopped by `worktree_remove` itself before deletion and normally does not need this flag; it is for genuinely foreign holders instead — an editor, a shell whose cwd is in the checkout, a build tool. That tracked stop is best-effort, though: a tracked process that refuses to die degrades into the same blocking condition and *does* then need this flag.
+
 ```
 worktree_remove(<id>, kill_blocking_processes=True)
 ```
@@ -110,6 +112,19 @@ worktree_remove(<id>, kill_blocking_processes=True)
 The response's `killed_pids` field lists every process that was terminated (pid, name, cmdline). If the directory is still locked after the kill attempt, the tool raises an error — you can then resolve the remaining lock at the OS level and retry.
 
 **Compound blocking (ticket #120).** If the directory lock and uncommitted/untracked changes are BOTH blocking removal at once, the raised error names every blocking condition and the flag needed to clear each in one message — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)`. Retry once with both flags set instead of discovering each condition across separate failed attempts.
+
+**Transport failure ("Connection closed"): confirm before retrying (ticket #116)**
+
+If a call dies with `Connection closed` / `MCP error -32000`, the response was lost — but the operation may have landed. Do not blind-retry a mutating call. Read back with `environment_list(path=<repo root>)` first; that call never writes state, so retrying *it* is always safe.
+
+| Lost call | Landed if `environment_list` shows |
+| --- | --- |
+| `worktree_create` | an entry with your `branch` and `tracked: true` — its `id` is the id the lost response carried (the 8-hex suffix is random and not re-derivable) |
+| `worktree_remove` | the entry is gone; `status: "orphaned"` means partially landed |
+| `environment_start` | your `role` present as a key in `pids` |
+| `environment_stop` | your `role` absent from `pids` |
+
+Read `worktree_remove` back from the **repo root**, never from the removed checkout path: that path is gone, so passing it back raises `invalid checkout_path '<p>': checkout_path does not exist: ...` — the exact text a typo produces, which proves nothing. Retry a removal **by `environment_id`, not `checkout_path`**: the id form is self-diagnosing (soft `{"code": "not_found"}`). A blind `worktree_create` retry is self-diagnosing too — it raises a duplicate error naming the landed environment inline, `(existing_environment_id: "<id>", existing_path: "<path>")` — best-effort: if the landed record can't be looked up, you just get the bare "already exists" text with no tokens.
 
 **Orphan worktree on disk**
 

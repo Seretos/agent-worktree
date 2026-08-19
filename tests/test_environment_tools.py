@@ -13,8 +13,10 @@ addressing path, and the hard primary-removal refusal.
 
 from __future__ import annotations
 
+import base64
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator, Tuple
 from unittest.mock import patch
@@ -25,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 from lib_python_worktree import (
     InMemoryStateStore,
+    InvalidRepoError,
     ManagerConfig,
     SetupOutcome,
     WorktreeManager,
@@ -32,7 +35,8 @@ from lib_python_worktree import (
     YamlStateStore,
     primary_id_for,
 )
-from worktree_plugin.tools.worktree import register
+from lib_python_worktree.core.state import ShadowedContract
+from worktree_plugin.tools.worktree import _invalid_path_error_text, register
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -636,17 +640,64 @@ def test_worktree_remove_missing_target_error_names_environment_id(tmp_path: Pat
 
 
 def test_worktree_remove_checkout_path_outside_any_repo(tmp_path: Path):
+    """Ticket #123: classify_checkout() raises InvalidRepoError (a
+    WorktreeError) before any store/removal logic runs when checkout_path
+    isn't a usable git repository. Before the fix, the wrapper's catch-all
+    `except WorktreeError` passed the engine's message through verbatim,
+    which names the engine-internal `repo_root` parameter even though the
+    caller passed `checkout_path` -- this tool has no `repo_root`
+    parameter at all. The re-worded message must name `checkout_path`
+    instead, never leak `repo_root`, and still carry the offending path
+    (as its basename, since `!r` doubles backslashes on Windows) and the
+    rejection reason."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     non_repo = tmp_path / "not-a-repo"
     non_repo.mkdir()
 
-    # Observed engine behaviour: classify_checkout() raises InvalidRepoError
-    # (a WorktreeError) before any store/removal logic runs, which the tool
-    # wrapper's catch-all `except WorktreeError` maps to a raised
-    # ValueError -- not a soft error dict, since this isn't a "target not
-    # found" condition but an invalid argument.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         fns["worktree_remove"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_worktree_remove_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: a checkout_path that does not exist on disk
+    produces reason text `repo_root does not exist: ...` from the engine --
+    this proves the fix's token substitution rewrites the reason *body*,
+    not just the `invalid repo_root ...:` prefix (a prefix-only fix would
+    still leak `repo_root` here)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
+
+
+def test_worktree_remove_checkout_path_is_a_file(tmp_path: Path):
+    """Ticket #123 edge case: a checkout_path pointing at a file (not a
+    directory) produces reason text `repo_root is not a directory: ...`."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("hi", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](checkout_path=str(a_file))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert a_file.name in msg
+    assert "not a directory" in msg
 
 
 @pytest.mark.parametrize("pre_start", [False, True])
@@ -795,6 +846,47 @@ def test_environment_start_missing_target_error_names_environment_id(
     assert "worktree_id" not in msg
 
 
+def test_environment_start_invalid_checkout_path_names_checkout_path(
+    tmp_path: Path,
+):
+    """Ticket #123: an unusable checkout_path leaks via classify_checkout()'s
+    InvalidRepoError, caught by environment_start's catch-all
+    `except (WorktreeError, ProcessLifecycleError)` before the fix -- which
+    passes the engine's `repo_root`-naming text straight through even
+    though environment_start has no `repo_root` parameter. The re-worded
+    message must name `checkout_path`, never leak `repo_root`, and still
+    carry the offending path's basename and the rejection reason."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_environment_start_invalid_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: proves the reason-body rewrite, not just the
+    `invalid repo_root ...:` prefix -- same rationale as
+    test_worktree_remove_checkout_path_nonexistent."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_start"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
+
+
 def test_environment_stop_unmaterialised_primary_soft_error(
     tmp_path: Path, temp_repo: Path
 ):
@@ -822,6 +914,43 @@ def test_environment_stop_missing_target_error_names_environment_id(tmp_path: Pa
     assert "environment_id" in msg
     assert "checkout_path" in msg
     assert "worktree_id" not in msg
+
+
+def test_environment_stop_invalid_checkout_path_names_checkout_path(
+    tmp_path: Path,
+):
+    """Ticket #123: empirically confirmed (repro script) that
+    environment_stop raises here rather than returning a soft not-found
+    dict -- classify_checkout() runs, and fails, before any state-store
+    lookup. Same leak/fix rationale as environment_start's counterpart."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](checkout_path=str(non_repo))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert non_repo.name in msg
+    assert "not a git repository" in msg
+
+
+def test_environment_stop_invalid_checkout_path_nonexistent(tmp_path: Path):
+    """Ticket #123 edge case: proves the reason-body rewrite, not just the
+    `invalid repo_root ...:` prefix."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    missing = tmp_path / "missing-checkout"
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["environment_stop"](checkout_path=str(missing))
+
+    msg = str(excinfo.value)
+    assert "checkout_path" in msg
+    assert "repo_root" not in msg
+    assert missing.name in msg
+    assert "does not exist" in msg
 
 
 def test_environment_stop_id_and_path_mismatch_error_names_environment_id(
@@ -905,9 +1034,38 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
         result = fn(environment_id=worktree_id, variant="worker")
 
     assert "error" not in result
-    cmd_str = " ".join(captured["cmd"])
-    assert "start-worker.sh" in cmd_str
-    assert "start-web.sh" not in cmd_str
+    # ticket #137: do NOT pin sys.platform here (as ticket #129 did). Doing
+    # so forces core/manager.py's env=_build_worktree_env(record, env) --
+    # an *argument expression*, evaluated before the patched
+    # _lifecycle_start is ever entered -- down _get_user_profile_env's
+    # win32 branch, which does `import winreg` at
+    # lib_python_worktree/core/_env_utils.py:55. winreg is a Windows-only
+    # stdlib module, so pinning sys.platform to "win32" on the
+    # ubuntu-22.04 CI leg makes this test itself raise
+    # ModuleNotFoundError -- the #129 fix for a Linux regression was
+    # itself a Linux regression. Branch the assertion on the *ambient*
+    # sys.platform instead so each leg exercises (and strictly checks)
+    # its own real argv shape.
+    cmd = captured["cmd"]
+    if sys.platform == "win32":
+        # ticket #109 (upstream lib-python-worktree): the default win32
+        # shell (powershell.exe) transports the run line as a base64
+        # -EncodedCommand blob rather than a raw -Command <text>
+        # argument, so decode it before checking which script was
+        # selected.
+        assert len(cmd) == 5
+        assert cmd[:4] == [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+        ]
+        decoded_run_line = base64.b64decode(cmd[4]).decode("utf-16-le")
+    else:
+        assert cmd == ["bash", "-c", "start-worker.sh"]
+        decoded_run_line = cmd[2]
+    assert "start-worker.sh" in decoded_run_line
+    assert "start-web.sh" not in decoded_run_line
 
     env = captured["env"]
     assert env.get("WORKTREE_ID") == worktree_id
@@ -1372,6 +1530,84 @@ def test_environment_stop_docstring_documents_role_vs_variant(tmp_path: Path):
     assert "variant" in doc
 
 
+# ---- Ticket #127 ----
+#
+# `environment_start`'s `variant` parameter defaults to `"default"`, but
+# resolving that default was previously documented as limited to a lone
+# *unnamed* `start:` step. As of the pinned v0.3.5 (upstream
+# lib-python-worktree#112), the lone-step fallback fires for a single
+# `start:` step regardless of whether it carries a `name:` key -- but the
+# wrapper's own docstrings, AGENTS.md, and SKILL.md still claimed the
+# narrower, unnamed-only behaviour. These tests protect the corrected
+# claim, and the previously-undocumented consequence: when the fallback
+# resolves a *named* step, `record.variants[role]` stores that step's own
+# name (not the literal string `"default"`), so a later
+# `environment_stop(variant="default")` will not resolve against it.
+
+
+def test_environment_start_docstring_documents_lone_named_step_default_fallback(
+    tmp_path: Path,
+):
+    """Claim under protection: the `variant="default"` lone-step fallback
+    fires for a single `start:` step REGARDLESS of whether that step
+    carries a `name:` key (v0.3.5 / upstream lib-python-worktree#112) --
+    not only for a lone *unnamed* step, which is what the pre-#127 wording
+    claimed ("resolves to the lone unnamed step for back-compat"). The
+    multi-step failure mode (two-or-more steps with none named `"default"`
+    still raise `ValueError` listing the available names) must remain
+    documented alongside the correction."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert re.search(
+        r"\b(single|lone|exactly one)\b[^.]{0,160}"
+        r"\b(regardless|even if|whether it is named|named or unnamed)\b",
+        norm,
+    ), "docstring must state the lone-step fallback covers a named step too"
+
+    assert "resolves to the lone unnamed step for back-compat" not in norm, (
+        "stale claim: the lone-step default fallback is not limited to "
+        "unnamed steps as of v0.3.5 / upstream #112"
+    )
+
+    assert re.search(r"valueerror[^.]{0,200}available|available[^.]{0,200}valueerror", norm), (
+        "the multi-step-with-no-default-named-step failure mode "
+        "(ValueError listing available names) must stay documented"
+    )
+
+
+def test_stop_variant_default_asymmetry_is_documented(tmp_path: Path):
+    """Claim under protection: when the tier-3 lone-step `variant="default"`
+    fallback resolves a NAMED step, the engine records
+    `record.variants[role] = step.name`, not the literal string
+    `"default"` -- so a later `environment_stop(variant="default")` does
+    NOT resolve against that role. Both `environment_start`'s and
+    `environment_stop`'s docstrings must document this asymmetry
+    explicitly, not just describe the two tools' `variant` behaviour in
+    isolation from each other."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    for tool_name in ("environment_start", "environment_stop"):
+        doc = fns[tool_name].__doc__ or ""
+        norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+        found = False
+        for m in re.finditer(r"default", norm):
+            idx = m.start()
+            window = norm[max(0, idx - 500) : idx + 500]
+            if "variants" in window and re.search(
+                r"(will not|does not|won't|cannot|never)[^.]{0,120}resolv", window
+            ):
+                found = True
+                break
+        assert found, (
+            f"{tool_name}'s docstring must document that the lone-step "
+            "default fallback's recorded variant name breaks a later "
+            'environment_stop(variant="default") resolution'
+        )
+
+
 def _seed_record(
     mgr: WorktreeManager,
     *,
@@ -1531,3 +1767,326 @@ def test_environment_stop_variant_resolution_failure_raises_valueerror(
     assert variant in msg
     assert "hint" in msg.lower()
     assert "role=" in msg or "role" in msg.lower()
+
+
+# ---- Ticket #130: docstring / SKILL / README sweep ----
+#
+# Four re-sliced findings originally filed as #124 (misplaced-contract
+# CAUTION is a silent no-op), #125 (environment_stop primary-vs-linked /
+# environment_start's three addressing outcomes), #128 (start_log_path
+# role-casing mismatch). This block covers #124, #125, and #128's
+# environment_start/environment_stop side; #126 and #128's SKILL/AGENTS.md/
+# README.md side live in tests/test_plugin_manifest.py, and #126's
+# worktree_remove side lives in tests/test_worktree_tools.py.
+
+
+def test_environment_start_docstring_no_longer_claims_silent_misplaced_contract(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #124): a contract
+    placed only in a worktree checkout (not at repo_root) is still a
+    {"status": "ready", "pids": {}} no-op, but it is a diagnosable one --
+    the same response carries no_op_reason: "contract-misplaced" (distinct
+    from "no-contract") -- and the stale "silent .../no error to indicate
+    the misplacement" claim must be gone."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert "no_op_reason" in norm
+    assert "contract-misplaced" in norm
+    assert "with no error to indicate the misplacement" not in norm
+
+    found_silent_far_from_diagnosis = False
+    for m in re.finditer(r"(?<!not )\bsilent\b", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 300) : idx + 300]
+        if "contract-misplaced" in window or "misplacement" in window:
+            found_silent_far_from_diagnosis = True
+    assert not found_silent_far_from_diagnosis, (
+        "docstring must not describe the misplaced-contract case as "
+        "(unqualified) 'silent' near its diagnosis -- it is diagnosable "
+        "via no_op_reason; 'not silent' is fine"
+    )
+
+
+def test_environment_start_response_carries_engine_shadowed_contract(tmp_path: Path):
+    """Tripwire for the engine-owned shadowed_contract diagnostic documented
+    in ticket #130 (upstream lib-python-worktree #100). This wrapper only
+    passes the field through via _record_to_dict's asdict(record) -- it
+    does not compute it -- so this test already passes today (it is not the
+    driving test for the docs). Its purpose is to fail loudly if a future
+    lib-python-worktree bump renames, drops, or stops populating
+    WorktreeRecord.shadowed_contract, which would otherwise leave the
+    newly-added documentation silently lying."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    record = WorktreeRecord(
+        id="wt-130-shadow-test",
+        repo_root=str(tmp_path / "repo-root"),
+        branch="feature/shadow",
+        path=str(tmp_path / "store" / "wt-130-shadow-test"),
+        status="running",
+        pids={"main": 4242},
+    )
+    record.shadowed_contract = ShadowedContract(
+        path="/wt/.seretos/worktree-setup.yml",
+        used_path="/repo-root/.seretos/worktree-setup.yml",
+        reason="differs",
+        message="checkout-local contract differs from the one used",
+    )
+
+    with patch.object(mgr, "start", return_value=record):
+        result = fns["environment_start"](environment_id=record.id)
+
+    assert "shadowed_contract" in result
+    shadowed = result["shadowed_contract"]
+    assert isinstance(shadowed, dict)
+    assert set(shadowed.keys()) == {"path", "used_path", "reason", "message"}
+    assert shadowed["reason"] == "differs"
+
+    # Second case: the engine leaves shadowed_contract unset (None) --
+    # the key must still be present, just with a None value.
+    record_no_shadow = WorktreeRecord(
+        id="wt-130-noshadow-test",
+        repo_root=str(tmp_path / "repo-root2"),
+        branch="feature/noshadow",
+        path=str(tmp_path / "store" / "wt-130-noshadow-test"),
+        status="running",
+        pids={"main": 4243},
+    )
+    assert record_no_shadow.shadowed_contract is None
+
+    with patch.object(mgr, "start", return_value=record_no_shadow):
+        result_none = fns["environment_start"](environment_id=record_no_shadow.id)
+
+    assert "shadowed_contract" in result_none
+    assert result_none["shadowed_contract"] is None
+
+
+def test_environment_stop_docstring_distinguishes_primary_from_linked(tmp_path: Path):
+    """Claim under protection (ticket #130, re-slicing #125 section 2a; fix
+    #130 blocking finding 1): a linked worktree's tracked-but-never-started
+    role is not a not-found condition -- the engine's graceful no-op path
+    runs contract stop: steps best-effort and always sets
+    stop_attempt.outcome == "no_process_recorded", but status only becomes
+    "stopped" if no other role is still tracked in pids (and the record
+    wasn't already "stop_incomplete"/"orphaned"); otherwise status is left
+    unchanged. Only the primary (no record until its first environment_start)
+    and a genuinely unknown target yield the soft not-found dict."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    found = False
+    for m in re.finditer(r"not_found", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 600) : idx + 600]
+        if "linked" in window and "stopped" in window and "no_process_recorded" in window:
+            found = True
+            break
+    assert found, (
+        "environment_stop docstring must contrast a linked worktree's "
+        "tracked-but-never-started role (no_process_recorded, status "
+        "stopped) against the primary/unknown-target not_found case, "
+        "within the same section"
+    )
+
+    # E8: the not_running paragraph must be scoped so it does not read as
+    # contradicting the linked-worktree paragraph above.
+    found_scoping = False
+    for m in re.finditer(r"not_running", norm):
+        idx = m.start()
+        window = norm[max(0, idx - 600) : idx + 600]
+        if "processnotrunningerror" in window:
+            found_scoping = True
+            break
+    assert found_scoping, (
+        "environment_stop docstring's not_running paragraph must name "
+        "ProcessNotRunningError to scope it against the linked-worktree "
+        "graceful no-op path"
+    )
+
+
+def test_environment_start_docstring_consolidates_three_addressing_outcomes(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #125 section 2b): all
+    three addressing outcomes -- ValueError (neither given), ValueError
+    (both given, disagree), and the soft not_found dict (well-formed pair,
+    target doesn't exist) -- must be named within the "Addressing the
+    target" section itself, not merely present ~180 lines apart elsewhere
+    in the docstring."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+
+    start_idx = doc.find("Addressing the target")
+    end_idx = doc.find("Multiple named ``start:`` steps")
+    assert start_idx != -1 and end_idx != -1 and end_idx > start_idx
+    section = doc[start_idx:end_idx]
+
+    assert "not_found" in section, (
+        "the Addressing the target section must name the soft not_found "
+        "outcome, not just the two ValueError outcomes"
+    )
+    assert section.count("ValueError") >= 2, (
+        "the Addressing the target section must still name both "
+        "ValueError outcomes (neither given; both given but disagreeing)"
+    )
+
+
+def test_environment_start_docstring_documents_start_log_path_role_casing(
+    tmp_path: Path,
+):
+    """Claim under protection (ticket #130, re-slicing #128): start_log_path's
+    filename is a lower-cased slug of role, while pids/record.variants key
+    on role verbatim -- documented (not fixed; upstream lib-python-worktree
+    defect), fully-qualified as Seretos/lib-python-worktree#111 so it is
+    never confused with this repo's own closed #111 (thread-leak ticket)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_start"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    occurrences = list(re.finditer(r"start_log_path", norm))
+    assert occurrences
+
+    found = False
+    for m in occurrences:
+        idx = m.start()
+        window = norm[max(0, idx - 100) : idx + 900]
+        if (
+            "seretos/lib-python-worktree#111" in window
+            and ("lower" in window or "slug" in window)
+            and "pids" in window
+        ):
+            found = True
+            break
+
+    assert found, (
+        "docstring must have at least one start_log_path mention whose "
+        "surrounding window fully-qualifies the upstream #111 reference, "
+        "names the lower-case/slug behaviour, and mentions pids"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #123: InvalidRepoError re-wording (_invalid_path_error_text)
+# ---------------------------------------------------------------------------
+#
+# R1-R3 above cover the wrapper-level behaviour (worktree_remove,
+# environment_start, environment_stop each re-word the engine's
+# InvalidRepoError to name checkout_path). R4 below unit-tests the
+# rewording helper directly; R5 covers its identity guard (never rename a
+# path the wrapper didn't itself receive); R6 is the negative control
+# proving worktree_create's genuinely-named `repo_root` parameter is left
+# alone.
+
+
+def test_invalid_path_error_text_preserves_reason_without_token(tmp_path: Path):
+    """R4: a reason with no `repo_root` token at all (e.g. an unexpected
+    'git rev-parse' output failure) must survive completely intact -- the
+    mechanical `\\brepo_root\\b` substitution is a no-op here, proving no
+    diagnostic detail is ever silently dropped for a reason shape the
+    rewording helper doesn't specifically know about."""
+    exc = InvalidRepoError("/x/y", "unexpected 'git rev-parse' output: 'garbage'")
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert msg == "invalid checkout_path '/x/y': unexpected 'git rev-parse' output: 'garbage'"
+
+
+def test_invalid_path_error_text_rewrites_token_in_future_reason(tmp_path: Path):
+    """R4: an invented reason (standing in for a future engine reason not
+    enumerated anywhere in this wrapper) that DOES contain the `repo_root`
+    token must still have it rewritten -- the substitution is mechanical,
+    not an allow-list of known reasons, so it keeps working for engine
+    reasons that don't exist yet."""
+    exc = InvalidRepoError("/x/y", "repo_root failed an invented future check: /x/y")
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert "repo_root" not in msg
+    assert "checkout_path failed an invented future check: /x/y" in msg
+
+
+def test_invalid_path_error_text_word_boundary_leaves_lookalikes_alone(tmp_path: Path):
+    """R4 edge case: `repo_roots` and `my_repo_root` must NOT be touched by
+    the substitution -- proves the `\\b` word-boundary anchors are doing
+    real work, not a bare (unanchored) string replace that would also
+    mangle these lookalike identifiers."""
+    exc = InvalidRepoError(
+        "/x/y", "repo_roots list exhausted; my_repo_root was already tried"
+    )
+
+    msg = _invalid_path_error_text(exc, param_name="checkout_path")
+
+    assert "repo_roots list exhausted; my_repo_root was already tried" in msg
+
+
+def test_worktree_remove_invalid_checkout_path_identity_guard_different_path(
+    tmp_path: Path,
+):
+    """R5: the wrapper must never rename a path it did not itself receive.
+    If the engine's InvalidRepoError names some OTHER path (e.g. one it
+    resolved internally) than the checkout_path the caller actually
+    passed, the wrapper must leave the engine's message untouched --
+    including its `repo_root` wording -- rather than mislabelling a path
+    that isn't the one the caller gave it.
+
+    This test may already pass before the production fix: the identity
+    guard is new code, but the pre-fix generic `except WorktreeError`
+    catch-all already passes str(exc) through verbatim too, so this is an
+    expected-already-passing regression guard, not a false RED."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    other_path = str(tmp_path / "some-other-place")
+
+    def _fake_remove(*args, **kwargs):
+        raise InvalidRepoError(other_path, f"repo_root does not exist: {other_path}")
+
+    with patch.object(mgr, "remove", side_effect=_fake_remove):
+        with pytest.raises(ValueError) as excinfo:
+            fns["worktree_remove"](checkout_path=str(tmp_path / "not-what-was-raised"))
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+
+
+def test_environment_start_invalid_checkout_path_identity_guard_checkout_path_none(
+    tmp_path: Path,
+):
+    """R5 additional edge case: exercises the `checkout_path is not None`
+    short-circuit -- when the caller addressed the target purely by
+    environment_id (checkout_path=None), the guard must not even attempt
+    the equality comparison, and the engine's message passes through
+    unchanged. Also an expected-already-passing guard (see the docstring
+    above for why)."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    other_path = str(tmp_path / "some-other-place")
+
+    def _fake_start(*args, **kwargs):
+        raise InvalidRepoError(other_path, f"repo_root does not exist: {other_path}")
+
+    with patch.object(mgr, "start", side_effect=_fake_start):
+        with pytest.raises(ValueError) as excinfo:
+            fns["environment_start"](environment_id="some-id")
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+
+
+def test_worktree_create_invalid_repo_root_still_names_repo_root(tmp_path: Path):
+    """R6 (negative control): worktree_create's parameter really is named
+    `repo_root` -- ticket #123's fix must be scoped to checkout_path-only
+    tools (worktree_remove, environment_start, environment_stop), never a
+    blanket string replacement that would also mangle worktree_create's
+    correctly-named error. Expected to pass both before and after the fix."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_create"](repo_root=str(non_repo), branch="feature/wt")
+
+    msg = str(excinfo.value)
+    assert "repo_root" in msg
+    assert "checkout_path" not in msg

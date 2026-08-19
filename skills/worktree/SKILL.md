@@ -47,8 +47,16 @@ worktree's own copy. `worktree_create` copies `.seretos/` into a new worktree as
 create-time convenience (so it is visible from inside the checkout), but that copy is
 *not* what `environment_start`/`environment_stop` actually read. Placing the contract
 only in a worktree checkout, and never at `<repo_root>/.seretos/worktree-setup.yml`,
-produces a silent no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
-with no error, indistinguishable from "no contract configured" (issue #87).
+still produces a no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
+— but it is **not silent** and **not** indistinguishable from "no contract configured"
+(issue #87): the same response carries `contract_found: false`, `steps_run: 0`, and
+`no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-unconfigured
+case) — ticket #103's contract diagnostics. The engine (`lib-python-worktree`, upstream
+#100) additionally sets `shadowed_contract` on the response — `None`, or `{path,
+used_path, reason, message}` with `reason` either `"differs"` or `"unreadable"` —
+whenever a checkout-local copy exists that is not the file it read. It is transient
+(never written to `state.yaml`) and is `None` for a primary, for `checkout ==
+repo_root`, and for the identical copy `worktree_create` writes.
 
 The contract declares up to five lifecycle hooks, each fired by a distinct MCP tool:
 
@@ -71,13 +79,24 @@ Each step under `setup:`, `start:`, `stop:`, or `teardown:` is a YAML mapping wi
 
 - `run:` — **required**, the shell command to execute.
 - `name:` — optional; for `start:`/`stop:` steps this selects the step via
-  `environment_start`'s `variant` parameter (a single unnamed step is the implicit
-  `"default"` variant, for back-compat).
+  `environment_start`'s `variant` parameter (see the three-tier
+  `variant="default"` resolution below for when an unnamed — or even a
+  named — step becomes the implicit default).
 - `shell:` — optional override of the shell used to run the step.
 
 `environment_start` supports multiple **named** `start:` variants — pass the step's
 `name` as `variant` to select it (e.g. `variant="gui"` vs. the default headless launch).
 An unknown variant raises a `ValueError` listing the available names.
+
+**Resolving `variant="default"`.** Three tiers, tried in order: (1) an exact
+`name:` match against `variant`; (2) exactly one **unnamed** `start:` step —
+implicitly the `"default"` variant, for back-compat; (3) exactly one `start:`
+step overall — even if that single step is named rather than unnamed
+(upstream lib-python-worktree#112, shipped in the pinned v0.3.5) — so a
+contract whose sole step carries a `name:` other than `"default"` still
+resolves without passing `variant` explicitly. Two or more `start:` steps
+with none of them named `"default"` still raise `ValueError` listing the
+available names, even under tier 3.
 
 **`role` vs `variant`.** These are independent parameters, easy to conflate: `role` is
 the tracking key a process's pid is filed under (`pids[role]`), and it defaults to
@@ -89,6 +108,26 @@ concurrently need two distinct `role`s, or the second call returns/errors with a
 (`record.variants`), so `environment_stop(variant=...)` can later stop that role
 without the caller separately tracking which role it used — see `environment_stop`'s
 own `variant` parameter below.
+
+**Asymmetry warning.** When tier 3 above (the lone-step fallback) resolves a
+*named* step from a bare `variant="default"` call, `record.variants[role]`
+stores that step's own name (e.g. `"main"`) — never the literal string
+`"default"`. A later `environment_stop(variant="default")` **will not
+resolve** against that role, since `record.variants[role]` is never
+`"default"` in that case. Use `role="main"` (the default) or pass the
+step's actual name as `variant` instead.
+
+**Log-file naming caveat.** `pids`/`record.variants` key on the **verbatim**
+`role` string, but the engine's captured startup log filename does not: it is
+`start-<slug(role)>.log`, where the slug is `role` **lower-cased**, with
+non-alphanumeric runs collapsed to `-` and truncated to 40 characters. Two
+roles differing only in case (e.g. `"API"` vs `"api"`) become two distinct
+`pids` keys sharing one append-mode log file, interleaving their output.
+Always read the log path from `environment_start`'s `start_log_path` field
+rather than deriving it yourself. Documented, not fixed — this is an upstream
+engine defect tracked as `Seretos/lib-python-worktree#111` — not to be
+confused with this repository's own already-closed issue of the same
+number, an unrelated thread-leak ticket.
 
 Concrete example (mirrors the multi-step, multi-variant shape used in this repo's own
 `.seretos/worktree-setup.yml`):
@@ -179,7 +218,10 @@ tool (`worktree_remove`, `environment_start`, `environment_stop`) re-words the e
 raw `CheckoutTargetError` text before raising `ValueError`: the engine's own message
 names its internal parameter and describes the contract in engine-API vocabulary
 (`start()`/`stop()`/`remove()`), so the wrapper replaces it with a message naming
-`environment_id`, `checkout_path`, and the calling tool itself.
+`environment_id`, `checkout_path`, and the calling tool itself. The same three tools
+also re-word the engine's `InvalidRepoError` (ticket #123), raised when `checkout_path`
+is given but isn't a usable git repository — its internal `repo_root` parameter name is
+replaced with `checkout_path`, with the full diagnostic reason preserved byte-for-byte.
 
 > **Spec-gap note (ticket #99).** The ticket's originally-specified surface is
 > id-only. That cannot satisfy the ticket's own AC1 — cold-starting a primary that has
@@ -256,6 +298,14 @@ Processes whose working directory sits inside the worktree can prevent directory
 deletion. Pass `kill_blocking_processes=True` to `worktree_remove` to have the tool
 terminate those foreign processes automatically before removal:
 
+**Tracked vs. foreign.** Your own `environment_start` process is not what this flag is
+for — `worktree_remove` stops every tracked role (from `pids`) as its first step,
+before this flag's scan ever runs, so it does not need `kill_blocking_processes`. The
+flag exists for genuinely foreign holders: an editor, a shell whose cwd is in the
+checkout, a build/indexing tool, or a reparented orphan. The tracked stop is
+best-effort, though — a tracked process that refuses to die still blocks removal and
+does then need this flag.
+
 ```
 worktree_remove(<id>, kill_blocking_processes=True)
 ```
@@ -272,6 +322,70 @@ clears each in a single message — `(blocked_by: "dir_locked",
 force=True)`. Read both tokens off that one error and retry once with both
 flags set, rather than discovering each condition across separate failed
 attempts (plain retry → `kill_blocking_processes=True` → `force=True`).
+
+**Transport failure ("Connection closed"): confirm before retrying (ticket #116)**
+
+A tool call can die with `Connection closed` / `MCP error -32000` before its
+response is written. The response is lost; the operation may have fully landed.
+Never blind-retry a mutating call — read back first. `environment_list` never
+writes state, so retrying *it* is always safe, which is what makes it the
+read-back tool.
+
+1. **`worktree_create`** — `environment_list(path=<the same repo_root>)`; find the
+   entry with your `branch` and `tracked: true`. Its `id` is what the lost
+   response carried, and the id's 8-hex suffix is random, so read-back is the
+   only way to recover it; `setup_status` says how the `setup:` steps ended. A
+   blind retry is non-destructive (the duplicate guard fires before any
+   worktree-creating git command — only a read-only `git rev-parse` for repo
+   classification has run at that point) and self-diagnosing: the raised
+   error carries `(existing_environment_id: "<id>", existing_path:
+   "<path>")` — best-effort only; if the landed record can't be looked up,
+   the bare engine text is raised instead, with no id invented.
+2. **`worktree_remove`** — read back from the **repo root**, never from the removed
+   checkout path. That path is gone if the removal landed, so passing it back
+   raises `invalid checkout_path '<p>': checkout_path does not exist: ...` —
+   byte-for-byte what a typo produces, and therefore no evidence at all. Entry
+   absent = landed; entry present with `status: "orphaned"` = partially landed
+   (directory gone, record survives), finish it with
+   `worktree_remove(environment_id=<that id>)`; entry unchanged = did not land.
+   **Retry by `environment_id`, not `checkout_path`** — the id form is
+   self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
+3. **`environment_start`** — `environment_list(...)`, then `pids`. Unambiguous
+   case first: your `role` (default `"main"`) present as a key means the start
+   landed and the process is alive, and `variants[<role>]` names the variant. If
+   the role is absent the reading is ambiguous — never started, or started and
+   since exited (the listing reconciles dead pids away). The
+   `returncode`/`start_log_path` heuristic breaks the tie only for a role never
+   started before: for such a role non-`null` values prove a spawn happened,
+   while for a role started at any earlier point they are stale leftovers that
+   reconciliation does not clear and that decide nothing — inspect the file at
+   `start_log_path` instead. A blind retry is protected by `code:
+   "already_running"` only while the pid is **alive**; a landed-then-exited
+   start will be started a second time.
+4. **`environment_stop`** — `environment_list(...)`, then `pids`: role absent = no
+   live tracked process remains; role present = did not land. The listing cannot
+   tell you whether the contract's `stop:` steps ran — only the persisted
+   `stop_detail` (and a sticky `status: "stop_incomplete"`) survives there. A
+   blind retry that *returns* is safe: `code: "not_found"`, `code:
+   "not_running"`, or a graceful no-op reported as `stop_attempt.outcome:
+   "no_process_recorded"`. But it can also **raise `ValueError`** instead of
+   returning — a bad `checkout_path`, a missing/disagreeing `environment_id`/
+   `checkout_path` pair, or a `variant` that fails to resolve all raise
+   rather than come back as a soft `code`. Branching on `code` only makes
+   sense for a call that returned.
+
+**Fields that can never serve as read-back evidence.** `stop_attempt`,
+`killed_pids` and `shadowed_contract` are transient: they are never written to
+`state.yaml`, and `environment_list` rebuilds every entry from persisted state,
+so those keys are always `null`/`[]` there no matter what happened. Read them
+only from the response of the call that produced them.
+
+**What this does and does not fix.** The transport drop itself is outside this
+plugin's reach. The Windows `SIGBREAK` guard (ticket #112) addresses one
+mechanism — a server killed by a `CTRL_BREAK_EVENT` during a stop/remove — and
+is already in place; it does not eliminate transport drops, and it does not
+explain a dropped *first* `environment_start` call, which fails during argument
+resolution before any signal code runs at all.
 
 **Orphan worktree recovery**
 
@@ -304,10 +418,14 @@ running under the given `role`).
 
 ## Pitfalls
 
-1. **Contract in the wrong location is a silent no-op.** The engine reads
-   `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's copy. A
-   contract placed only in the worktree checkout produces no error — just an
-   indistinguishable-from-unconfigured `{"status": "ready", "pids": {}}` response.
+1. **Contract in the wrong location is a no-op — but a *diagnosable* one.** The engine
+   reads `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's
+   copy. A contract placed only in the worktree checkout still produces
+   `{"status": "ready", "pids": {}}`, but `environment_start`'s response also carries
+   `no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-
+   unconfigured case) — branch on that instead of inferring from `status`/`pids`. If
+   instead the checkout-local copy was *edited* while a valid repo-root contract
+   started normally, look for `shadowed_contract` in the response.
 2. **`isolation: none` forbids every block.** Adding `setup:`, `start:`, `stop:`,
    `teardown:`, or `ports:` under `isolation: none` raises `ContractValidationError` —
    switch to `isolation: full` first.
@@ -318,7 +436,9 @@ running under the given `role`).
    recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
    `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
-   fighting the lock manually. If the directory lock and uncommitted changes are
+   fighting the lock manually. This flag is not for a process you started yourself
+   with `environment_start` — removal stops every tracked role first, before this
+   flag's scan runs. If the directory lock and uncommitted changes are
    BOTH blocking removal, the error names both conditions and both required
    flags (`blocked_by`/`required_flags`) in one message — set both flags in a
    single retry instead of discovering each condition one at a time.
@@ -335,3 +455,12 @@ running under the given `role`).
    at `repo_root` — you do not have to pass `base` just because the branch is new. This
    default still raises `ValueError` when `repo_root`'s HEAD is detached or unborn (no
    commits yet), since there is then no checked-out branch to default to.
+8. **A multi-step contract with no step named `default` fails the *first*
+   `environment_start` call from any agent, unless `variant=` is passed.**
+   The `variant="default"` lone-step fallback only ever fires when the
+   contract declares exactly one `start:` step total; the moment a second
+   named step is added, a bare `environment_start()` call raises
+   `ValueError` listing the available names instead of silently picking
+   one. Check `worktree_create`'s returned `start_variants` field (or this
+   contract's `start:` list) up front and pass `variant=<name>` explicitly
+   whenever more than one step exists.

@@ -41,7 +41,7 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 - `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
 - `warning` (optional) — present when `repo_root` was silently re-rooted; contains the original and resolved paths.
 
-**Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures.
+**Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures. Retrying a create whose response was lost raises a duplicate error that names the landed environment inline: `(existing_environment_id: "<id>", existing_path: "<path>")` (ticket #116) — best-effort only: when the landed record's lookup misses or raises, only the engine's own bare "already exists" text is raised and no id is invented.
 
 ---
 
@@ -60,7 +60,7 @@ Removing the primary/main clone is never allowed regardless of how it is address
 | `environment_id` | `str` | No* | The id of a *tracked* checkout to remove (as returned by `worktree_create` or `environment_list`). |
 | `checkout_path` | `str` | No* | The path of the checkout to remove — the only way to address an untracked/orphan checkout. |
 | `force` | `bool` | No | When `True`, removes the worktree even if it contains uncommitted changes. Defaults to `False`. |
-| `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate foreign processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). |
+| `kill_blocking_processes` | `bool` | No | When `True`, attempts to terminate **foreign** processes whose cwd is inside the worktree directory before removal. Opt-in; primarily a Windows concern. Defaults to `False` (no-op when nothing is blocking). Not needed for a process you started via `environment_start` — removal stops every tracked role first; best-effort, so a tracked process that refuses to die still blocks. |
 
 \* At least one of `environment_id`/`checkout_path` is required; passing neither raises `ValueError`. Passing both is fine only when they agree — a mismatch also raises `ValueError`. Resolution is entirely the engine's job (via its `CheckoutTargetError`), and the wrapper performs no validation of the pair itself — but it re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a `worktree_remove`-specific message naming `environment_id` and `checkout_path`.
 
@@ -68,7 +68,7 @@ Removing the primary/main clone is never allowed regardless of how it is address
 
 **Soft error:** if the target is not found, returns `{"error": "...", "code": "not_found"}` instead of raising, so callers can treat not-found as an idempotent condition and branch on `code` rather than parsing the error text. When `environment_id` looks like a synthesised untracked id, the error text names `checkout_path` as the remedy (`code` is `"not_found"` either way).
 
-**Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes.
+**Errors:** raises `ValueError` for other `WorktreeError` conditions (e.g. uncommitted changes when `force=False`). Also raises `ValueError` (mapped from `WorktreeDirLockedError`) when the worktree directory remains locked even after killing blocking processes. An unusable `checkout_path` (does not exist, is not a directory, or is not a git repository) raises `ValueError` whose message names `checkout_path` — the engine's `InvalidRepoError` text is re-worded (ticket #123) to replace its internal `repo_root` parameter name with `checkout_path`, with the full diagnostic reason preserved.
 
 **Compound blocking, reported in one shot (ticket #120):** when the directory lock AND uncommitted/untracked changes are BOTH blocking removal at once, the engine raises `WorktreeRemovalBlockedError` instead of the single-condition exceptions above. The wrapper catches it explicitly and raises one `ValueError` naming every currently-blocking condition and the flag needed to clear each — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)` — so a single informed retry (passing both flags at once) suffices, instead of a caller discovering each condition sequentially across up to three separate failed attempts. Filesystem paths are never included in this message.
 
@@ -87,7 +87,7 @@ Every environment is addressed by one or both of:
 - **`environment_id`** — the normal way. Use the id returned by `worktree_create` (a linked worktree) or by `environment_list` / a prior `environment_start` call (the primary, once materialised).
 - **`checkout_path`** — the cold-start/primary way. This is the *only* way to start the primary/main clone's environment before it has ever been started. A primary's id, `primary_id_for(repo_root)`, is a one-way SHA-256 hash of the repo root — before the first successful `environment_start()` call, nothing persisted maps that hash back to a path, so id-only addressing cannot cold-start it. Pass the repo root (or any path inside it) as `checkout_path` and the engine resolves and, if needed, materialises the primary's record — this is the **only** place a primary record is ever written.
 
-`environment_start` and `environment_stop` both accept `environment_id: Optional[str] = None` and `checkout_path: Optional[str] = None`; neither is schema-required, but the *engine* (not the MCP wrapper) enforces the resolution: passing both is fine only when they agree — a mismatch raises `ValueError` — and passing neither also raises `ValueError`. Resolution is entirely the engine's job, via its `CheckoutTargetError`, and the wrapper performs no validation of the `(environment_id, checkout_path)` pair itself — but each tool re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a message naming `environment_id`, `checkout_path`, and the calling tool itself (`environment_start` or `environment_stop`).
+`environment_start` and `environment_stop` both accept `environment_id: Optional[str] = None` and `checkout_path: Optional[str] = None`; neither is schema-required, but the *engine* (not the MCP wrapper) enforces the resolution: passing both is fine only when they agree — a mismatch raises `ValueError` — and passing neither also raises `ValueError`. Resolution is entirely the engine's job, via its `CheckoutTargetError`, and the wrapper performs no validation of the `(environment_id, checkout_path)` pair itself — but each tool re-words that error's text before raising `ValueError`, replacing the engine's internal parameter name and engine-API vocabulary (`start()`/`stop()`/`remove()`) with a message naming `environment_id`, `checkout_path`, and the calling tool itself (`environment_start` or `environment_stop`). The same re-wording also applies to the engine's `InvalidRepoError` (ticket #123), raised when `checkout_path` is given but isn't a usable git repository — its internal `repo_root` parameter name is replaced with `checkout_path`, with the full diagnostic reason preserved.
 
 > **Deliberate, documented deviation from ticket #99.** The ticket specifies id-only `environment_start`/`environment_stop` signatures. That cannot satisfy the ticket's own AC1: cold-starting a primary that has never been started is structurally impossible with an id-only signature, for the one-way-hash reason above. `checkout_path` is a strict *superset* of the id-only surface — every existing id-only call keeps working byte-for-byte, and it is the only way to address a never-started primary.
 
@@ -95,10 +95,14 @@ Every environment is addressed by one or both of:
 
 These two parameters are independent and easy to conflate:
 
-- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would.
+- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would. `record.pids`/`record.variants` key on this **verbatim** `role` string, which is not how the start-log filename is derived — see `start_log_path` below; the mismatch is an upstream defect tracked as `Seretos/lib-python-worktree#111` — not this repository's own already-closed issue of the same number, an unrelated thread-leak ticket.
 - **`variant`** only selects *which* contract `start:` step is run (by its `name`). It has no effect on where the resulting pid is filed.
 
 Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
+
+**Resolving `variant="default"`.** Three tiers, tried in order: (1) an exact `name:` match against `variant`; (2) exactly one **unnamed** `start:` step — implicitly the `"default"` variant, for back-compat; (3) exactly one `start:` step overall — even if that single step is named rather than unnamed (upstream lib-python-worktree#112, shipped in the pinned v0.3.5) — so a contract whose sole step carries a `name:` other than `"default"` still resolves without the caller passing `variant` explicitly. Two or more `start:` steps with none of them named `"default"` still raise `ValueError` listing the available names, even under tier 3.
+
+**Asymmetry warning.** When tier 3 (the lone-step fallback) resolves a *named* step from a bare `variant="default"` call, `record.variants[role]` stores that step's own name (e.g. `"main"`) — never the literal string `"default"` — because the engine records `variant=step.name or variant`. A later `environment_stop(variant="default")` **will not resolve** against that role, since `record.variants[role]` is never `"default"` in that case. Use `role="main"` (the default) or pass the step's actual name as `variant` instead.
 
 #### environment_list
 
@@ -135,7 +139,7 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 |-----------|------|----------|-------------|
 | `role` | `str` | No | Logical role name for the process. Defaults to `"main"`. Multiple processes can be attached to one environment under different roles. See "`role` vs `variant`" above. |
 | `cwd` | `str` | No | Working directory for the spawned process. When omitted, the environment's checkout path is used by the underlying engine. |
-| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves to the lone unnamed step for back-compat. When multiple named steps exist, pass the step's `name` here. An unknown variant raises `ValueError` listing the available names. See "`role` vs `variant`" above. |
+| `variant` | `str` | No | Selects which named `start:` step to run. Defaults to `"default"`, which resolves via the three-tier rule under "`role` vs `variant`" above (exact `name:` match; else the lone unnamed step; else the lone step overall, named or not, if the contract declares exactly one). Two or more steps with none named `"default"` still raise `ValueError` listing the available names. |
 | `env` | `dict` | No | Optional dict of extra environment variables merged into the process environment by the engine. Omit (or pass `null`) to inherit the current environment unchanged. |
 
 **The command to run is NOT supplied by the caller — it is read from the setup step(s) defined in `.seretos/worktree-setup.yml` at `repo_root`.** Multiple named `start:` steps are supported; `variant` selects the step by its `name`. A missing step or unknown variant surfaces as a `ValueError`.
@@ -146,6 +150,9 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 - `backing` — `"primary"` for the main clone, `"worktree"` for a linked worktree.
 - `pids` — dict mapping role name to PID (e.g. `{"main": 12345}`).
 - `ports` — dict mapping port name to host port number; `{}` before port setup runs.
+- `start_log_path` — filesystem path to the captured startup log. **Casing caveat:** the filename is `start-<slug(role)>.log`, lower-cased with non-alphanumeric runs collapsed to `-` and truncated to 40 chars — unlike `pids`/`record.variants`, which key on the verbatim `role`. Two roles differing only in case share one append-mode log file. Documented, not fixed; tracked as `Seretos/lib-python-worktree#111`.
+- Contract diagnostics (ticket #103) — five additive keys computed by this wrapper: `contract_found`, `contract_path`, `contract_isolation`, `steps_run`, `no_op_reason`.
+- `shadowed_contract` — a **separate, engine-produced** diagnostic (`lib-python-worktree`, upstream #100), not derived by this wrapper: `None` or `{path, used_path, reason, message}` with `reason` ∈ `{"differs", "unreadable"}`. Transient — never written to `state.yaml`. `None` for a primary, for `checkout == repo_root`, and for the identical copy `worktree_create` writes.
 
 **Soft errors:** if the target is not found, returns `{"error": "...", "code": "not_found"}`; if a process is already running under the given `role`, returns `{"error": "...", "code": "already_running"}` — both instead of raising, so callers can branch on `code` rather than parsing the error text. The not-found message names whichever target identifier was supplied (`environment_id` if given, else `checkout_path`).
 
@@ -205,6 +212,129 @@ Ticket #112 ("Connection closed (intermittent)"): the pinned `lib-python-worktre
 **Tradeoff, by design:** the guard swallows *every* `SIGBREAK`/`CTRL_BREAK_EVENT` unconditionally, including a hypothetical legitimate one aimed at this process itself (an operator's own Ctrl+Break, or a launcher/supervisor that might use it for graceful teardown). Windows carries no metadata on the signal that distinguishes "stray, meant for a child sharing our console" from "intentional, meant for us" — there is no way to swallow only the former, so this is an unavoidable consequence of the chosen approach, not a bug to code around. It is accepted because it loses no legitimate capability: the supported ways to stop this server are (a) the MCP host closing stdin or killing the process, and (b) `SIGINT` (Ctrl+C) for interactive use. `CTRL_BREAK_EVENT` is never a supported shutdown signal for this server.
 
 **Upstream recommendation (not implemented in this repo):** the correct fix belongs in `lib-python-worktree` itself — `_send_graceful_signal` should refuse (or route around) sending `CTRL_BREAK_EVENT` to a pid that is not confirmed to be the leader of its own process group, mirroring the POSIX guard already in `_signal_process_group`. See `tests/test_signal_resilience.py`'s module docstring in this repo for the full executable evidence and exact source citations.
+
+## Transport-level failures ("Connection closed")
+
+A tool call can die with `Connection closed` / `MCP error -32000` before its
+JSON-RPC response is written. The response is lost; the operation may well have
+landed. Two sub-symptoms have been reported (ticket #116):
+
+**Masked success on a stop/remove.** `environment_stop` and `worktree_remove`
+both traverse `_send_graceful_signal` (via `_kill_process_tree` and teardown) --
+the exact call sites ticket #112 pinned. The server dies after the state
+mutation, before the response is written, so the caller sees a transport error
+for an operation that fully succeeded. This is *consistent with* the #112
+mechanism above (it is Windows-only: `CTRL_BREAK_EVENT` has no POSIX analogue
+on this path); it is not per-incident proof for any individual report.
+
+**A first `environment_start` invocation that drops. NOT explained by #112.**
+`environment_start()` called with neither `environment_id` nor `checkout_path`
+raises `CheckoutTargetError` inside `WorktreeManager._resolve_target`, before
+any process or signal code runs at all -- there is no `os.kill` and no
+`CTRL_BREAK_EVENT` anywhere on that path. The SIGBREAK guard therefore cannot
+account for this sub-symptom. It is recorded here as a symptom only; no cause
+is claimed, and nothing in this repo currently addresses it.
+
+**The mitigation shipped for #116 is recovery, not prevention.** The transport
+itself is outside this repo; the #112 guard is the only in-repo lever and is
+already in place. What #116 adds is (a) a read-back recipe in every mutating
+tool's docstring, and (b) one production change: `worktree_create` now catches
+`DuplicateWorktreeError` explicitly and appends `(existing_environment_id:
+"<id>", existing_path: "<path>")` to the raised `ValueError`. That is the only
+tool whose lost response destroys unrecoverable information -- a record's 8-hex
+id suffix is random and cannot be re-derived -- so it is the only tool that got
+a production hint. `worktree_remove`'s misleading retry error (`invalid
+checkout_path '<p>': checkout_path does not exist: ...`, indistinguishable from
+a typo, see #123's `_invalid_path_error_text`) was deliberately left alone: a
+hint there would also fire on ordinary typos.
+
+**Read-back rules (canonical long form lives in `skills/worktree/SKILL.md`):**
+
+| Lost call | Read back with | Landed if |
+| --- | --- | --- |
+| `worktree_create` | `environment_list(path=<repo_root>)` | an entry has your `branch` and `tracked: true` |
+| `worktree_remove` | `environment_list(path=<repo_root>)`, never the removed path | the entry is absent (`status: "orphaned"` = partially landed) |
+| `environment_start` | `environment_list(...)` | your `role` is a key in `pids` |
+| `environment_stop` | `environment_list(...)` | your `role` is absent from `pids` |
+
+`environment_list` never writes state, so retrying *it* is always safe. Retry a
+`worktree_remove` **by `environment_id`, not `checkout_path`** -- the id form is
+self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
+
+**Structural constraint on any future recipe.** `yaml_store._record_to_dict`
+does not persist `stop_attempt`, `killed_pids` or `shadowed_contract`, and
+`environment_list` rebuilds every entry from `state.yaml`. Those three keys are
+present in the output but always `null`/`[]` there. Never write a recipe that
+reads them back.
+
+### Build provenance of the #116 sweep (verified 2026-08-19)
+
+Which binary generated the reports that opened #116, and whether the #112
+fix could have prevented them, is settled below by commit-ancestry
+evidence — not inferred from timing alone.
+
+- The cluster-testers who filed #116 do not exercise this git working
+  tree; they run a prebuilt `worktree.exe` cached at
+  `C:/Users/arnev/.claude/plugins/cache/agent-marketplace/agent-worktree/`.
+- The newest build ever installed in that cache is `0.1.16-00adeab6cfd3`
+  (installed 2026-08-11 22:08; no directory in that cache carries a later
+  mtime, and no version above `0.1.16` exists there). Nothing was
+  installed on 2026-08-17.
+- `00adeab6cfd3` is commit `00adeab6cfd31a5a9cb0b85081d9d58057218ab7`,
+  `release: v0.1.16`, committed 2026-07-23T23:37:37Z.
+- `git merge-base --is-ancestor df0d8eb 00adeab6` returns **false**: the
+  #112 SIGBREAK fix, commit `df0d8ebc93b9e12a7153513fae8104bcf39b85dd`
+  ("server: harden against stray Windows console ctrl-break; add
+  machine-readable soft-error codes (#112)", committed
+  2026-08-17T08:22:36Z UTC), is **not an ancestor** of the installed
+  build.
+- `git tag --contains df0d8eb` returns nothing: no release tag contains
+  the #112 fix. The newest release tag in the repo remains
+  `agent-worktree--v0.1.16`.
+
+**Conclusions, and the line between them:**
+
+1. #116's sweep (2026-08-17) ran against a binary built roughly 25 days
+   before the #112 fix landed on `main`. Its observations therefore
+   **predate #112** — established by commit ancestry, not merely
+   inferred from the calendar gap.
+2. **This does not mean #116 is fixed or resolved.** The #112 fix is
+   merged to `main` but has **never shipped in a released build** — no
+   release tag contains it, and no cache install postdates it. The
+   transport-drop symptom remains live for anyone running the currently
+   released plugin, and the fix's effectiveness against the incidents
+   reported in #116 is **unverified in the field**. Do not describe #116
+   as fixed/resolved on the strength of #112 alone; that requires a new
+   release build and a repro run against it.
+
+A `strings`-based scan of the installed binary for fix markers was
+attempted and was **inconclusive** (the PyInstaller payload is
+compressed; a sanity-control string also returned zero matches, so the
+negative result carries no evidential weight). It is not cited as
+evidence above — the commit-ancestry check is the only load-bearing
+evidence for this section.
+
+### Unverified leads (NOT investigated, NOT implemented)
+
+Everything under this heading is an untested hypothesis recorded so it is not
+lost. None of it has been confirmed, and none of it is acted on in this repo.
+
+- **UNVERIFIED lead -- PyInstaller `bootloader_ignore_signals=False`
+  (`worktree.spec`).** In a
+  frozen build the PyInstaller bootloader sits between the OS and the Python
+  process and has its own console-control-event handling; in principle a
+  console event could terminate the bootloader before Python's `SIGBREAK`
+  handler from `_install_signal_guards()` ever runs, which would make that
+  guard ineffective in the packaged binary while remaining effective when
+  running from source. **What was NOT done:** PyInstaller's actual Windows
+  console-control behaviour was not confirmed against its source or docs, no
+  frozen build was tested, and no correlation with any reported incident was
+  established. `worktree.spec` is deliberately left unchanged -- flipping this
+  flag blind could break Ctrl+C or clean shutdown. **This lead is UNVERIFIED
+  and the pytest suite cannot verify it**: the tests exercise the source
+  package, never a frozen binary, so no test in `tests/` can confirm or refute
+  it. Investigating it requires building the binary and sending real console
+  control events to it.
 
 ## Security
 
