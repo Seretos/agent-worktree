@@ -41,7 +41,7 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 - `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
 - `warning` (optional) — present when `repo_root` was silently re-rooted; contains the original and resolved paths.
 
-**Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures.
+**Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures. Retrying a create whose response was lost raises a duplicate error that names the landed environment inline: `(existing_environment_id: "<id>", existing_path: "<path>")` (ticket #116) — best-effort only: when the landed record's lookup misses or raises, only the engine's own bare "already exists" text is raised and no id is invented.
 
 ---
 
@@ -212,6 +212,129 @@ Ticket #112 ("Connection closed (intermittent)"): the pinned `lib-python-worktre
 **Tradeoff, by design:** the guard swallows *every* `SIGBREAK`/`CTRL_BREAK_EVENT` unconditionally, including a hypothetical legitimate one aimed at this process itself (an operator's own Ctrl+Break, or a launcher/supervisor that might use it for graceful teardown). Windows carries no metadata on the signal that distinguishes "stray, meant for a child sharing our console" from "intentional, meant for us" — there is no way to swallow only the former, so this is an unavoidable consequence of the chosen approach, not a bug to code around. It is accepted because it loses no legitimate capability: the supported ways to stop this server are (a) the MCP host closing stdin or killing the process, and (b) `SIGINT` (Ctrl+C) for interactive use. `CTRL_BREAK_EVENT` is never a supported shutdown signal for this server.
 
 **Upstream recommendation (not implemented in this repo):** the correct fix belongs in `lib-python-worktree` itself — `_send_graceful_signal` should refuse (or route around) sending `CTRL_BREAK_EVENT` to a pid that is not confirmed to be the leader of its own process group, mirroring the POSIX guard already in `_signal_process_group`. See `tests/test_signal_resilience.py`'s module docstring in this repo for the full executable evidence and exact source citations.
+
+## Transport-level failures ("Connection closed")
+
+A tool call can die with `Connection closed` / `MCP error -32000` before its
+JSON-RPC response is written. The response is lost; the operation may well have
+landed. Two sub-symptoms have been reported (ticket #116):
+
+**Masked success on a stop/remove.** `environment_stop` and `worktree_remove`
+both traverse `_send_graceful_signal` (via `_kill_process_tree` and teardown) --
+the exact call sites ticket #112 pinned. The server dies after the state
+mutation, before the response is written, so the caller sees a transport error
+for an operation that fully succeeded. This is *consistent with* the #112
+mechanism above (it is Windows-only: `CTRL_BREAK_EVENT` has no POSIX analogue
+on this path); it is not per-incident proof for any individual report.
+
+**A first `environment_start` invocation that drops. NOT explained by #112.**
+`environment_start()` called with neither `environment_id` nor `checkout_path`
+raises `CheckoutTargetError` inside `WorktreeManager._resolve_target`, before
+any process or signal code runs at all -- there is no `os.kill` and no
+`CTRL_BREAK_EVENT` anywhere on that path. The SIGBREAK guard therefore cannot
+account for this sub-symptom. It is recorded here as a symptom only; no cause
+is claimed, and nothing in this repo currently addresses it.
+
+**The mitigation shipped for #116 is recovery, not prevention.** The transport
+itself is outside this repo; the #112 guard is the only in-repo lever and is
+already in place. What #116 adds is (a) a read-back recipe in every mutating
+tool's docstring, and (b) one production change: `worktree_create` now catches
+`DuplicateWorktreeError` explicitly and appends `(existing_environment_id:
+"<id>", existing_path: "<path>")` to the raised `ValueError`. That is the only
+tool whose lost response destroys unrecoverable information -- a record's 8-hex
+id suffix is random and cannot be re-derived -- so it is the only tool that got
+a production hint. `worktree_remove`'s misleading retry error (`invalid
+checkout_path '<p>': checkout_path does not exist: ...`, indistinguishable from
+a typo, see #123's `_invalid_path_error_text`) was deliberately left alone: a
+hint there would also fire on ordinary typos.
+
+**Read-back rules (canonical long form lives in `skills/worktree/SKILL.md`):**
+
+| Lost call | Read back with | Landed if |
+| --- | --- | --- |
+| `worktree_create` | `environment_list(path=<repo_root>)` | an entry has your `branch` and `tracked: true` |
+| `worktree_remove` | `environment_list(path=<repo_root>)`, never the removed path | the entry is absent (`status: "orphaned"` = partially landed) |
+| `environment_start` | `environment_list(...)` | your `role` is a key in `pids` |
+| `environment_stop` | `environment_list(...)` | your `role` is absent from `pids` |
+
+`environment_list` never writes state, so retrying *it* is always safe. Retry a
+`worktree_remove` **by `environment_id`, not `checkout_path`** -- the id form is
+self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
+
+**Structural constraint on any future recipe.** `yaml_store._record_to_dict`
+does not persist `stop_attempt`, `killed_pids` or `shadowed_contract`, and
+`environment_list` rebuilds every entry from `state.yaml`. Those three keys are
+present in the output but always `null`/`[]` there. Never write a recipe that
+reads them back.
+
+### Build provenance of the #116 sweep (verified 2026-08-19)
+
+Which binary generated the reports that opened #116, and whether the #112
+fix could have prevented them, is settled below by commit-ancestry
+evidence — not inferred from timing alone.
+
+- The cluster-testers who filed #116 do not exercise this git working
+  tree; they run a prebuilt `worktree.exe` cached at
+  `C:/Users/arnev/.claude/plugins/cache/agent-marketplace/agent-worktree/`.
+- The newest build ever installed in that cache is `0.1.16-00adeab6cfd3`
+  (installed 2026-08-11 22:08; no directory in that cache carries a later
+  mtime, and no version above `0.1.16` exists there). Nothing was
+  installed on 2026-08-17.
+- `00adeab6cfd3` is commit `00adeab6cfd31a5a9cb0b85081d9d58057218ab7`,
+  `release: v0.1.16`, committed 2026-07-23T23:37:37Z.
+- `git merge-base --is-ancestor df0d8eb 00adeab6` returns **false**: the
+  #112 SIGBREAK fix, commit `df0d8ebc93b9e12a7153513fae8104bcf39b85dd`
+  ("server: harden against stray Windows console ctrl-break; add
+  machine-readable soft-error codes (#112)", committed
+  2026-08-17T08:22:36Z UTC), is **not an ancestor** of the installed
+  build.
+- `git tag --contains df0d8eb` returns nothing: no release tag contains
+  the #112 fix. The newest release tag in the repo remains
+  `agent-worktree--v0.1.16`.
+
+**Conclusions, and the line between them:**
+
+1. #116's sweep (2026-08-17) ran against a binary built roughly 25 days
+   before the #112 fix landed on `main`. Its observations therefore
+   **predate #112** — established by commit ancestry, not merely
+   inferred from the calendar gap.
+2. **This does not mean #116 is fixed or resolved.** The #112 fix is
+   merged to `main` but has **never shipped in a released build** — no
+   release tag contains it, and no cache install postdates it. The
+   transport-drop symptom remains live for anyone running the currently
+   released plugin, and the fix's effectiveness against the incidents
+   reported in #116 is **unverified in the field**. Do not describe #116
+   as fixed/resolved on the strength of #112 alone; that requires a new
+   release build and a repro run against it.
+
+A `strings`-based scan of the installed binary for fix markers was
+attempted and was **inconclusive** (the PyInstaller payload is
+compressed; a sanity-control string also returned zero matches, so the
+negative result carries no evidential weight). It is not cited as
+evidence above — the commit-ancestry check is the only load-bearing
+evidence for this section.
+
+### Unverified leads (NOT investigated, NOT implemented)
+
+Everything under this heading is an untested hypothesis recorded so it is not
+lost. None of it has been confirmed, and none of it is acted on in this repo.
+
+- **UNVERIFIED lead -- PyInstaller `bootloader_ignore_signals=False`
+  (`worktree.spec`).** In a
+  frozen build the PyInstaller bootloader sits between the OS and the Python
+  process and has its own console-control-event handling; in principle a
+  console event could terminate the bootloader before Python's `SIGBREAK`
+  handler from `_install_signal_guards()` ever runs, which would make that
+  guard ineffective in the packaged binary while remaining effective when
+  running from source. **What was NOT done:** PyInstaller's actual Windows
+  console-control behaviour was not confirmed against its source or docs, no
+  frozen build was tested, and no correlation with any reported incident was
+  established. `worktree.spec` is deliberately left unchanged -- flipping this
+  flag blind could break Ctrl+C or clean shutdown. **This lead is UNVERIFIED
+  and the pytest suite cannot verify it**: the tests exercise the source
+  package, never a frozen binary, so no test in `tests/` can confirm or refute
+  it. Investigating it requires building the binary and sending real console
+  control events to it.
 
 ## Security
 

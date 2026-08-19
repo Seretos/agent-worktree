@@ -48,6 +48,7 @@ from lib_python_worktree import (
     CONTRACT_FILENAME,
     CheckoutTargetError,
     ContractError,
+    DuplicateWorktreeError,
     EnvironmentEntry,
     InvalidRepoError,
     KilledProcessInfo,
@@ -64,6 +65,7 @@ from lib_python_worktree import (
     WorktreeNotFoundError,
     WorktreeRecord,
     WorktreeRemovalBlockedError,
+    classify_checkout,
     load as load_contract,
     primary_id_for,
 )
@@ -546,6 +548,37 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         via a self-ignoring ``.gitignore`` written inside it, so it stays
         invisible to ``git status`` and the worktree remains removable with
         ``worktree_remove``'s default ``force=False`` (ticket #110).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        If this call dies with a transport error ("Connection closed",
+        "MCP error -32000"), you do NOT know whether it landed: the
+        worktree may exist and its record may be persisted even though no
+        response ever reached you. **Read back before retrying.** Call
+        ``environment_list(path=<the same repo_root>)`` and look for the
+        entry whose ``branch`` equals the ``branch`` you passed AND whose
+        ``tracked`` is ``true``. If it is there the create landed: that
+        entry's ``id`` is exactly what the lost response carried -- and
+        since the id's 8-hex suffix is random, read-back is the ONLY way
+        to recover it -- while ``setup_status`` reports how the contract's
+        ``setup:`` steps ended.
+
+        A blind retry is non-destructive: the duplicate-branch guard fires
+        before any worktree-creating git command runs -- only a read-only
+        ``git rev-parse`` (repo classification via ``_validate_repo()`` /
+        ``classify_checkout()``) has executed by that point -- so no second
+        worktree is ever created. It does report as a failure -- ``ValueError("A worktree
+        for branch '...' already exists in ...")`` -- but that message
+        also carries the landed environment's identity as machine-readable
+        tokens, ``(existing_environment_id: "<id>", existing_path:
+        "<path>")``, so a blind retry is self-diagnosing; parse those
+        tokens instead of treating the error as fatal. The tokens are
+        best-effort: when the existing record cannot be looked up, only
+        the engine's own text is raised and no id is invented.
+
+        Honest limit: this tells you the worktree exists and what the
+        persisted ``setup_status`` says; it cannot tell you whether a
+        setup step was interrupted mid-command.
         """
 
         try:
@@ -554,6 +587,36 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             raise ValueError(
                 f"Setup failed for worktree (left intact at path for inspection): {exc}"
             ) from exc
+        except DuplicateWorktreeError as exc:
+            # DuplicateWorktreeError subclasses WorktreeError, so this catch
+            # must come before the generic `except WorktreeError` tail below
+            # -- same MRO-ordering concern as CheckoutTargetError (#119),
+            # WorktreeRemovalBlockedError (#120) and InvalidRepoError (#123)
+            # in worktree_remove.
+            #
+            # Ticket #116: when a create's JSON-RPC response is lost to a
+            # transport drop ("Connection closed"), the caller loses the
+            # record's *random* 8-hex id suffix, which is not re-derivable
+            # from anything it holds. Naming the landed environment inline
+            # makes the blind retry self-diagnosing. Best-effort only: the
+            # lookup mirrors the engine's own key derivation
+            # (`_validate_repo` == classify_checkout(resolved path).repo_root),
+            # and any failure falls back to the engine's bare text -- an id
+            # is never invented.
+            existing = None
+            try:
+                resolved_root = classify_checkout(
+                    Path(repo_root).expanduser().resolve()
+                ).repo_root.as_posix()
+                existing = manager.state.find_by_branch(resolved_root, branch)
+            except Exception:  # noqa: BLE001 -- diagnostics must never re-fail
+                existing = None
+            if existing is not None:
+                raise ValueError(
+                    f'{exc} (existing_environment_id: "{existing.id}",'
+                    f' existing_path: "{existing.path}")'
+                ) from exc
+            raise ValueError(str(exc)) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -728,6 +791,29 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         The raised message includes the engine's own text plus an explicit
         ``backing: "primary"`` token so callers can react programmatically
         without parsing prose.
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        Read back with ``environment_list(path=<the REPO ROOT>)`` -- never
+        with the removed checkout's own path. If the removal landed that
+        path is gone, and passing it back to any tool yields ``ValueError``
+        text of the form ``invalid checkout_path '<p>': checkout_path does
+        not exist: ...``, which is byte-for-byte what a simple typo
+        produces. That error is therefore NOT evidence that the removal
+        succeeded. From the repo root the reading is unambiguous:
+
+        - entry absent -> the removal landed; you are done.
+        - entry present with ``status: "orphaned"`` -> partially landed
+          (the directory is gone, the record survives). Finish it with
+          ``worktree_remove(environment_id=<that entry's id>)``.
+        - entry present and unchanged -> the removal did not land; retry.
+
+        A blind retry addressed by ``environment_id`` is self-diagnosing:
+        an already-removed target comes back as the soft ``{"error":
+        "...", "code": "not_found"}`` instead of raising. A blind retry
+        addressed by ``checkout_path`` is not -- it raises the misleading
+        "does not exist" text above. **Prefer ``environment_id`` for any
+        retry after a transport failure.**
         """
 
         try:
@@ -887,6 +973,24 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         tracked repo whose on-disk clone has since vanished is skipped
         gracefully rather than failing the whole call -- only a bad ``path``
         argument raises.
+
+        **Retrying this call is always safe.** It never writes state, so a
+        transport-level failure ("Connection closed", "MCP error -32000")
+        can be retried unconditionally. That is precisely what makes it
+        the read-back tool for deciding whether a lost *mutating* call
+        landed -- see the "Transport-level failure" block in
+        ``worktree_create``, ``worktree_remove``, ``environment_start``
+        and ``environment_stop``.
+
+        **Fields this call never populates.** Each entry carries every
+        ``WorktreeRecord`` key, but three of them are transient by design
+        and are never persisted to ``state.yaml``: ``stop_attempt``,
+        ``killed_pids`` and ``shadowed_contract``. Because this call
+        rebuilds every entry from persisted state, those three are always
+        ``null``/``[]`` here regardless of what actually happened. They
+        are readable ONLY on the response of the call that produced them
+        (``environment_stop``, ``worktree_remove``,
+        ``environment_start``). Never use them as read-back evidence.
         """
         if scope not in ("repo", "all"):
             raise ValueError(
@@ -1227,6 +1331,34 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         parsing the error text. The message names whichever target
         identifier was supplied (``environment_id`` if given, else
         ``checkout_path``).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        A transport error tells you nothing about whether the start
+        landed. Read back with ``environment_list(path=<checkout path or
+        repo root>)`` and inspect the entry's ``pids``.
+
+        The unambiguous case first: if your ``role`` (default ``"main"``)
+        is a key in ``pids``, the start landed AND the process is still
+        alive -- ``variants[<role>]`` names the variant that was selected,
+        and there is nothing further to do.
+
+        If the role is absent the reading is ambiguous: either the start
+        never happened, or it happened and the process has since exited
+        (this listing reconciles dead pids away, so the two look
+        identical). A heuristic can sometimes break the tie, but only for
+        a role that was never started before -- for such a role a
+        non-``null`` ``returncode``/``start_log_path`` proves a spawn
+        occurred, whereas for a role that HAS been started at some earlier
+        point both fields are leftovers from that earlier run, are not
+        cleared by reconciliation, and therefore decide nothing at all; in
+        that case the only reliable evidence is the content and mtime of
+        the file at ``start_log_path``.
+
+        A blind retry is protected by ``{"error": "...", "code":
+        "already_running"}`` only while the previously started pid is
+        ALIVE. A start that landed and whose process then exited is not
+        protected: the blind retry starts a second process.
         """
 
         try:
@@ -1457,6 +1589,38 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         parsing the error text. The message names whichever target
         identifier was supplied (``environment_id`` if given, else
         ``checkout_path``).
+
+        Transport-level failure ("Connection closed"): confirm before retrying
+        ---------------------------------------------------------------------
+        Read back with ``environment_list(path=<checkout path or repo
+        root>)`` and inspect ``pids``: your ``role`` absent means no live
+        tracked process remains under it (the stop landed, or the process
+        was already gone); the role still present means the stop did not
+        land.
+
+        Honest limits: the listing cannot tell you whether the contract's
+        ``stop:`` steps ran. The persisted ``stop_detail`` (and a sticky
+        ``status: "stop_incomplete"``) is the only stop diagnostic that
+        survives into ``environment_list``; the richer ``stop_attempt``
+        exists ONLY on this call's own response and is never readable from
+        the listing -- so it can never serve as read-back evidence.
+
+        A blind retry that *returns* is safe: it comes back as one of three
+        soft outcomes -- ``{"error": "...", "code": "not_found"}`` (mapping
+        ``WorktreeNotFoundError``), ``{"error": "...", "code":
+        "not_running"}`` (mapping ``ProcessNotRunningError``), or a
+        graceful no-op reported as ``stop_attempt.outcome:
+        "no_process_recorded"``. But those three are not the only possible
+        outcomes -- this is not an exhaustive disjunction. The same call can
+        instead **raise ``ValueError``**
+        when the target itself fails to resolve: an invalid
+        ``checkout_path`` (``InvalidRepoError``, ticket #123), a missing or
+        mutually-disagreeing ``environment_id``/``checkout_path`` pair
+        (``CheckoutTargetError``), or a ``variant`` that fails to resolve to
+        a role (``VariantResolutionError`` -- see "``role`` vs ``variant``"
+        above for its three failure modes). Branching on ``code`` is only
+        meaningful for a call that *returned*; a raise is a separate path
+        the caller must handle independently, not a third value of ``code``.
         """
 
         try:
