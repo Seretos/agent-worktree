@@ -391,6 +391,132 @@ def _start_step_names(repo_root: str) -> Optional[List[str]]:
         return None
 
 
+def _default_stop_variant(
+    manager: WorktreeManager,
+    environment_id: Optional[str],
+    checkout_path: Optional[str],
+) -> str:
+    """Pre-resolve ``environment_stop``'s ``variant="default"`` so it can
+    stop the same lone-named-step environment ``environment_start`` starts
+    by default (ticket #139 Part B).
+
+    Root cause and why this is fixed here, not upstream
+    -----------------------------------------------------
+    The engine's ``start()`` tier-3 fallback (upstream lib-python-worktree
+    #112, shipped in the pinned v0.3.5) lets a bare ``variant="default"``
+    call resolve a contract's lone ``start:`` step even when that step
+    carries its own ``name:`` -- but it then records ``variant=step.name or
+    variant`` (``manager.py``), i.e. the step's own name, never the literal
+    ``"default"``. The engine's own docstring calls this "a deliberate,
+    documented asymmetry": ``stop(variant="default")`` -- the same literal
+    the caller passed to ``start()`` -- will not resolve against that role,
+    because no role is ever recorded under the variant ``"default"`` once
+    the fallback substitutes the step's own name. Changing that upstream
+    would be a behaviour/contract change to a documented-as-deliberate
+    engine decision, and is not implementable from this repo. But the
+    engine's own docstring for ``stop()`` explicitly assigns exactly this
+    translation job to this layer: any dict-shaped soft-error contract "is
+    owned by the MCP wrapper layer in the separate agent-worktree plugin
+    repo, which translates this engine's return values/exceptions into
+    whatever shape its tool surface promises callers". Mirroring ``start()``
+    's own tier-3 fallback here, wrapper-side, against pure record/contract
+    data the wrapper already has read access to, satisfies that contract
+    without touching the engine.
+
+    Never raises. Strict precedence, in order:
+
+    1. Locate the target record -- ``manager.state.get(environment_id)`` if
+       given, else via ``checkout_path``: resolve it through
+       ``classify_checkout()``, then branch on ``info.backing`` exactly as
+       ``WorktreeManager._resolve_target()`` does -- a primary id lookup
+       only when ``backing == "primary"``, else a resolved-path match over
+       this repo's non-primary tracked records. ``info.repo_root`` is
+       always the main clone's root regardless of which checkout
+       ``checkout_path`` itself belongs to, so the primary id lookup must
+       never be attempted unconditionally -- doing so would resolve a
+       linked-worktree ``checkout_path`` to its repo's *primary* record
+       instead. Any failure at this step (invalid ``checkout_path``,
+       unknown id, no match at all) falls through to step 4 below -- the
+       original engine error text for whatever is actually wrong with the
+       addressing pair must survive verbatim, this helper is never the
+       thing that raises for it.
+    2. If ``"default"`` is already present in ``record.variants.values()``,
+       return ``"default"`` unchanged. This keeps every existing exact-match
+       call byte-for-byte unaffected, and makes this helper forward-
+       compatible with a future engine bump that starts recording the
+       caller's literal itself (e.g. as part of resolving the upstream
+       ticket this fix's plan recommends filing): the plain path resolves
+       first and this fallback simply never engages.
+    3. Else, load ``<record.repo_root>/.seretos/worktree-setup.yml``. If it
+       declares exactly one ``start:`` step and that step has a non-empty
+       ``name:`` other than ``"default"``, return that name -- mirroring
+       ``start()``'s own tier-3 rule byte-for-byte (single step, named or
+       not, resolves ``variant="default"``).
+    4. Any miss -- no record, no contract, an unreadable contract, more
+       than one ``start:`` step, or a lone step that is *unnamed* (which the
+       engine already records under the literal ``"default"``, so step 2
+       already covers it) -- returns ``"default"`` unchanged, so today's
+       ``VariantResolutionError`` failure path for every one of those cases
+       is byte-for-byte what it was before this helper existed.
+
+    Only engages when the caller's ``variant`` is exactly the string
+    ``"default"``; ``environment_stop``'s call site only invokes this
+    helper in that case, so ``variant=None`` (the default -- no resolution
+    at all) and every other literal are entirely untouched by this helper's
+    existence.
+    """
+    try:
+        record: Optional[WorktreeRecord] = None
+        if environment_id is not None:
+            record = manager.state.get(environment_id)
+        if record is None and checkout_path is not None:
+            info = classify_checkout(checkout_path)
+            if info.backing == "primary":
+                # Mirrors WorktreeManager._resolve_target()'s primary branch
+                # (manager.py:1698-1700): classify_checkout() documents that
+                # info.repo_root is always the main clone's root regardless
+                # of which checkout checkout_path itself belongs to, so this
+                # lookup must only be attempted when checkout_path actually
+                # IS the primary -- otherwise it returns the primary's own
+                # record for a linked-worktree checkout_path too (ticket
+                # #139 fix-cycle finding).
+                record = manager.state.get(primary_id_for(info.repo_root))
+            else:
+                # checkout_path resolved to a linked worktree: go straight
+                # to the path/containment match, scoped to this repo's
+                # non-primary records, mirroring _resolve_target()'s
+                # "worktree" branch (manager.py:1701-1719).
+                target = Path(info.checkout_path).resolve()
+                repo_root_str = info.repo_root.as_posix()
+                for rec in manager.state.list():
+                    if rec.backing == "primary" or rec.repo_root != repo_root_str:
+                        continue
+                    if Path(rec.path).resolve() == target:
+                        record = rec
+                        break
+        if record is None:
+            return "default"
+
+        if any(v == "default" for v in record.variants.values()):
+            return "default"
+
+        contract_path = Path(record.repo_root) / CONTRACT_FILENAME
+        if not contract_path.exists():
+            return "default"
+        contract = load_contract(contract_path)
+        if len(contract.start) == 1:
+            name = contract.start[0].name
+            if isinstance(name, str) and name and name != "default":
+                return name
+        return "default"
+    except Exception:  # noqa: BLE001 -- best-effort resolution must never
+        # raise; any failure here must leave environment_stop's existing
+        # behaviour (and error text) completely unaffected. Mirrors the
+        # blanket-except posture of worktree_create's DuplicateWorktreeError
+        # enrichment (worktree.py, ticket #116).
+        return "default"
+
+
 def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     """Shape one ``EnvironmentEntry`` (from ``WorktreeManager.list_repo``)
     into the flat dict returned by ``environment_list``.
@@ -969,10 +1095,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         Raises ``ValueError`` for an unknown ``scope``, or when ``path`` itself
         is not a valid, existing git repository (mapped from the engine's
-        ``InvalidRepoError``). Under ``scope="all"``, a *different*, previously
-        tracked repo whose on-disk clone has since vanished is skipped
-        gracefully rather than failing the whole call -- only a bad ``path``
-        argument raises.
+        ``InvalidRepoError``, re-worded per ticket #123's pattern to name
+        ``path`` instead of the engine-internal ``repo_root`` parameter,
+        with the full diagnostic reason preserved). Under ``scope="all"``, a
+        *different*, previously tracked repo whose on-disk clone has since
+        vanished is skipped gracefully rather than failing the whole call --
+        only a bad ``path`` argument raises.
 
         **Retrying this call is always safe.** It never writes state, so a
         transport-level failure ("Connection closed", "MCP error -32000")
@@ -1000,6 +1128,25 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         try:
             listing = manager.list_repo(path)
         except InvalidRepoError as exc:
+            # InvalidRepoError subclasses WorktreeError. environment_list
+            # deliberately has no generic `except WorktreeError` tail today
+            # (unlike worktree_remove/environment_start/environment_stop) --
+            # this comment documents that invariant for whoever adds one
+            # later, so its ordering relative to this catch gets the same
+            # MRO-ordering scrutiny given to the sibling catches at #119/
+            # #120/#123.
+            # Ticket #123/#139: the engine's message names its internal
+            # `repo_root` parameter, which this tool doesn't have -- rename
+            # it to `path` only when the rejected path is the one this
+            # wrapper actually received (identity guard), so an
+            # InvalidRepoError from some other internally-resolved path
+            # (e.g. the scope="all" fan-out over other tracked repo roots,
+            # which already skips stale roots gracefully rather than
+            # raising) is never mislabelled.
+            if path is not None and exc.repo_root == path:
+                raise ValueError(
+                    _invalid_path_error_text(exc, param_name="path")
+                ) from exc
             raise ValueError(str(exc)) from exc
 
         entries = [_entry_to_dict(e) for e in listing.entries]
@@ -1183,17 +1330,18 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         call can address that role without the caller having to separately
         track which role it used -- see ``environment_stop``'s docstring.
 
-        **Asymmetry warning:** when tier 3 of the variant resolution above
-        (the lone-step fallback) resolves a *named* step from a bare
-        ``variant="default"`` call, the value recorded in
-        ``record.variants[role]`` is that step's own name (e.g.
-        ``"main"``) -- never the literal string ``"default"`` -- because
-        the engine records ``variant=step.name or variant``. A later
-        ``environment_stop(variant="default")`` will not resolve against
-        that role, since ``record.variants[role]`` is never ``"default"``
-        in that case. To stop it, either omit ``variant`` entirely
-        (``role`` alone defaults to ``"main"``) or pass the step's actual
-        name, e.g. ``environment_stop(variant="main")``.
+        **Symmetry with environment_stop (ticket #139):** when tier 3 of the
+        variant resolution above (the lone-step fallback) resolves a *named*
+        step from a bare ``variant="default"`` call, the value the *engine*
+        records in ``record.variants[role]`` is that step's own name (e.g.
+        ``"main"``) -- never the literal string ``"default"`` -- because the
+        engine itself records ``variant=step.name or variant``. Despite
+        that, a later ``environment_stop(variant="default")`` call **does**
+        resolve a lone-named-step environment: this wrapper compensates by
+        pre-resolving a bare ``"default"`` to the same lone-step contract
+        rule before ever calling the engine -- see ``environment_stop``'s
+        docstring for the mechanism. Passing the step's actual name, e.g.
+        ``environment_stop(variant="main")``, keeps working too.
 
         Parameters
         ----------
@@ -1220,9 +1368,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             exactly one ``start:`` step total. Two or more steps with none
             named ``"default"`` still raise ``ValueError`` listing the
             available names. See "``role`` vs ``variant``" above for how
-            this relates to the ``role`` parameter, including the
-            asymmetry warning about ``environment_stop(variant="default")``
-            when the lone-step fallback resolves a named step.
+            this relates to the ``role`` parameter, including the note on
+            ``environment_stop(variant="default")``'s symmetry with this
+            resolution when the lone-step fallback resolves a named step.
         env:
             Optional dict of extra environment variables merged into the process
             environment by the engine. Omit (or pass ``None``) to inherit the
@@ -1486,16 +1634,25 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - Both given: they must agree -- ``variant`` must resolve to exactly
           the role named by ``role``, or a ``ValueError`` is raised.
 
-        **Asymmetry warning:** ``environment_start``'s three-tier
-        ``variant="default"`` resolution includes a lone-step fallback that
-        can fire for a *named* step (see ``environment_start``'s "``role``
-        vs ``variant``" section). When it does, ``record.variants[role]``
-        stores that step's own name -- never the literal string
-        ``"default"``. As a result, calling
-        ``environment_stop(variant="default")`` afterwards **will not
-        resolve** against that role: ``record.variants`` never contains
-        ``"default"`` in that case. Use ``role="main"`` (the default) or
-        pass the step's actual name as ``variant`` instead.
+        **Symmetry with environment_start (ticket #139):**
+        ``environment_start``'s three-tier ``variant="default"`` resolution
+        includes a lone-step fallback that can fire for a *named* step (see
+        ``environment_start``'s "``role`` vs ``variant``" section). When it
+        does, the *engine* records that step's own name in
+        ``record.variants[role]`` -- never the literal string ``"default"``.
+        This tool compensates for that: a bare ``environment_stop(variant=
+        "default")`` call **does resolve** a lone-named-step environment --
+        before ever calling the engine, this wrapper pre-resolves
+        ``"default"`` to whatever single named ``start:`` step the
+        contract declares (mirroring ``environment_start``'s own tier-3
+        rule), so the same call that started it can stop it too. This only
+        engages when ``record.variants`` does not already contain the
+        literal ``"default"`` (an exact-match ``environment_start(variant=
+        "default")`` call, or a step literally named ``"default"``, both
+        keep resolving via the plain match as before). Passing the step's
+        actual name, e.g. ``environment_stop(variant="main")``, or omitting
+        ``variant`` and relying on ``role="main"`` (the default), both keep
+        working exactly as before.
 
         Resolution can fail three ways, all surfaced as ``ValueError`` (never
         a soft error dict): the variant matches no currently-running role
@@ -1570,6 +1727,21 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``status: "stopped"`` only when no other role is still tracked in
         ``pids``), not this one.
 
+        ``not_running`` reachability (ticket #139, version-scoped to the
+        pinned engine v0.3.5): this is a genuinely live branch, not a
+        documentation-only relic kept "just in case". It fires when the pid
+        entry for the resolved role disappears between the engine's own
+        ``WorktreeManager.stop()`` snapshotting the record early on and its
+        delegated ``process_lifecycle.stop()`` performing its own,
+        independent, fresh re-read of the same state-store entry immediately
+        before deciding whether to raise ``ProcessNotRunningError`` -- a
+        window a **concurrent** writer can close: another ``environment_stop``
+        call racing for the same role, or an ``environment_list`` call whose
+        ``reconcile()`` pass prunes a dead pid out from under it. This is
+        distinct from -- and must not be confused with -- the tracked-but-
+        never-started ``no_process_recorded`` no-op path described just
+        above, which is reached without any concurrent actor at all.
+
         On success returns the canonical environment record dict. Fields of
         note:
 
@@ -1623,6 +1795,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         the caller must handle independently, not a third value of ``code``.
         """
 
+        # Ticket #139 Part B: pre-resolve a bare variant="default" before
+        # ever calling the engine -- not a retry, no nested try/except. See
+        # _default_stop_variant's docstring for the full rationale and
+        # precedence rule; it never raises, and only ever changes behaviour
+        # when variant is exactly "default".
+        if variant == "default":
+            variant = _default_stop_variant(manager, environment_id, checkout_path)
+
         try:
             record = manager.stop(
                 environment_id,
@@ -1641,6 +1821,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                 "code": "not_found",
             }
         except ProcessNotRunningError as exc:
+            # Ticket #139 Part C: confirmed reachable, not dead code, for the
+            # pinned engine v0.3.5 -- `manager.stop()` (manager.py ~:1510)
+            # snapshots the record via `_resolve_target()` and only checks
+            # `effective_role not in record.pids` (manager.py ~:1556)
+            # against THAT snapshot, after running the best-effort contract
+            # `stop:` steps in between. The delegated
+            # `process_lifecycle.stop()` then performs its OWN, independent,
+            # fresh `store.get(worktree_id)` re-read (process_lifecycle.py
+            # ~:2802) immediately before raising this exception if the role
+            # is still absent (~:2809). A concurrent writer -- another
+            # `environment_stop` call for the same role, or an
+            # `environment_list` call whose `reconcile()` pass prunes a dead
+            # pid -- can close that pid entry in the gap between the two
+            # reads, so this branch is live. Do not "clean this up" as
+            # unreachable without re-verifying against whichever
+            # lib-python-worktree version is pinned at the time.
             return {"error": str(exc), "code": "not_running"}
         except CheckoutTargetError as exc:
             raise ValueError(
