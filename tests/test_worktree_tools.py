@@ -2155,9 +2155,11 @@ def test_tool_environment_start_default_cwd_falls_back_to_worktree_path(tmp_path
 
 
 def test_tool_environment_start_surfaces_start_log_path(tmp_path: Path):
-    """The engine's ``start_log_path`` diagnostic field (path to the captured
-    startup log for the spawned process) must flow through to the tool's
-    response dict so callers can inspect it when a process exits immediately.
+    """The engine's per-role ``start_log_paths`` mapping (ticket #145,
+    upstream lib-python-worktree#119) must flow through to the tool's
+    response dict, both as the raw mapping and as a scalar ``start_log_path``
+    derived for the role this call requested, so callers can inspect it when
+    a process exits immediately.
     """
     from unittest.mock import patch
 
@@ -2177,11 +2179,8 @@ def test_tool_environment_start_surfaces_start_log_path(tmp_path: Path):
         path=str(wt_path),
         status="running",
         pids={"main": 4242},
+        start_log_paths={"main": "/logs/start-main.log"},
     )
-    # Set post-construction (not a constructor kwarg) so this test doesn't
-    # error at collection/call time before the dependency is bumped and
-    # ``start_log_path`` becomes a real dataclass field.
-    record.start_log_path = "/logs/start-main.log"
 
     state = InMemoryStateStore()
     state.add(record)
@@ -2201,6 +2200,152 @@ def test_tool_environment_start_surfaces_start_log_path(tmp_path: Path):
         f"Expected start_log_path to flow through to the response dict, "
         f"got {result.get('start_log_path')!r}"
     )
+    assert result.get("start_log_paths") == {"main": "/logs/start-main.log"}, (
+        f"Expected the raw start_log_paths mapping to flow through unchanged "
+        f"via asdict(), got {result.get('start_log_paths')!r}"
+    )
+
+
+def test_tool_environment_start_start_log_path_is_scoped_to_requested_role(
+    tmp_path: Path,
+):
+    """A multi-role record must not bleed another role's log path into the
+    scalar ``start_log_path`` -- this is the exact cross-role bleed upstream
+    lib-python-worktree#119 fixed by keying ``start_log_paths`` per role.
+    ``environment_start(role="ui")`` must return ``ui``'s path, never
+    ``main``'s.
+    """
+    from unittest.mock import patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    wt_path = tmp_path / "store" / "repo" / "wt-log-test-multirole"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+
+    worktree_id = "wt-log-test-multirole"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/log-test",
+        path=str(wt_path),
+        status="running",
+        pids={"main": 4242, "ui": 4243},
+        start_log_paths={
+            "main": "/logs/start-main.log",
+            "ui": "/logs/start-ui.log",
+        },
+    )
+
+    state = InMemoryStateStore()
+    state.add(record)
+
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"),
+        state=state,
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    with patch.object(mgr, "start", return_value=record):
+        result = fn(environment_id=worktree_id, role="ui")
+
+    assert result.get("start_log_path") == "/logs/start-ui.log", (
+        f"Expected the scalar start_log_path to be scoped to the requested "
+        f"role ('ui'), not another role's entry, got "
+        f"{result.get('start_log_path')!r}"
+    )
+
+
+def test_tool_environment_start_start_log_path_edge_cases(tmp_path: Path):
+    """Edge cases pinning the ``.get(role)`` derivation semantics against
+    upstream's invariants: a no-op ``"ready"`` start records no key at all
+    (never a ``None`` value) for a role, and ``stop()`` deliberately does not
+    pop ``start_log_paths[role]`` so a role can outlive its pid entry.
+    """
+    from unittest.mock import patch
+
+    from mcp.server.fastmcp import FastMCP
+    from worktree_plugin.tools.worktree import register
+
+    mcp = FastMCP("test")
+
+    def _make_record(worktree_id: str, wt_path: Path, repo_root: Path, **kwargs):
+        wt_path.mkdir(parents=True)
+        repo_root.mkdir()
+        return WorktreeRecord(
+            id=worktree_id,
+            repo_root=str(repo_root),
+            branch="feature/log-test",
+            path=str(wt_path),
+            **kwargs,
+        )
+
+    # Case 1: empty mapping (no-op "ready" start, nothing spawned) -> scalar
+    # is None, no KeyError.
+    worktree_id = "wt-log-test-empty"
+    record = _make_record(
+        worktree_id,
+        tmp_path / "store" / "repo" / worktree_id,
+        tmp_path / "repo-root-empty",
+        status="ready",
+        pids={},
+        start_log_paths={},
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(config=ManagerConfig(store_root=tmp_path / "store"), state=state)
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+    with patch.object(mgr, "start", return_value=record):
+        result = fn(environment_id=worktree_id)
+    assert result.get("start_log_path") is None
+    assert result.get("start_log_paths") == {}
+
+    # Case 2: role retained past stop() -- present in start_log_paths but
+    # absent from pids -- scalar still surfaces, no exception.
+    worktree_id2 = "wt-log-test-stopped"
+    record2 = _make_record(
+        worktree_id2,
+        tmp_path / "store" / "repo" / worktree_id2,
+        tmp_path / "repo-root-stopped",
+        status="stopped",
+        pids={},
+        start_log_paths={"main": "/logs/start-main.log"},
+    )
+    state2 = InMemoryStateStore()
+    state2.add(record2)
+    mgr2 = WorktreeManager(config=ManagerConfig(store_root=tmp_path / "store"), state=state2)
+    mcp2 = FastMCP("test2")
+    register(mcp2, mgr2)
+    fn2 = mcp2._tool_manager._tools["environment_start"].fn
+    with patch.object(mgr2, "start", return_value=record2):
+        result2 = fn2(environment_id=worktree_id2)
+    assert result2.get("start_log_path") == "/logs/start-main.log"
+
+    # Case 3: role present in pids but absent from start_log_paths -> scalar
+    # is None, no exception.
+    worktree_id3 = "wt-log-test-nolog"
+    record3 = _make_record(
+        worktree_id3,
+        tmp_path / "store" / "repo" / worktree_id3,
+        tmp_path / "repo-root-nolog",
+        status="running",
+        pids={"main": 4242},
+        start_log_paths={},
+    )
+    state3 = InMemoryStateStore()
+    state3.add(record3)
+    mgr3 = WorktreeManager(config=ManagerConfig(store_root=tmp_path / "store"), state=state3)
+    mcp3 = FastMCP("test3")
+    register(mcp3, mgr3)
+    fn3 = mcp3._tool_manager._tools["environment_start"].fn
+    with patch.object(mgr3, "start", return_value=record3):
+        result3 = fn3(environment_id=worktree_id3)
+    assert result3.get("start_log_path") is None
 
 
 # ---- Ticket #66: SetupFailedError from worktree_create is caught as ValueError ----
