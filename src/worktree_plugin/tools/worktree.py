@@ -1393,9 +1393,16 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``ports``: a dict mapping port name to host port number; empty dict
           ``{}`` before port setup runs.
         - ``start_log_path``: filesystem path to the engine's captured
-          startup log for the spawned process; useful for diagnosing a
-          process that exits immediately. May be absent/``null`` on a no-op
-          ``"ready"`` start where nothing was spawned. **Role-casing
+          startup log for *this call's requested* ``role``, derived as
+          ``start_log_paths.get(role)``; useful for diagnosing a process
+          that exits immediately. May be absent/``null`` on a no-op
+          ``"ready"`` start where nothing was spawned.
+        - ``start_log_paths``: the full per-role mapping (``Dict[str,
+          str]``) that ``start_log_path`` above is derived from -- one
+          entry per role that has ever been started, keyed by the
+          **verbatim** ``role`` string. ``environment_stop`` deliberately
+          does not pop a role's entry on stop, so a role may still appear
+          here after it no longer appears in ``pids``. **Role-casing
           caveat:** the filename is ``start-<slug(role)>.log``, where the
           slug is the ``role`` **lower-cased**, with non-alphanumeric runs
           collapsed to ``-`` and truncated to 40 characters -- unlike
@@ -1496,12 +1503,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         (this listing reconciles dead pids away, so the two look
         identical). A heuristic can sometimes break the tie, but only for
         a role that was never started before -- for such a role a
-        non-``null`` ``returncode``/``start_log_path`` proves a spawn
-        occurred, whereas for a role that HAS been started at some earlier
-        point both fields are leftovers from that earlier run, are not
-        cleared by reconciliation, and therefore decide nothing at all; in
-        that case the only reliable evidence is the content and mtime of
-        the file at ``start_log_path``.
+        non-``null`` ``returncode`` or the role's presence in
+        ``start_log_paths`` (``environment_list`` surfaces this as
+        ``entry["start_log_paths"]``, never a scalar ``start_log_path``)
+        proves a spawn occurred, whereas for a role that HAS been started
+        at some earlier point both signals are leftovers from that
+        earlier run, are not cleared by reconciliation, and therefore
+        decide nothing at all; in that case the only reliable evidence is
+        the content and mtime of the file at ``start_log_paths[role]``.
 
         A blind retry is protected by ``{"error": "...", "code":
         "already_running"}`` only while the previously started pid is
@@ -1557,7 +1566,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             raise ValueError(str(exc)) from exc
         except (WorktreeError, ProcessLifecycleError) as exc:
             raise ValueError(str(exc)) from exc
-        return {**_record_to_dict(record), **_contract_diagnostics(record, role)}
+        # `record` is guaranteed to be a WorktreeRecord here: manager.start()
+        # is typed `-> WorktreeRecord` and every error path above returns
+        # early, so `.start_log_paths` is always safe to access.
+        return {
+            **_record_to_dict(record),
+            "start_log_path": record.start_log_paths.get(role),
+            **_contract_diagnostics(record, role),
+        }
 
     @mcp.tool()
     def environment_stop(
