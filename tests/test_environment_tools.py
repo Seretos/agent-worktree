@@ -2662,11 +2662,13 @@ def test_environment_start_docstring_consolidates_three_addressing_outcomes(
 def test_environment_start_docstring_documents_start_log_path_role_casing(
     tmp_path: Path,
 ):
-    """Claim under protection (ticket #130, re-slicing #128): start_log_path's
-    filename is a lower-cased slug of role, while pids/record.variants key
-    on role verbatim -- documented (not fixed; upstream lib-python-worktree
-    defect), fully-qualified as Seretos/lib-python-worktree#111 so it is
-    never confused with this repo's own closed #111 (thread-leak ticket)."""
+    """Claim under protection (ticket #146, correcting #130/#128): start_log_path's
+    filename is a *case-preserving* slug of role (never lower-cased), while
+    pids/record.variants key on role verbatim -- fully-qualified as
+    Seretos/lib-python-worktree#111 so it is never confused with this repo's
+    own closed #111 (thread-leak ticket). v0.3.7 fixed the upstream
+    lower-casing bug that #111 originally reported; the residual caveat is
+    the case-insensitive-filesystem interleaving, not lower-casing."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     doc = fns["environment_start"].__doc__ or ""
     norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
@@ -2681,6 +2683,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
         if (
             "seretos/lib-python-worktree#111" in window
             and ("lower" in window or "slug" in window)
+            and "preserv" in window
             and "pids" in window
         ):
             found = True
@@ -2689,7 +2692,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
     assert found, (
         "docstring must have at least one start_log_path mention whose "
         "surrounding window fully-qualifies the upstream #111 reference, "
-        "names the lower-case/slug behaviour, and mentions pids"
+        "names the case-preserving slug behaviour, and mentions pids"
     )
 
 

@@ -488,10 +488,13 @@ def test_docs_document_tracked_vs_foreign_blocking_processes():
 
 
 def test_docs_document_start_log_path_role_casing():
-    """Claim under protection (ticket #130, re-slicing #128): SKILL.md and
-    AGENTS.md must document that start_log_path's filename is a lower-cased
-    slug of role while pids/record.variants key on role verbatim, citing
-    the fully-qualified upstream defect."""
+    """Claim under protection (ticket #146, correcting #130/#128): SKILL.md and
+    AGENTS.md must document that start_log_path's filename is a
+    *case-preserving* slug of role (never lower-cased) while pids/
+    record.variants key on role verbatim, citing the fully-qualified
+    upstream reference. v0.3.7 fixed the lower-casing bug #111 originally
+    reported; the residual caveat is case-insensitive-filesystem
+    interleaving, not lower-casing."""
     for path in (SKILL_MD, AGENTS_MD):
         text = path.read_text(encoding="utf-8")
         norm = _normalize(text)
@@ -506,6 +509,7 @@ def test_docs_document_start_log_path_role_casing():
             if (
                 "seretos/lib-python-worktree#111" in window
                 and ("lower" in window or "slug" in window)
+                and "preserv" in window
                 and "pids" in window
             ):
                 found = True
@@ -514,8 +518,8 @@ def test_docs_document_start_log_path_role_casing():
         assert found, (
             f"{path.name} must have at least one start_log_path mention "
             "whose surrounding window fully-qualifies the upstream #111 "
-            "reference, names the lower-case/slug behaviour, and mentions "
-            "pids"
+            "reference, names the case-preserving slug behaviour, and "
+            "mentions pids"
         )
 
 
@@ -534,6 +538,133 @@ def test_upstream_issue_111_reference_is_fully_qualified():
             f"'Seretos/lib-python-worktree' near: "
             f"{text[max(0, match.start() - 40) if match else 0:(match.end() + 40) if match else 0]!r}"
         )
+
+
+# ---- Ticket #146, Topic 1: contract copy (committed/live) vs live filesystem read ----
+
+
+def test_docs_document_contract_copy_vs_live_read():
+    """Claim under protection (ticket #146, Topic 1): worktree.py and
+    SKILL.md must document that environment_start/environment_stop always
+    read the contract live from repo_root on every call, that the
+    checkout-local .seretos/ copy is written once at create time and never
+    re-read, and that a shadowed_contract reason of "differs" is the
+    expected, diagnosed signal for that divergence (not a malfunction)."""
+    for path in (WORKTREE_PY, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"shadowed_contract|\.seretos", norm))
+        assert occurrences, f"{path.name} must mention shadowed_contract/.seretos"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 900) : idx + 900]
+            if (
+                "live" in window
+                and "on every" in window
+                and ("create-time" in window or "create time" in window)
+                and "repo_root" in window
+                and "differs" in window
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one shadowed_contract/.seretos "
+            "mention whose surrounding window documents the 'live ... on "
+            "every' call read, the create-time copy, repo_root, and the "
+            "'differs' signal"
+        )
+
+
+# ---- Ticket #146, Topic 2: default per-OS step shell ----
+
+
+def test_docs_document_default_step_shell_per_os():
+    """Claim under protection (ticket #146, Topic 2): worktree.py and
+    SKILL.md must document the per-OS default shell used for a step that
+    omits shell: (powershell.exe on Windows, bash on POSIX), the accepted
+    override set, and the &&-under-PowerShell portability warning."""
+    for path in (WORKTREE_PY, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"shell:", norm))
+        assert occurrences, f"{path.name} must mention 'shell:'"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 200) : idx + 1200]
+            if (
+                "powershell" in window
+                and "bash" in window
+                and "windows" in window
+                and ("posix" in window or "linux" in window or "macos" in window)
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one 'shell:' mention whose "
+            "surrounding window names both the powershell and bash defaults "
+            "and both platform words (windows + posix/linux/macos)"
+        )
+
+        assert "&&" in text, (
+            f"{path.name} must warn that '&&' does not parse under the "
+            "Windows default powershell.exe"
+        )
+        for accepted in ("bash", "sh", "pwsh", "powershell"):
+            assert accepted in norm, (
+                f"{path.name} must list {accepted!r} as an accepted shell: override"
+            )
+
+
+# ---- Ticket #146, Topic 3: kill_orphans vs. unconditional Job Object kill ----
+
+
+def test_docs_document_kill_orphans_vs_job_object():
+    """Claim under protection (ticket #146, Topic 3): worktree.py, SKILL.md
+    and AGENTS.md must document that the tree/Job Object kill is
+    unconditional and that kill_orphans is a separate path-scoped scan, not
+    a deeper containment mechanism."""
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"kill_orphans", norm))
+        assert occurrences, f"{path.name} must mention kill_orphans"
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 200) : idx + 1400]
+            if (
+                "job object" in window
+                and "unconditional" in window
+                and ("path-scoped" in window or "path scoped" in window)
+            ):
+                found = True
+                break
+
+        assert found, (
+            f"{path.name} must have at least one kill_orphans mention whose "
+            "surrounding window documents the unconditional job-object kill "
+            "and the path-scoped nature of kill_orphans"
+        )
+
+    worktree_text = _normalize(WORKTREE_PY.read_text(encoding="utf-8"))
+    assert "job_member_list_truncated" in worktree_text, (
+        "worktree.py must document that kill_orphans does not help a "
+        "job_member_list_truncated stop_incomplete outcome"
+    )
+    assert "kill_orphans_may_help" in worktree_text, (
+        "worktree.py must document the stop_detail.kill_orphans_may_help "
+        "gating hint"
+    )
 
 
 # ---- Ticket #116: transport-level "Connection closed" read-back docs ----
