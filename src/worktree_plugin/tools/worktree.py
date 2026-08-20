@@ -650,7 +650,26 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``teardown:``/``ports:`` -- combining them is a hard schema-
         validation error, not a silent no-op. Each ``setup:`` step is a YAML
         mapping with a required ``run:`` key (the shell command) and
-        optional ``name:``/``shell:`` keys. Example::
+        optional ``name:``/``shell:`` keys.
+
+        **Default shell when a step omits ``shell:``.** The default is
+        per-OS: **Windows** runs the step under
+        ``powershell.exe -NoProfile -NonInteractive`` (Windows PowerShell
+        5.1, not ``pwsh``); **POSIX** (Linux/macOS) runs it under
+        ``bash -c``. This is the same default for ``setup:``, ``start:``,
+        ``stop:`` and ``teardown:`` steps alike. Accepted ``shell:``
+        override values are exactly ``bash``, ``sh``, ``pwsh``, and
+        ``powershell``; any other value raises ``ValueError: unknown step
+        shell: '<value>'`` when the step runs. ``-NonInteractive`` is always
+        passed to both PowerShell variants, so a step that would prompt
+        fails loudly instead of hanging. **Portability warning:** a
+        ``run:`` line using ``&&``, ``||``, ``$VAR``, backticks, or
+        ``2>&1`` is bash/cmd syntax and will not parse under the Windows
+        default ``powershell.exe`` (Windows PowerShell 5.1 has no ``&&``
+        operator, so this is a shell *parse* error, not a step failure with
+        a useful message) -- write ``shell: bash`` explicitly on such a
+        step (or use PowerShell's ``;`` / ``-and``) rather than relying on
+        the default. Example::
 
             version: 1
             isolation: full
@@ -662,7 +681,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``<repo_root>/.seretos/`` into the new worktree checkout when it
         would not otherwise be tracked there (see below) -- but that copy is
         never what ``environment_start``/``environment_stop`` read; they
-        always read the ``repo_root`` original. If you suspect the two have
+        always read the **live** ``<repo_root>/.seretos/worktree-setup.yml``
+        from disk, on every call -- an uncommitted edit takes effect
+        immediately, no commit and no worktree re-create needed. Which state
+        the checkout-local copy holds is conditional: if ``.seretos/`` is
+        **tracked** in git, ``git worktree add`` (inside ``create()``) has
+        already checked out the **committed** tree at the branch tip before
+        this create-time copy step runs, so the copy step is skipped
+        entirely (the destination already exists) -- an uncommitted edit at
+        ``repo_root`` then leaves this checkout-local copy pinned to the
+        last commit while start/stop already see the edit. If
+        ``.seretos/`` is **untracked/excluded** (the case the copy exists
+        for), the copy step runs once, at create time, copying the
+        **live** working-tree bytes -- and is never re-read afterwards
+        either. If you suspect the two have
         drifted, which signal to check depends on whether ``repo_root``'s own
         contract exists: if it is missing entirely while the checkout-local
         copy is present, ``environment_start``'s response carries
@@ -670,7 +702,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``no_op_reason`` stays ``None`` (the start proceeds normally against
         ``repo_root``'s contract) -- check that response's
         ``shadowed_contract`` field (``reason: "differs"``) instead; see
-        ``environment_start``'s docstring for its shape. The copy is marked ignored
+        ``environment_start``'s docstring for its shape. A ``"differs"``
+        reason is the **expected, diagnosed signal** for the
+        tracked-and-edited-uncommitted case above -- not a malfunction;
+        commit the contract (or re-create the worktree) to re-converge. The
+        copy is marked ignored
         via a self-ignoring ``.gitignore`` written inside it, so it stays
         invisible to ``git status`` and the worktree remains removable with
         ``worktree_remove``'s default ``force=False`` (ticket #110).
@@ -750,7 +786,8 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         # If .seretos/ exists in the repo root but was not copied into the new
         # worktree by git (common when the directory is excluded from tracking
-        # via .git/info/exclude), copy it now so setup can find the contract.
+        # via .git/info/exclude), copy it now so the contract is visible from
+        # inside the checkout.
         contract_dir_name = Path(CONTRACT_FILENAME).parts[0]  # ".seretos"
         src_contract_dir = Path(record.repo_root) / contract_dir_name
         dst_contract_dir = Path(record.path) / contract_dir_name
@@ -1185,9 +1222,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         from the environment's contract's ``start:`` steps in
         ``.seretos/worktree-setup.yml``. The engine reads this file from
         ``repo_root`` -- the original repository clone -- **not** from a
-        linked worktree checkout itself. ``worktree_create`` copies
-        ``.seretos/`` into a new worktree as a create-time convenience, but
-        that copy is not what the engine reads.
+        linked worktree checkout itself, and it reads it **live from disk on
+        every call**, never the checkout-local copy. ``worktree_create``
+        copies ``.seretos/`` into a new worktree as a create-time
+        convenience, but that copy is not what the engine reads.
 
         CAUTION: placing the contract only in a worktree checkout (and not at
         ``<repo_root>/.seretos/worktree-setup.yml``) still produces a
@@ -1276,8 +1314,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         have no name to list).
 
         Step schema: each ``start:`` entry is a YAML mapping with a required
-        ``run:`` key (the shell command to execute) and an optional ``name:``
-        key (used by ``variant`` to select that step). See the three-tier
+        ``run:`` key (the shell command to execute), an optional ``name:``
+        key (used by ``variant`` to select that step), and an optional
+        ``shell:`` key -- when omitted, the default is per-OS
+        (``powershell.exe -NoProfile -NonInteractive`` on Windows,
+        ``bash -c`` on POSIX/Linux/macOS); see ``worktree_create``'s
+        "Default shell when a step omits ``shell:``" section for the full
+        accepted-values list and the ``&&``-under-PowerShell portability
+        warning. See the three-tier
         resolution above for how a contract with only one ``start:`` step
         total -- named or not -- is matched by ``variant="default"``.
 
@@ -1314,8 +1358,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           records its pid under ``role="main"``, exactly like starting
           ``variant="default"`` would. ``record.pids[role]`` and
           ``record.variants[role]`` are both keyed by this **verbatim**
-          ``role`` string -- which is *not* how the start-log filename is
-          derived; see the ``start_log_path`` casing caveat below.
+          ``role`` string -- which is *nearly* how the start-log filename is
+          derived (sanitised, but case-preserved); see the
+          ``start_log_path`` casing caveat below.
         - ``variant`` only selects *which* contract ``start:`` step is run
           (by its ``name``). It has no effect on where the resulting pid is
           filed.
@@ -1403,21 +1448,31 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           **verbatim** ``role`` string. ``environment_stop`` deliberately
           does not pop a role's entry on stop, so a role may still appear
           here after it no longer appears in ``pids``. **Role-casing
-          caveat:** the filename is ``start-<slug(role)>.log``, where the
-          slug is the ``role`` **lower-cased**, with non-alphanumeric runs
-          collapsed to ``-`` and truncated to 40 characters -- unlike
-          ``pids``/``record.variants``, which key on the **verbatim**
-          ``role`` string. Example: ``role="API Server"`` files its pid
-          under ``pids["API Server"]`` but logs to
-          ``start-api-server.log``. Two roles differing only in case (e.g.
-          ``"API"`` and ``"api"``) become two distinct ``pids`` keys that
-          share one append-mode log file, interleaving their output. Never
-          derive the log path by slugging a ``pids``/``variants`` key
-          yourself -- always read ``start_log_path`` from the response.
-          Documented here, not fixed: this is an upstream engine defect,
-          tracked as ``Seretos/lib-python-worktree#111`` -- not to be
-          confused with this repository's own already-closed issue of the
-          same number, an unrelated thread-leak ticket.
+          caveat:** the ``start_log_path`` filename is
+          ``start-<slug(role)>.log``, a **case-preserving** slug of the
+          **verbatim** ``pids`` key -- never lower-cased, and
+          case-preserving is *not* upper-casing either; casing is simply
+          left untouched -- tracked at its origin as
+          ``Seretos/lib-python-worktree#111`` (the lower-casing bug it
+          originally reported was fixed upstream in the pinned v0.3.7).
+          Non-alphanumeric runs (``[^A-Za-z0-9]+``) collapse to a single
+          ``-``, leading/trailing ``-`` are stripped, the result is
+          truncated to 40 characters (and re-stripped), and a role with no
+          alphanumeric characters at all falls back to ``"_"`` (e.g.
+          ``start-_.log``). Example: ``role="API Server"`` files its pid
+          under ``pids["API Server"]`` and logs to
+          ``start-API-Server.log``. Two roles differing only in case (e.g.
+          ``"API"`` and ``"api"``) produce two *distinct* ``pids`` keys and
+          two *distinct* filename strings, but on a case-insensitive
+          filesystem (Windows, default macOS) those strings name the same
+          physical file and their append-mode output interleaves. Only the
+          *sanitisation* is lossy: ``"role a"``, ``"role-a"`` and
+          ``"role_a"`` all slug to ``role-a``. Never derive the log path by
+          slugging a ``pids``/``variants`` key yourself -- always read
+          ``start_log_path`` from the response. This is an accepted,
+          documented upstream limitation -- not to be confused with this
+          repository's own already-closed issue of the same number, an
+          unrelated thread-leak ticket.
 
         Contract diagnostics (ticket #103) -- five additive keys that make a
         real start distinguishable from every "nothing ran" flavour,
@@ -1704,24 +1759,34 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             the process is forcibly killed (SIGKILL/TerminateProcess). Defaults
             to ``10.0``.
         kill_orphans:
-            When ``True``, after the primary stop signal a cwd/open-file scan
-            terminates orphaned grandchild processes that were reparented away
-            from the tracked shell wrapper (e.g. a detached GUI started via
-            ``Start-Process -PassThru``). Defaults to ``False``
-            (backward-compatible).
+            When ``True``, after the primary stop signal a path-scoped scan
+            (cwd / cmdline token / open file / Windows handle table) also
+            terminates anything it finds under the environment's checkout
+            path -- a *different scope*, not a deeper containment
+            mechanism, from the unconditional process-tree/Job Object kill
+            described below. Defaults to ``False`` (backward-compatible).
+            See "``kill_orphans``: when it is actually necessary" below for
+            when this is genuinely needed versus wasted cost.
 
         Any contract ``stop:`` steps defined in ``.seretos/worktree-setup.yml``
         are executed best-effort before the graceful SIGTERM/CtrlBreak signal is
         sent; failures in those steps are logged but do not prevent the process
         from being stopped. As with ``environment_start``, the engine reads this
         file from ``repo_root`` -- the original repository clone -- not from a
-        linked worktree checkout itself; a contract placed only in the
-        checkout is silently ignored.
+        linked worktree checkout itself, and it reads it **live from disk on
+        every call**, never the checkout-local copy; a contract placed only in
+        the checkout is silently ignored.
 
         Step schema: ``stop:`` steps share the same per-step shape as
         ``start:`` steps -- each entry is a YAML mapping with a required
-        ``run:`` key (the shell command to execute) and an optional ``name:``
-        key. The contract also requires top-level ``version`` (int) and
+        ``run:`` key (the shell command to execute), an optional ``name:``
+        key, and an optional ``shell:`` key -- when omitted, the default is
+        per-OS (``powershell.exe -NoProfile -NonInteractive`` on Windows,
+        ``bash -c`` on POSIX/Linux/macOS), the same default used for
+        ``setup:``/``start:``/``teardown:`` steps; see ``worktree_create``'s
+        "Default shell when a step omits ``shell:``" section for the full
+        accepted-values list and the ``&&``-under-PowerShell portability
+        warning. The contract also requires top-level ``version`` (int) and
         ``isolation`` (``full``/``partial``/``none``) keys; ``isolation: none``
         forbids ``start:``, ``stop:``, and ``ports:``. Example::
 
@@ -1757,6 +1822,54 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         distinct from -- and must not be confused with -- the tracked-but-
         never-started ``no_process_recorded`` no-op path described just
         above, which is reached without any concurrent actor at all.
+
+        ``kill_orphans``: when it is actually necessary
+        -------------------------------------------------
+        **The tree/Job Object kill is unconditional, not gated on
+        ``kill_orphans``.** ``environment_stop`` always snapshots and kills
+        the tracked pid's descendant tree, and on Windows always terminates
+        its Job Object as a unit. On Windows, with a successfully assigned
+        job, a ``Start-Process``/``ShellExecuteEx``-delegated grandchild
+        outside the ppid lineage is **already killed without
+        ``kill_orphans``** -- the Job Object is ppid-independent, and
+        ``CREATE_BREAKAWAY_FROM_JOB`` **cannot escape it**, because the
+        engine sets no limit flags (no ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``),
+        so the OS refuses breakaway outright. On POSIX there is no Job
+        Object mechanism at all -- containment there is the ppid tree plus
+        the process group.
+
+        **``kill_orphans`` is a different scope, not a deeper one.** It is a
+        **path-scoped**, not lineage-scoped, heuristic scan of the
+        environment's checkout path (cwd / cmdline token / open file /
+        Windows handle table) that kills whatever it finds there regardless
+        of who started it, and never consults ``record.pids``.
+
+        **When it is genuinely necessary** -- four caller-visible gaps the
+        unconditional tree/job kill cannot reach on its own:
+
+        - a POSIX descendant that escaped via ``setsid()`` out of both the
+          ppid tree and the process group (no Job Object exists on POSIX at
+          all);
+        - a Windows role whose Job Object was never created, or never
+          successfully assigned, or whose job handle is unavailable at
+          ``stop()`` time;
+        - a process left behind by a ``setup:`` step (spawned by
+          ``SetupRunner``'s default runner, which never creates or joins a
+          Job Object) -- its pid never entered ``record.pids``, reachable
+          only because it still runs with the worktree as its cwd;
+        - the sub-millisecond window between a child's ``Popen`` returning
+          and its Job Object assignment landing.
+
+        **When it will not help:** a ``stop_detail.reason ==
+        "job_member_list_truncated"`` outcome -- ``TerminateJobObject``
+        already killed those members; the path scan adds nothing there.
+
+        **Do not pass it defensively on every call.** On Windows, the scan
+        includes a system-wide OS handle-table scan that can take several
+        seconds within its own discovery budget, plus reserving part of the
+        caller's own ``timeout``. Let the engine tell you instead: re-call
+        with ``kill_orphans=True`` only when a ``stop_incomplete``
+        response's ``stop_detail.kill_orphans_may_help`` is ``true``.
 
         On success returns the canonical environment record dict. Fields of
         note:
