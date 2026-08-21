@@ -14,9 +14,11 @@ addressing path, and the hard primary-removal refusal.
 from __future__ import annotations
 
 import base64
+import inspect
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterator, Tuple
 from unittest.mock import patch
@@ -30,8 +32,10 @@ from lib_python_worktree import (
     InvalidRepoError,
     ManagerConfig,
     SetupOutcome,
+    WorktreeDirLockedError,
     WorktreeManager,
     WorktreeRecord,
+    WorktreeRemovalBlockedError,
     YamlStateStore,
     primary_id_for,
 )
@@ -45,6 +49,123 @@ from worktree_plugin.tools.worktree import (
 
 def _git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+# ---- ticket #141 ambient-handle retry helper (MIRRORED) BEGIN ----
+# Kept BYTE-IDENTICAL with the copy in the sibling test module. A shared
+# conftest.py / helper module is deliberately not used (ticket #141 scope
+# constraint); test_environment_tools.py carries the drift guard.
+
+_AMBIENT_RETRY_ATTEMPTS = 5
+_AMBIENT_RETRY_BASE_DELAY = 0.2
+
+# Narrow text signatures for the generic `except WorktreeError` tail in
+# tools/worktree.py, which can carry git's raw permission wording without a
+# lock-typed __cause__. Deliberately excludes every deterministic refusal
+# wording used by this suite ("not a git repository", "does not exist",
+# "primary", "resolved to id", "not found").
+_AMBIENT_TEXT_SIGNATURES = (
+    "being used by another process",
+    "access is denied",
+    "permission denied",
+    "unable to unlink",
+    "failed to delete",
+)
+
+
+def _is_ambient_handle_error(exc: BaseException) -> bool:
+    """True when `exc`, or anything in its cause/context chain, is the
+    "something outside this test is holding the checkout" signal."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, WorktreeRemovalBlockedError):
+            # Ticket #141 review fix: WorktreeRemovalBlockedError subclasses
+            # WorktreeDirLockedError (a compound remove() failure: a
+            # directory lock AND real uncommitted/untracked changes, both
+            # at once). Retrying it as ambient would mask the
+            # dirty-worktree half behind the AMBIENT-HANDLE banner, which
+            # never mentions dirty_paths -- a compound block is a real,
+            # non-transient condition, never ambient. This check must come
+            # before the WorktreeDirLockedError check below.
+            return False
+        if isinstance(cur, WorktreeDirLockedError):
+            return True
+        if isinstance(cur, OSError) and getattr(cur, "winerror", None) in (5, 32):
+            # ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32): the
+            # actual foreign-handle signals. ERROR_DIR_NOT_EMPTY (145) is
+            # deliberately excluded -- it can indicate a genuine
+            # removal/cleanup regression (a leftover file the engine
+            # failed to delete), not a lock. PermissionError is an OSError
+            # subclass, so a winerror-carrying PermissionError is caught
+            # here too; a bare PermissionError with no winerror (POSIX
+            # EACCES, or a genuine ACL failure) is NOT ambient -- this
+            # pre-flight is win32-only.
+            return True
+        if not isinstance(cur, OSError):
+            # The text fallback deliberately does not apply to OSError
+            # (PermissionError included): its winerror check above is
+            # already authoritative for that family, so the text path must
+            # not second-guess it by matching e.g. "permission denied" in
+            # a POSIX PermissionError's own str(). This fallback exists
+            # solely for the tool layer's generic `except WorktreeError`
+            # tail, which can carry git's raw wording inside a
+            # ValueError/WorktreeError with no lock-typed __cause__.
+            text = str(cur).lower()
+            if any(sig in text for sig in _AMBIENT_TEXT_SIGNATURES):
+                return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _remove_with_ambient_retry(
+    op,
+    *,
+    what: str,
+    attempts: int = _AMBIENT_RETRY_ATTEMPTS,
+    base_delay: float = _AMBIENT_RETRY_BASE_DELAY,
+):
+    """Run `op()` (a zero-arg callable performing a real-git removal),
+    retrying only while the failure looks like a foreign handle holder.
+
+    Contract:
+      * returns `op()`'s value unchanged on the first success;
+      * re-raises any NON-ambient exception immediately and unchanged, on
+        the very first attempt (so ordinary product failures keep their
+        original type, message and traceback);
+      * on an ambient-looking failure, sleeps `base_delay * attempt`
+        (linear backoff) and retries, up to `attempts` total calls;
+      * when the budget is exhausted, calls `pytest.fail` with the
+        `AMBIENT-HANDLE (ticket #141)` banner naming the diagnosis AND the
+        original engine message. It never skips: a persistent holder may
+        equally be a genuine engine-level lock regression, and that must
+        stay visible (ticket #141, Q1).
+
+    Never call this inside a `pytest.raises(...)` block, and never wrap a
+    deterministic refusal/lock-mapping test with it.
+    """
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return op()
+        except Exception as exc:  # noqa: BLE001 -- re-raised unless ambient
+            if not _is_ambient_handle_error(exc):
+                raise
+            last = exc
+            if attempt < attempts:
+                time.sleep(base_delay * attempt)
+    total = base_delay * (attempts - 1) * attempts / 2
+    pytest.fail(
+        f"AMBIENT-HANDLE (ticket #141): {what} stayed blocked by a foreign "
+        f"handle across {attempts} attempts (~{total:.1f}s of retries). "
+        f"Diagnosis: a process outside this test (indexer / AV / editor / "
+        f"agent) is holding a handle inside the checkout -- OR the engine "
+        f"has a real lock regression, which is why this fails loudly "
+        f"instead of skipping. Original engine error: "
+        f"{type(last).__name__}: {last}"
+    )
+# ---- ticket #141 ambient-handle retry helper (MIRRORED) END ----
 
 
 def _make_repo(base: Path, name: str = "src-repo") -> Path:
@@ -614,7 +735,10 @@ def test_worktree_remove_untracked_orphan_by_checkout_path(
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     orphan_path = _make_orphan(temp_repo, tmp_path)
 
-    result = fns["worktree_remove"](checkout_path=str(orphan_path))
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](checkout_path=str(orphan_path)),
+        what="worktree_remove(orphan by checkout_path)",
+    )
 
     assert "error" not in result
     assert re.search(r"-untracked-[0-9a-f]{8}$", result["id"])
@@ -627,7 +751,10 @@ def test_worktree_remove_orphan_leaves_branch_intact(tmp_path: Path, temp_repo: 
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     orphan_path = _make_orphan(temp_repo, tmp_path)
 
-    result = fns["worktree_remove"](checkout_path=str(orphan_path), force=True)
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](checkout_path=str(orphan_path), force=True),
+        what="worktree_remove(orphan, force=True)",
+    )
 
     assert "error" not in result
     branches = subprocess.run(
@@ -647,7 +774,10 @@ def test_worktree_remove_by_checkout_path_on_tracked_worktree(
     rec = mgr.create(str(temp_repo), "feature/wt")
     assert mgr.state.list() == [rec]
 
-    result = fns["worktree_remove"](checkout_path=rec.path)
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](checkout_path=rec.path),
+        what="worktree_remove(tracked worktree by checkout_path)",
+    )
 
     assert "error" not in result
     assert result["id"] == rec.id
@@ -2532,11 +2662,13 @@ def test_environment_start_docstring_consolidates_three_addressing_outcomes(
 def test_environment_start_docstring_documents_start_log_path_role_casing(
     tmp_path: Path,
 ):
-    """Claim under protection (ticket #130, re-slicing #128): start_log_path's
-    filename is a lower-cased slug of role, while pids/record.variants key
-    on role verbatim -- documented (not fixed; upstream lib-python-worktree
-    defect), fully-qualified as Seretos/lib-python-worktree#111 so it is
-    never confused with this repo's own closed #111 (thread-leak ticket)."""
+    """Claim under protection (ticket #146, correcting #130/#128): start_log_path's
+    filename is a *case-preserving* slug of role (never lower-cased), while
+    pids/record.variants key on role verbatim -- fully-qualified as
+    Seretos/lib-python-worktree#111 so it is never confused with this repo's
+    own closed #111 (thread-leak ticket). v0.3.7 fixed the upstream
+    lower-casing bug that #111 originally reported; the residual caveat is
+    the case-insensitive-filesystem interleaving, not lower-casing."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     doc = fns["environment_start"].__doc__ or ""
     norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
@@ -2551,6 +2683,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
         if (
             "seretos/lib-python-worktree#111" in window
             and ("lower" in window or "slug" in window)
+            and "preserv" in window
             and "pids" in window
         ):
             found = True
@@ -2559,7 +2692,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
     assert found, (
         "docstring must have at least one start_log_path mention whose "
         "surrounding window fully-qualifies the upstream #111 reference, "
-        "names the lower-case/slug behaviour, and mentions pids"
+        "names the case-preserving slug behaviour, and mentions pids"
     )
 
 
@@ -2684,3 +2817,70 @@ def test_worktree_create_invalid_repo_root_still_names_repo_root(tmp_path: Path)
     msg = str(excinfo.value)
     assert "repo_root" in msg
     assert "checkout_path" not in msg
+
+
+# ---- Ticket #141: ambient-handle hardening ----
+
+_MIRROR_BEGIN = "# ---- ticket #141 ambient-handle retry helper (MIRRORED) " + "BEGIN ----"
+_MIRROR_END = "# ---- ticket #141 ambient-handle retry helper (MIRRORED) " + "END ----"
+
+
+def _extract_mirrored_block(path: Path) -> str:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index(_MIRROR_BEGIN)
+    end = text.index(_MIRROR_END) + len(_MIRROR_END)
+    return text[start:end]
+
+
+def test_ambient_retry_helper_copies_are_identical():
+    this_file = Path(__file__)
+    sibling_file = this_file.with_name("test_worktree_tools.py")
+
+    this_block = _extract_mirrored_block(this_file)
+    sibling_block = _extract_mirrored_block(sibling_file)
+
+    assert this_block == sibling_block, (
+        "The ticket #141 ambient-handle retry helper has drifted between "
+        "test_environment_tools.py and test_worktree_tools.py -- they must "
+        "stay byte-identical."
+    )
+
+
+_HARDENED_REMOVAL_SITES = (
+    "test_worktree_remove_untracked_orphan_by_checkout_path",
+    "test_worktree_remove_orphan_leaves_branch_intact",
+    "test_worktree_remove_by_checkout_path_on_tracked_worktree",
+)
+
+
+def test_real_git_removal_sites_are_ambient_hardened():
+    for name in _HARDENED_REMOVAL_SITES:
+        source = inspect.getsource(globals()[name])
+        assert "_remove_with_ambient_retry(" in source, (
+            f"{name} performs a real-git removal but is not routed through "
+            f"_remove_with_ambient_retry (ticket #141)"
+        )
+
+
+_DETERMINISTIC_REFUSAL_TESTS_NOT_HARDENED = (
+    "test_worktree_remove_primary_raises_even_with_force",
+    "test_worktree_remove_primary_by_checkout_path_refused_even_unstarted",
+    "test_worktree_remove_unknown_id_still_soft_error",
+    "test_worktree_remove_untracked_id_soft_error_names_checkout_path",
+    "test_worktree_remove_checkout_path_and_id_mismatch_raises_valueerror",
+    "test_worktree_remove_with_neither_target_raises_valueerror",
+    "test_worktree_remove_missing_target_error_names_environment_id",
+    "test_worktree_remove_checkout_path_outside_any_repo",
+    "test_worktree_remove_checkout_path_nonexistent",
+    "test_worktree_remove_checkout_path_is_a_file",
+    "test_worktree_remove_invalid_checkout_path_identity_guard_different_path",
+)
+
+
+def test_deterministic_refusal_tests_are_not_ambient_hardened():
+    for name in _DETERMINISTIC_REFUSAL_TESTS_NOT_HARDENED:
+        source = inspect.getsource(globals()[name])
+        assert "_remove_with_ambient_retry(" not in source, (
+            f"{name} is a deterministic refusal/lock-mapping test and must "
+            f"not be wrapped in _remove_with_ambient_retry (ticket #141)"
+        )
