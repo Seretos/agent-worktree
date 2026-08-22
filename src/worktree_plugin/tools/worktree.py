@@ -947,8 +947,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         discover which host ports the worktree's services are bound to.
 
         The response includes a ``killed_pids`` list (may be empty). Each entry
-        is a dict with ``pid`` (int), ``name`` (str), and ``cmdline`` (list of
-        str) describing a process that was terminated to unblock removal.
+        is a dict with ``pid`` (int), ``name`` (str), ``cmdline`` (list of str)
+        and ``cmdline_raw`` (list of str, or ``None``) describing a process
+        that was terminated to unblock removal. ``cmdline`` is agent-readable:
+        when the killed process's argv was a PowerShell/pwsh
+        ``-EncodedCommand`` base64 blob (ticket #153; decoding lives in the
+        pinned engine, ticket #132), it is rewritten in place to the decoded
+        script text, and the original, untouched argv is preserved in
+        ``cmdline_raw``. ``cmdline_raw`` is ``None`` whenever no such
+        substitution happened -- including every non-PowerShell process --
+        which is the signal that ``cmdline`` is exactly what the OS reported,
+        unmodified.
 
         If the target is not found, returns ``{"error": "...", "code":
         "not_found"}`` instead of raising, so callers can treat not-found as
@@ -1956,6 +1965,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           is removed once the process exits.
         - ``ports``: a dict mapping port name to host port number; empty dict
           ``{}`` for environments with no port setup.
+        - ``killed_pids``: a list (may be empty) of processes terminated by
+          the unconditional process-tree/Job Object kill described above,
+          each a dict with ``pid`` (int), ``name`` (str), ``cmdline`` (list
+          of str) and ``cmdline_raw`` (list of str, or ``None``) -- same
+          agent-readable-``cmdline``/raw-``cmdline_raw`` contract as
+          ``worktree_remove``'s ``killed_pids`` (ticket #153; decoding lives
+          in the pinned engine, ticket #132). ``cmdline_raw`` is ``None``
+          unless a PowerShell/pwsh ``-EncodedCommand`` blob was decoded.
 
         If the target is not found, returns ``{"error": "...", "code":
         "not_found"}`` instead of raising, so callers can treat not-found as
