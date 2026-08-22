@@ -528,10 +528,13 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     (synthesised) entries -- ``tracked=False`` -- pass through unchanged;
     callers must use ``tracked``, never the id, as the "is this persisted"
     discriminator. A synthesised linked worktree's ``id`` is
-    ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
-    ``untracked_id_for()``), a one-way derivation of its checkout path --
-    NOT a state-store key. It cannot be passed as ``environment_id`` to
-    ``worktree_remove``; address it via ``checkout_path`` instead.
+    ``<checkout-dirname-slug>-untracked-<8-hex>`` (minted by
+    ``untracked_id_for()``): the checkout directory's own basename, slugged
+    (lower-case ASCII, non-alphanumeric runs collapsed to ``-``, truncated
+    to 40 chars), plus the first 8 hex characters of a SHA-256 hash of its
+    resolved path -- no repo slug and no branch slug are involved. It
+    cannot be passed as ``environment_id`` to ``worktree_remove``; address
+    it via ``checkout_path`` instead.
     """
     result = {
         **asdict(entry.record),
@@ -542,7 +545,11 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     return result
 
 
-def _repo_roots_for_scope_all(manager: WorktreeManager, path: str) -> List[str]:
+def _repo_roots_for_scope_all(
+    manager: WorktreeManager,
+    path: str,
+    repos: Optional[List[str]] = None,
+) -> List[str]:
     """Return every distinct repo root ``environment_list(scope="all")``
     should fan out over, current-repo first.
 
@@ -557,13 +564,31 @@ def _repo_roots_for_scope_all(manager: WorktreeManager, path: str) -> List[str]:
     non-normalised spelling can never produce a duplicate entry, and with
     the current repo's root excluded. The remainder is sorted by resolved
     POSIX string for a deterministic, reproducible order.
+
+    ``repos`` (ticket #150) is an optional allow-list of repo roots or their
+    parent directories. When given, an additional root is kept only if its
+    resolved path is at-or-under one of the resolved ``repos`` entries
+    (containment, not exact match). The current repo (``path``) is never
+    filtered -- it is always element 0 of the result. ``repos=[]`` yields
+    just ``[path]``. An entry that matches nothing (e.g. a stale or
+    misspelled path) is silently ignored rather than raising.
     """
     current_resolved = Path(path).resolve()
     seen = {current_resolved}
+    # Ticket #150: resolve the allow-list once, up front. Non-strict
+    # resolve() -- an entry naming a path that no longer exists matches
+    # nothing instead of raising, mirroring the stale-root grace below.
+    allowed: Optional[List[Path]] = (
+        None if repos is None else [Path(entry).resolve() for entry in repos]
+    )
     others: List[str] = []
     for rec in manager.state.list():
         resolved = Path(rec.repo_root).resolve()
         if resolved in seen:
+            continue
+        if allowed is not None and not any(
+            resolved.is_relative_to(entry) for entry in allowed
+        ):
             continue
         seen.add(resolved)
         others.append(rec.repo_root)
@@ -841,9 +866,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           list --porcelain`` reports it, and ``environment_list`` shows it
           with ``tracked: false``) but was never created through this tool
           has a synthesised, display-only id
-          (``<repo-slug>-<branch-slug>-untracked-<8-hex>``) that is a
-          one-way derivation of its checkout path, not a state-store key --
-          it can never resolve via ``environment_id`` alone. Pass the
+          (``<checkout-dirname-slug>-untracked-<8-hex>``): the checkout
+          directory's own basename, slugged (lower-case ASCII,
+          non-alphanumeric runs collapsed to ``-``, truncated to 40 chars),
+          plus the first 8 hex characters of a SHA-256 hash of its resolved
+          path -- no repo slug and no branch slug are involved, and it is
+          not a state-store key -- it can never resolve via
+          ``environment_id`` alone. Pass the
           checkout's path (as shown in ``environment_list``'s ``path``
           field) as ``checkout_path`` instead. Removing an untracked target
           this way tears down the checkout but never touches the state
@@ -1058,7 +1087,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    def environment_list(path: str, scope: str = "repo") -> List[Dict[str, Any]]:
+    def environment_list(
+        path: str,
+        scope: str = "repo",
+        repos: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """List the environments (primary clone + linked worktrees) for the
         repo containing ``path``, joined against persistent, disk-backed
         state (survives server restarts; reconciled on startup).
@@ -1085,6 +1118,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             containing ``path`` is always listed first. Costs one extra
             ``git worktree list --porcelain`` subprocess call per
             *additional* repo. Any unknown value raises ``ValueError``.
+        repos:
+            Optional allow-list of repo roots or parent directories,
+            **only valid when ``scope="all"``** -- passing it under
+            ``scope="repo"`` raises ``ValueError`` since there is nothing
+            for it to narrow there. When given, an additional repo fanned
+            out under ``scope="all"`` is kept only if its resolved root is
+            at-or-under one of the resolved ``repos`` entries (containment
+            matching, not exact match -- an entry may name a parent
+            directory that contains several tracked repo roots). The repo
+            containing ``path`` is always included and always listed
+            first, regardless of ``repos``. ``repos=[]`` means "no
+            additional repos" -- the result is just the current repo's
+            entries. An entry that matches nothing (e.g. a stale or
+            misspelled path) is silently ignored rather than raising.
 
         Each entry mirrors a ``WorktreeRecord`` plus three extra keys:
 
@@ -1105,11 +1152,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           deterministic ``primary_id_for(repo_root)`` (so it round-trips
           correctly once later materialised by ``environment_start``), while
           a synthesised linked worktree's ``id`` is
-          ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
-          ``untracked_id_for()``) -- a one-way derivation of its checkout
-          path, NOT a state-store key. It cannot be passed as
-          ``environment_id`` to ``worktree_remove``; address it via
-          ``checkout_path`` instead.
+          ``<checkout-dirname-slug>-untracked-<8-hex>`` (minted by
+          ``untracked_id_for()``): the checkout directory's own basename,
+          slugged (lower-case ASCII, non-alphanumeric runs collapsed to
+          ``-``, truncated to 40 chars), plus the first 8 hex characters of
+          a SHA-256 hash of its resolved path -- no repo slug and no branch
+          slug are involved, and it is NOT a state-store key. It cannot be
+          passed as ``environment_id`` to ``worktree_remove``; address it
+          via ``checkout_path`` instead.
+
+          Look-alike caveat: a worktree this tool created and later lost
+          the record for has a checkout directory basename that already
+          looks like ``<repo-slug>-<branch-slug>-<8-hex>`` (the tracked
+          create-id shape), so its untracked id can visually appear to
+          contain a repo slug and a branch slug even though it does not
+          derive from either -- a hand-made orphan's prefix is simply
+          whatever the directory happens to be named.
         - ``setup_status``: a coarse setup-health signal derived SOLELY from
           the record's ``setup_outcome`` (an ``Optional[SetupOutcome]``),
           never from ``status`` (the overall run status) -- full decoupling
@@ -1130,11 +1188,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ever been started does not create a record for it; only
         ``environment_start`` does that.
 
-        Raises ``ValueError`` for an unknown ``scope``, or when ``path`` itself
+        Raises ``ValueError`` for an unknown ``scope``, when ``path`` itself
         is not a valid, existing git repository (mapped from the engine's
         ``InvalidRepoError``, re-worded per ticket #123's pattern to name
         ``path`` instead of the engine-internal ``repo_root`` parameter,
-        with the full diagnostic reason preserved). Under ``scope="all"``, a
+        with the full diagnostic reason preserved), or when ``repos`` is
+        given together with ``scope="repo"`` (ticket #150 -- ``repos`` only
+        narrows the ``scope="all"`` fan-out, so passing it under
+        ``scope="repo"`` signals a wrong mental model and fails loudly
+        rather than being silently ignored). Under ``scope="all"``, a
         *different*, previously tracked repo whose on-disk clone has since
         vanished is skipped gracefully rather than failing the whole call --
         only a bad ``path`` argument raises.
@@ -1160,6 +1222,15 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         if scope not in ("repo", "all"):
             raise ValueError(
                 f"unknown scope {scope!r}; expected 'repo' or 'all'"
+            )
+
+        # Ticket #150: the repos allow-list narrows the scope="all" fan-out
+        # only; under scope="repo" there is nothing to narrow, so a caller
+        # passing it has a wrong mental model -- fail loudly rather than
+        # silently ignoring the argument.
+        if repos is not None and scope != "all":
+            raise ValueError(
+                f"repos is only valid with scope='all'; got scope={scope!r}"
             )
 
         try:
@@ -1189,7 +1260,9 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         entries = [_entry_to_dict(e) for e in listing.entries]
 
         if scope == "all":
-            for root in _repo_roots_for_scope_all(manager, listing.repo_root):
+            for root in _repo_roots_for_scope_all(
+                manager, listing.repo_root, repos=repos
+            ):
                 if Path(root).resolve() == Path(listing.repo_root).resolve():
                     continue
                 try:

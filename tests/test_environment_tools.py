@@ -43,6 +43,7 @@ from lib_python_worktree.core.state import ShadowedContract
 from worktree_plugin.tools.worktree import (
     _default_stop_variant,
     _invalid_path_error_text,
+    _repo_roots_for_scope_all,
     register,
 )
 
@@ -670,6 +671,178 @@ def test_environment_list_unknown_scope_raises_valueerror(
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     with pytest.raises(ValueError):
         fns["environment_list"](path=str(temp_repo), scope="bogus")
+
+
+# ---- Ticket #150: repos allow-list narrows the scope="all" fan-out ----
+
+
+def test_environment_list_repos_filter_limits_fanout(tmp_path: Path):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+    repo3 = _make_repo(tmp_path, "repo3")
+    _git("branch", "feature/wt3", cwd=repo3)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+    rec3 = mgr.create(str(repo3), "feature/wt3")
+
+    result = fns["environment_list"](
+        path=str(repo1), scope="all", repos=[str(repo2)]
+    )
+    ids = {e["id"] for e in result}
+    assert rec1.id in ids
+    assert rec2.id in ids
+    assert rec3.id not in ids
+
+
+def test_environment_list_repos_filter_matches_parent_prefix(tmp_path: Path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    repo1 = _make_repo(parent, "repoA")
+    _git("branch", "feature/a", cwd=repo1)
+    repo2 = _make_repo(parent, "repoB")
+    _git("branch", "feature/b", cwd=repo2)
+    outsider = _make_repo(tmp_path, "outsider")
+    _git("branch", "feature/o", cwd=outsider)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/a")
+    rec2 = mgr.create(str(repo2), "feature/b")
+    rec_outsider = mgr.create(str(outsider), "feature/o")
+
+    result = fns["environment_list"](
+        path=str(repo1), scope="all", repos=[str(parent)]
+    )
+    ids = {e["id"] for e in result}
+    assert rec1.id in ids
+    assert rec2.id in ids
+    assert rec_outsider.id not in ids
+
+
+def test_environment_list_repos_filter_tolerates_unmatched_entry(tmp_path: Path):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+
+    never_tracked = tmp_path / "never-tracked"  # deliberately never created
+    result = fns["environment_list"](
+        path=str(repo1), scope="all", repos=[str(never_tracked)]
+    )
+    ids = {e["id"] for e in result}
+    repo_scope_ids = {
+        e["id"] for e in fns["environment_list"](path=str(repo1), scope="repo")
+    }
+    assert ids == repo_scope_ids
+    assert rec2.id not in ids
+
+
+def test_environment_list_repos_filter_keeps_current_repo_first_and_single_is_current(
+    tmp_path: Path,
+):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+    repo3 = _make_repo(tmp_path, "repo3")
+    _git("branch", "feature/wt3", cwd=repo3)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec1 = mgr.create(str(repo1), "feature/wt1")
+    rec2 = mgr.create(str(repo2), "feature/wt2")
+    rec3 = mgr.create(str(repo3), "feature/wt3")
+    repo1_ids = {primary_id_for(repo1), rec1.id}
+
+    result = fns["environment_list"](
+        path=str(repo1), scope="all", repos=[str(repo2)]
+    )
+    # The current repo's own entries are always placed first -- before any
+    # fanned-out entry from another repo -- regardless of the repos filter.
+    assert result[0]["id"] in repo1_ids
+    assert rec3.id not in {e["id"] for e in result}
+
+    current = [e for e in result if e["is_current"]]
+    assert len(current) == 1
+    assert current[0]["id"] in repo1_ids
+
+
+def test_environment_list_repos_empty_list_equals_repo_scope(tmp_path: Path):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    mgr.create(str(repo1), "feature/wt1")
+    mgr.create(str(repo2), "feature/wt2")
+
+    result_repo = fns["environment_list"](path=str(repo1), scope="repo")
+    result_all_empty_repos = fns["environment_list"](
+        path=str(repo1), scope="all", repos=[]
+    )
+    assert {e["id"] for e in result_all_empty_repos} == {
+        e["id"] for e in result_repo
+    }
+
+
+def test_environment_list_repos_with_scope_repo_raises_valueerror(
+    tmp_path: Path, temp_repo: Path
+):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    with pytest.raises(ValueError, match="repos"):
+        fns["environment_list"](
+            path=str(temp_repo), scope="repo", repos=[str(temp_repo)]
+        )
+
+    with pytest.raises(ValueError, match="repos"):
+        fns["environment_list"](path=str(temp_repo), scope="repo", repos=[])
+
+
+def test_repo_roots_for_scope_all_applies_repos_filter(tmp_path: Path):
+    repo1 = _make_repo(tmp_path, "repo1")
+    _git("branch", "feature/wt1", cwd=repo1)
+    repo2 = _make_repo(tmp_path, "repo2")
+    _git("branch", "feature/wt2", cwd=repo2)
+    repo3 = _make_repo(tmp_path, "repo3")
+    _git("branch", "feature/wt3", cwd=repo3)
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    mgr.create(str(repo1), "feature/wt1")
+    mgr.create(str(repo2), "feature/wt2")
+    mgr.create(str(repo3), "feature/wt3")
+
+    filtered = _repo_roots_for_scope_all(mgr, str(repo1), repos=[str(repo2)])
+    filtered_resolved = {Path(r).resolve() for r in filtered}
+    assert repo1.resolve() in filtered_resolved
+    assert repo2.resolve() in filtered_resolved
+    assert repo3.resolve() not in filtered_resolved
+
+    # No-regression arm: repos=None must remain fully unfiltered.
+    unfiltered = _repo_roots_for_scope_all(mgr, str(repo1), repos=None)
+    unfiltered_resolved = {Path(r).resolve() for r in unfiltered}
+    assert repo1.resolve() in unfiltered_resolved
+    assert repo2.resolve() in unfiltered_resolved
+    assert repo3.resolve() in unfiltered_resolved
+
+
+def test_environment_list_repos_is_optional_in_tool_schema(tmp_path: Path):
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    schema = tools["environment_list"].parameters
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+
+    assert "repos" in properties
+    assert "repos" not in required
+    assert "path" in required
+    assert "scope" not in required
 
 
 # ---- R6: worktree_remove refuses a primary, even with force=True ----
