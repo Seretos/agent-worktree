@@ -965,3 +965,39 @@ def test_docs_still_state_tracked_create_id_formula():
             f"{path.name} must still document the tracked create-id "
             "formula <repo-slug>-<branch-slug>-<8-hex>"
         )
+
+
+# ---- Ticket #150: environment_list's repos allow-list must be documented ----
+
+
+def test_docs_document_environment_list_repos_filter():
+    """AGENTS.md and SKILL.md must document the new ``repos`` allow-list
+    parameter narrowing ``environment_list(scope="all")``'s fan-out:
+    AGENTS.md's `environment_list(` signature line must include `repos`,
+    both docs must mention `repos`, both must describe the containment/
+    "at or under" matching rule, and both must state that `repos` is only
+    valid with `scope='all'` (raising otherwise)."""
+    for path in (AGENTS_MD, SKILL_MD):
+        text = path.read_text(encoding="utf-8")
+        assert "repos" in text, f"{path.name} does not mention `repos`"
+
+        text_lower = text.lower()
+        assert "at or under" in text_lower, (
+            f"{path.name} does not describe the containment ('at or under') "
+            "matching rule for the repos allow-list"
+        )
+        assert "only valid with" in text_lower and "scope" in text_lower, (
+            f"{path.name} does not state that repos is only valid with "
+            "scope='all'"
+        )
+
+    agents_text = AGENTS_MD.read_text(encoding="utf-8")
+    signature_line = next(
+        line
+        for line in agents_text.splitlines()
+        if line.strip().startswith("environment_list(")
+    )
+    assert "repos" in signature_line, (
+        f"AGENTS.md's environment_list(...) signature line must include "
+        f"`repos`: {signature_line!r}"
+    )

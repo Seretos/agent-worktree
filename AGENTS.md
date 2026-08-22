@@ -107,13 +107,14 @@ Because the two are independent, two variants started concurrently against the s
 #### environment_list
 
 ```
-environment_list(path: str, scope: str = "repo") -> list[dict]
+environment_list(path: str, scope: str = "repo", repos: Optional[list[str]] = None) -> list[dict]
 ```
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | `str` | Yes | Any path inside a git repository — the repo root, a linked worktree checkout, or a subdirectory of either. There is no "list everything, everywhere" call; every environment this tool can return is reachable from a `path` you already have. |
 | `scope` | `str` | No | `"repo"` (default) — only the repo containing `path`. `"all"` — every distinct repo this server has ever tracked an environment for, fanned out with the identical entry shape (no second shape, no repo-grouping wrapper); the repo containing `path` is always listed first. Unknown values raise `ValueError`. |
+| `repos` | `list[str]` | No | Ticket #150. Allow-list narrowing the `scope="all"` fan-out to specific repos or everything under a parent directory — is only valid with scope='all', raising `ValueError` if combined with `scope="repo"`. Each entry is a repo root or parent directory; a tracked repo root is included only if its resolved path is at or under one entry's resolved path (containment match). The repo containing `path` is always included and always listed first regardless of `repos`. `repos=[]` means no additional repos (same result set as `scope="repo"`). An entry matching no tracked repo is silently ignored. `repos=None` (the default) disables filtering — identical to pre-#150 behaviour. |
 
 This tool replaces the old unfiltered discovery listing (no `repo_root` filter meant every worktree, everywhere) and the old single-record-by-id lookup. Each entry mirrors a `WorktreeRecord` plus:
 
@@ -123,7 +124,7 @@ This tool replaces the old unfiltered discovery listing (no `repo_root` filter m
 
 This call **never writes state** — listing the primary before it has ever started does not create a record for it.
 
-**Errors:** raises `ValueError` for an unknown `scope`, or when `path` itself is not a valid, existing git repository (mapped from `InvalidRepoError`, re-worded per ticket #123's pattern to replace the engine's internal `repo_root` parameter name with `path`, with the full diagnostic reason preserved). Under `scope="all"`, a *different*, previously tracked repo whose clone has since vanished from disk is skipped gracefully; only a bad `path` argument raises.
+**Errors:** raises `ValueError` for an unknown `scope`, when `path` itself is not a valid, existing git repository (mapped from `InvalidRepoError`, re-worded per ticket #123's pattern to replace the engine's internal `repo_root` parameter name with `path`, with the full diagnostic reason preserved), or when `repos` is combined with `scope="repo"` (ticket #150 — `repos` is only valid with scope='all'). Under `scope="all"`, a *different*, previously tracked repo whose clone has since vanished from disk is skipped gracefully; only a bad `path` argument raises.
 
 ---
 
