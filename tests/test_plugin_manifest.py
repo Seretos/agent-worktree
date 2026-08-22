@@ -1001,3 +1001,40 @@ def test_docs_document_environment_list_repos_filter():
         f"AGENTS.md's environment_list(...) signature line must include "
         f"`repos`: {signature_line!r}"
     )
+
+
+# ---- Ticket #153: killed_pids[].cmdline must be agent-readable ----
+
+
+def test_docs_document_decoded_cmdline_and_cmdline_raw():
+    """Claim under protection (ticket #153): worktree.py, SKILL.md,
+    AGENTS.md, and README.md must each document that killed_pids[].cmdline
+    is decoded/human-readable (not an opaque base64 -EncodedCommand blob)
+    and that the original raw argv is recoverable via cmdline_raw. The
+    stale phrase 'cmdline (list of str)' -- describing cmdline as a bare,
+    undecoded argv list, true only before the v0.3.9 engine bump -- must no
+    longer appear anywhere in these files."""
+    decoded_claim_re = re.compile(r"decoded|human-readable|agent-readable")
+    # The stale wording always wraps ``cmdline`` in backticks (single in the
+    # Markdown docs, double in the RST-style worktree.py docstring, itself
+    # sometimes line-wrapped between "of" and "str") and, pre-fix, ran
+    # straight into "describing" with nothing in between. Post-fix, that
+    # same "(list of str)" type annotation on ``cmdline`` is still present
+    # (the type didn't change) but is now followed by "and `cmdline_raw`
+    # ..." before "describing" -- so anchoring on immediate adjacency to
+    # "describing" is what actually distinguishes stale from current text.
+    stale_phrase_re = re.compile(
+        r"`{1,2}cmdline`{1,2}\s*\(\s*list\s+of\s+str\s*\)\s*describing"
+    )
+    for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD, README_MD):
+        text = path.read_text(encoding="utf-8")
+
+        assert "cmdline_raw" in text, f"{path.name} must mention cmdline_raw"
+        assert decoded_claim_re.search(text), (
+            f"{path.name} must claim killed_pids[].cmdline is decoded/"
+            "human-readable/agent-readable"
+        )
+        assert not stale_phrase_re.search(text), (
+            f"{path.name} still contains the stale 'cmdline (list of str) "
+            "describing' phrasing that predates the v0.3.9 decode (ticket #153)"
+        )

@@ -356,7 +356,10 @@ worktree_remove(<id>, kill_blocking_processes=True)
 ```
 
 The response's `killed_pids` field lists every terminated process (pid, name,
-cmdline). If the directory is still locked afterward, the tool raises an error —
+cmdline, cmdline_raw). `cmdline` is agent-readable — a PowerShell/pwsh
+`-EncodedCommand` base64 blob is decoded to the actual script text — with the
+original, undecoded argv preserved in `cmdline_raw` (`None` when nothing was
+decoded). If the directory is still locked afterward, the tool raises an error —
 resolve the remaining lock at the OS level and retry.
 
 **Compound blocking (ticket #120): one retry, not a guessing sequence.** If the
