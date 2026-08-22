@@ -109,7 +109,7 @@ A tracked process started via `environment_start` is stopped by `worktree_remove
 worktree_remove(<id>, kill_blocking_processes=True)
 ```
 
-The response's `killed_pids` field lists every process that was terminated (pid, name, cmdline). If the directory is still locked after the kill attempt, the tool raises an error — you can then resolve the remaining lock at the OS level and retry.
+The response's `killed_pids` field lists every process that was terminated (pid, name, cmdline, cmdline_raw). `cmdline` is agent-readable — a PowerShell/pwsh `-EncodedCommand` base64 blob is decoded to the actual script text — with the original, undecoded argv preserved in `cmdline_raw` (`None` when nothing was decoded). If the directory is still locked after the kill attempt, the tool raises an error — you can then resolve the remaining lock at the OS level and retry.
 
 **Compound blocking (ticket #120).** If the directory lock and uncommitted/untracked changes are BOTH blocking removal at once, the raised error names every blocking condition and the flag needed to clear each in one message — `(blocked_by: "dir_locked", "uncommitted_changes"; required_flags: kill_blocking_processes=True, force=True)`. Retry once with both flags set instead of discovering each condition across separate failed attempts.
 

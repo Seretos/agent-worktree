@@ -630,8 +630,10 @@ def _make_running_record(worktree_id: str = "wt-id") -> WorktreeRecord:
     )
 
 
-def _make_stopped_record(worktree_id: str = "wt-id") -> WorktreeRecord:
+def _make_stopped_record(worktree_id: str = "wt-id", killed_pids=None) -> WorktreeRecord:
     """Return a minimal WorktreeRecord with status='stopped' and no pids."""
+    if killed_pids is None:
+        killed_pids = []
     return WorktreeRecord(
         id=worktree_id,
         repo_root="/r",
@@ -639,6 +641,7 @@ def _make_stopped_record(worktree_id: str = "wt-id") -> WorktreeRecord:
         path="/p",
         status="stopped",
         pids={},
+        killed_pids=killed_pids,
     )
 
 
@@ -972,6 +975,55 @@ def test_tool_environment_stop_default_forwards_kill_orphans_false(tmp_path: Pat
     assert call_args.kwargs["kill_orphans"] is False
 
 
+# ---- Ticket #153: killed_pids[].cmdline must be agent-readable ----
+
+
+def test_tool_environment_stop_killed_pids_cmdline_is_decoded_and_raw_preserved(
+    tmp_path: Path,
+):
+    """Ticket #153: environment_stop's killed_pids[].cmdline must surface the
+    decoded PowerShell script text (not the opaque base64 -EncodedCommand
+    blob), with the original raw argv still recoverable via cmdline_raw.
+
+    Uses the real engine KilledProcessInfo dataclass -- its __post_init__ (as
+    of lib-python-worktree v0.3.9, ticket #132) performs the decode when
+    constructed with a -EncodedCommand-shaped argv, exactly as the engine's
+    own process-kill code paths construct it. No wrapper-side decoding
+    exists; asdict() picks the resulting cmdline/cmdline_raw fields up
+    automatically."""
+    from unittest.mock import MagicMock
+
+    script = "Write-Host 'hello #153'"
+    encoded_payload = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    raw_argv = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encoded_payload,
+    ]
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    killed = [KilledProcessInfo(pid=4321, name="powershell.exe", cmdline=list(raw_argv))]
+    record = _make_stopped_record(killed_pids=killed)
+    mgr.stop = MagicMock(return_value=record)
+
+    result = fns["environment_stop"](environment_id="wt-id")
+
+    assert "error" not in result
+    assert "killed_pids" in result
+    entry = result["killed_pids"][0]
+    assert "hello #153" in entry["cmdline"][-1], (
+        f"expected decoded script text in cmdline, got {entry['cmdline']!r}"
+    )
+    assert encoded_payload not in entry["cmdline"], (
+        "raw base64 -EncodedCommand payload must not survive in cmdline"
+    )
+    assert entry.get("cmdline_raw") == raw_argv, (
+        "cmdline_raw must round-trip the original, undecoded argv"
+    )
+
+
 # ---- Ticket #44: worktree_remove kill_blocking_processes parameter ----
 
 
@@ -1059,6 +1111,52 @@ def test_tool_worktree_remove_default_empty_killed_pids(tmp_path: Path):
     assert "error" not in result
     assert "killed_pids" in result
     assert result["killed_pids"] == []
+
+
+def test_tool_worktree_remove_killed_pids_cmdline_is_decoded_and_raw_preserved(
+    tmp_path: Path,
+):
+    """Ticket #153: worktree_remove's killed_pids[].cmdline must surface the
+    decoded PowerShell script text (not the opaque base64 -EncodedCommand
+    blob), with the original raw argv still recoverable via cmdline_raw.
+
+    Uses the real engine KilledProcessInfo dataclass -- its __post_init__ (as
+    of lib-python-worktree v0.3.9, ticket #132) performs the decode when
+    constructed with a -EncodedCommand-shaped argv, exactly as the engine's
+    own process-kill code paths construct it. No wrapper-side decoding
+    exists; asdict() picks the resulting cmdline/cmdline_raw fields up
+    automatically."""
+    from unittest.mock import MagicMock
+
+    script = "Write-Host 'hello #153'"
+    encoded_payload = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    raw_argv = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encoded_payload,
+    ]
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    killed = [KilledProcessInfo(pid=4321, name="powershell.exe", cmdline=list(raw_argv))]
+    record = _make_removed_record(killed_pids=killed)
+    mgr.remove = MagicMock(return_value=record)
+
+    result = fns["worktree_remove"](environment_id="wt-id", kill_blocking_processes=True)
+
+    assert "error" not in result
+    assert "killed_pids" in result
+    entry = result["killed_pids"][0]
+    assert "hello #153" in entry["cmdline"][-1], (
+        f"expected decoded script text in cmdline, got {entry['cmdline']!r}"
+    )
+    assert encoded_payload not in entry["cmdline"], (
+        "raw base64 -EncodedCommand payload must not survive in cmdline"
+    )
+    assert entry.get("cmdline_raw") == raw_argv, (
+        "cmdline_raw must round-trip the original, undecoded argv"
+    )
 
 
 def test_tool_worktree_remove_blocked_by_both_conditions_names_both_flags(
@@ -3407,6 +3505,7 @@ _DETERMINISTIC_REFUSAL_TESTS_NOT_HARDENED = (
     "test_tool_worktree_remove_default_kill_false_forwarded",
     "test_tool_worktree_remove_killed_pids_in_response",
     "test_tool_worktree_remove_default_empty_killed_pids",
+    "test_tool_worktree_remove_killed_pids_cmdline_is_decoded_and_raw_preserved",
     "test_tool_worktree_remove_unknown_checkout_target_reason_defensive_text",
     "test_tool_worktree_remove_empty_string_id_not_absent",
     "test_tool_worktree_remove_not_found_still_soft_error",
