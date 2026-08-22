@@ -128,7 +128,7 @@ Read `worktree_remove` back from the **repo root**, never from the removed check
 
 **Orphan worktree on disk**
 
-An orphan is a linked worktree that exists on disk but has no persisted record — `environment_list` shows it with `tracked: false` and a synthesised, display-only id (`<repo-slug>-<branch-slug>-untracked-<8-hex>`) that is a one-way derivation of its checkout path, not a lookup key. Removing it by that id (`worktree_remove(environment_id=...)`) always comes back as a not-found error. Instead:
+An orphan is a linked worktree that exists on disk but has no persisted record — `environment_list` shows it with `tracked: false` and a synthesised, display-only id (`<checkout-dirname-slug>-untracked-<8-hex>`): the checkout directory's own basename, slugged (lower-case ASCII, non-alphanumeric runs collapsed to `-`, truncated to 40 chars), plus the first 8 hex characters of a SHA-256 hash of its resolved path — no repo slug and no branch slug are involved. That id is a one-way derivation of its checkout path, not a lookup key. Removing it by that id (`worktree_remove(environment_id=...)`) always comes back as a not-found error. Instead:
 
 1. Call `environment_list(path=<repo_root>)` and find the entry with `tracked: false`.
 2. Call `worktree_remove(checkout_path=<entry's path>, force=true)` — addressed by `path`, not `id` — to remove it even if it contains uncommitted changes.

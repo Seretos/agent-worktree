@@ -141,10 +141,11 @@ def test_docs_state_untracked_orphan_recovery():
 def test_source_docstrings_state_untracked_orphan_recovery():
     """``worktree.py``'s ``_entry_to_dict`` and ``environment_list``
     docstrings must document the true synthesised-linked-worktree id shape
-    (``<repo-slug>-<branch-slug>-untracked-<8-hex>``, via
-    ``untracked_id_for()``) and must no longer claim such an id is the
-    empty string ``""`` (the stale claim ticket #113's review fix removes
-    from the source, not just the docs)."""
+    (``<checkout-dirname-slug>-untracked-<8-hex>`` -- the checkout
+    directory's own basename, slugged, plus an 8-hex SHA-256 hash of its
+    resolved path, via ``untracked_id_for()``) and must no longer claim
+    such an id is the empty string ``""`` (the stale claim ticket #113's
+    review fix removes from the source, not just the docs)."""
     text = WORKTREE_PY.read_text(encoding="utf-8")
 
     stale_claims = ['id == ""', "is the empty string"]
@@ -156,7 +157,7 @@ def test_source_docstrings_state_untracked_orphan_recovery():
     assert text.count("-untracked-<8-hex>") >= 2, (
         "worktree.py's _entry_to_dict and environment_list docstrings must "
         "both state the true synthesised id shape "
-        "<repo-slug>-<branch-slug>-untracked-<8-hex>"
+        "<checkout-dirname-slug>-untracked-<8-hex>"
     )
     assert text.count("untracked_id_for") >= 2, (
         "worktree.py's _entry_to_dict and environment_list docstrings must "
@@ -889,3 +890,78 @@ def test_skill_environment_stop_recipe_documents_raise_path():
         "can RAISE, not only return a soft code -- branching on `code` is "
         "only meaningful for a call that returned"
     )
+
+
+# ---- Ticket #148: untracked/orphan synthesised id docstring correction ----
+#
+# Ground truth (lib_python_worktree v0.3.7 core/checkout.py::untracked_id_for):
+# the id is <checkout-dirname-slug>-untracked-<8-hex> -- derived from the
+# checkout directory's OWN basename (slugged) plus an 8-hex SHA-256 hash of
+# its resolved path. It never derives from a repo slug or a branch slug, even
+# though a hand-made orphan whose directory happens to be named like a
+# tool-created checkout can visually look like it does.
+
+_UNTRACKED_ID_DOC_SITES = (WORKTREE_PY, AGENTS_MD, SKILL_MD, README_MD)
+
+
+def test_docs_no_longer_claim_repo_and_branch_slug_untracked_id():
+    """None of the four corrected doc sites may still claim the untracked/
+    orphan synthesised id is built from a repo slug and a branch slug
+    (``<repo-slug>-<branch-slug>-untracked-<8-hex>``) -- that formula is
+    wrong; the id derives solely from the checkout directory's own
+    basename plus a path hash."""
+    for path in _UNTRACKED_ID_DOC_SITES:
+        text = path.read_text(encoding="utf-8")
+        assert "<branch-slug>-untracked-" not in text, (
+            f"{path.name} still claims the untracked id is built from "
+            "<repo-slug>-<branch-slug>-untracked-<8-hex> -- it is not, see "
+            "untracked_id_for() in lib_python_worktree/core/checkout.py"
+        )
+
+
+def test_docs_state_untracked_id_derives_from_checkout_dirname():
+    """Each of the four corrected doc sites must, at least once near an
+    ``-untracked-`` mention, explain the TRUE derivation: the checkout
+    directory's own basename/dirname (slugged), plus a SHA-256-derived
+    hash -- not merely drop the wrong formula without stating the right
+    one."""
+    directory_cue = re.compile(
+        r"basename|dirname|directory name|directory's own name"
+    )
+    hash_cue = re.compile(r"sha-?256|hash")
+
+    for path in _UNTRACKED_ID_DOC_SITES:
+        text = path.read_text(encoding="utf-8")
+        norm = _normalize(text)
+
+        occurrences = list(re.finditer(r"-untracked-", norm))
+        assert occurrences, (
+            f"{path.name} must still document the -untracked- id suffix"
+        )
+
+        found = False
+        for m in occurrences:
+            idx = m.start()
+            window = norm[max(0, idx - 400) : idx + 400]
+            if directory_cue.search(window) and hash_cue.search(window):
+                found = True
+                break
+        assert found, (
+            f"{path.name} must explain, near an -untracked- mention, that "
+            "the id derives from the checkout directory's own basename "
+            "plus a SHA-256 path hash"
+        )
+
+
+def test_docs_still_state_tracked_create_id_formula():
+    """Regression fence: the ticket #148 fix must not have swept away the
+    UNRELATED, already-correct tracked/tool-created worktree create-id
+    formula (<repo-slug>-<branch-slug>-<8-hex>, no -untracked- infix) --
+    that one genuinely does derive from the repo slug and branch slug, via
+    a different code path (lib_python_worktree/core/manager.py)."""
+    for path in (WORKTREE_PY, AGENTS_MD):
+        text = path.read_text(encoding="utf-8")
+        assert "<repo-slug>-<branch-slug>-<8-hex>" in text, (
+            f"{path.name} must still document the tracked create-id "
+            "formula <repo-slug>-<branch-slug>-<8-hex>"
+        )
