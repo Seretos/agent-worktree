@@ -249,10 +249,12 @@ name their target — pass one or the other (or both, if they agree):
   materialises) the target. For `worktree_remove`, the same "one-way hash, not a
   lookup key" problem applies to an **untracked linked worktree**: `environment_list`
   displays it with a synthesised id of the form
-  `<repo-slug>-<branch-slug>-untracked-<8-hex>` (a one-way derivation of its checkout
-  path), and that id can never resolve via `environment_id` — pass the checkout's
-  `path` (from `environment_list`) as `checkout_path` instead. See "Orphan worktree
-  recovery" below for the full recipe.
+  `<checkout-dirname-slug>-untracked-<8-hex>` — the checkout directory's own basename,
+  slugged (lower-case ASCII, non-alphanumeric runs collapsed to `-`, truncated to 40
+  chars), plus the first 8 hex characters of a SHA-256 hash of its resolved path (no
+  repo slug and no branch slug are involved) — and that id can never resolve via
+  `environment_id` — pass the checkout's `path` (from `environment_list`) as
+  `checkout_path` instead. See "Orphan worktree recovery" below for the full recipe.
 
 Passing both is fine only when they agree — a mismatch raises `ValueError`. Passing
 neither also raises `ValueError`. This resolution is entirely the *engine's* job, not
@@ -468,10 +470,19 @@ resolution before any signal code runs at all.
 An orphan is a linked worktree that exists on disk (`git worktree list --porcelain`
 finds it) but has no persisted record — `environment_list` shows it with
 `tracked: false` and a synthesised, display-only id
-(`<repo-slug>-<branch-slug>-untracked-<8-hex>`). That id is a one-way derivation of the
+(`<checkout-dirname-slug>-untracked-<8-hex>`): the checkout directory's own basename,
+slugged (lower-case ASCII, non-alphanumeric runs collapsed to `-`, truncated to 40
+chars), plus the first 8 hex characters of a SHA-256 hash of its resolved path — no
+repo slug and no branch slug are involved. That id is a one-way derivation of the
 checkout's path, not a state-store key, so `worktree_remove(environment_id=<that id>)`
 can never resolve it — it always comes back as a soft not-found error
-(`{"error": "...", "code": "not_found"}`). The working
+(`{"error": "...", "code": "not_found"}`).
+
+Look-alike caveat: a worktree this tool created and later lost the record for has a
+checkout directory basename that already looks like `<repo-slug>-<branch-slug>-<8-hex>`
+(the tracked create-id shape), so its untracked id can visually appear to contain a
+repo slug and a branch slug even though it does not derive from either — a hand-made
+orphan's prefix is simply whatever the directory happens to be named. The working
 recipe is:
 
 1. `environment_list(path=<repo_root>)` — find the entry with `tracked: false` (and

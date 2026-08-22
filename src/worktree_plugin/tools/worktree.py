@@ -528,10 +528,13 @@ def _entry_to_dict(entry: EnvironmentEntry) -> Dict[str, Any]:
     (synthesised) entries -- ``tracked=False`` -- pass through unchanged;
     callers must use ``tracked``, never the id, as the "is this persisted"
     discriminator. A synthesised linked worktree's ``id`` is
-    ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
-    ``untracked_id_for()``), a one-way derivation of its checkout path --
-    NOT a state-store key. It cannot be passed as ``environment_id`` to
-    ``worktree_remove``; address it via ``checkout_path`` instead.
+    ``<checkout-dirname-slug>-untracked-<8-hex>`` (minted by
+    ``untracked_id_for()``): the checkout directory's own basename, slugged
+    (lower-case ASCII, non-alphanumeric runs collapsed to ``-``, truncated
+    to 40 chars), plus the first 8 hex characters of a SHA-256 hash of its
+    resolved path -- no repo slug and no branch slug are involved. It
+    cannot be passed as ``environment_id`` to ``worktree_remove``; address
+    it via ``checkout_path`` instead.
     """
     result = {
         **asdict(entry.record),
@@ -841,9 +844,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           list --porcelain`` reports it, and ``environment_list`` shows it
           with ``tracked: false``) but was never created through this tool
           has a synthesised, display-only id
-          (``<repo-slug>-<branch-slug>-untracked-<8-hex>``) that is a
-          one-way derivation of its checkout path, not a state-store key --
-          it can never resolve via ``environment_id`` alone. Pass the
+          (``<checkout-dirname-slug>-untracked-<8-hex>``): the checkout
+          directory's own basename, slugged (lower-case ASCII,
+          non-alphanumeric runs collapsed to ``-``, truncated to 40 chars),
+          plus the first 8 hex characters of a SHA-256 hash of its resolved
+          path -- no repo slug and no branch slug are involved, and it is
+          not a state-store key -- it can never resolve via
+          ``environment_id`` alone. Pass the
           checkout's path (as shown in ``environment_list``'s ``path``
           field) as ``checkout_path`` instead. Removing an untracked target
           this way tears down the checkout but never touches the state
@@ -1105,11 +1112,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           deterministic ``primary_id_for(repo_root)`` (so it round-trips
           correctly once later materialised by ``environment_start``), while
           a synthesised linked worktree's ``id`` is
-          ``<repo-slug>-<branch-slug>-untracked-<8-hex>`` (minted by
-          ``untracked_id_for()``) -- a one-way derivation of its checkout
-          path, NOT a state-store key. It cannot be passed as
-          ``environment_id`` to ``worktree_remove``; address it via
-          ``checkout_path`` instead.
+          ``<checkout-dirname-slug>-untracked-<8-hex>`` (minted by
+          ``untracked_id_for()``): the checkout directory's own basename,
+          slugged (lower-case ASCII, non-alphanumeric runs collapsed to
+          ``-``, truncated to 40 chars), plus the first 8 hex characters of
+          a SHA-256 hash of its resolved path -- no repo slug and no branch
+          slug are involved, and it is NOT a state-store key. It cannot be
+          passed as ``environment_id`` to ``worktree_remove``; address it
+          via ``checkout_path`` instead.
+
+          Look-alike caveat: a worktree this tool created and later lost
+          the record for has a checkout directory basename that already
+          looks like ``<repo-slug>-<branch-slug>-<8-hex>`` (the tracked
+          create-id shape), so its untracked id can visually appear to
+          contain a repo slug and a branch slug even though it does not
+          derive from either -- a hand-made orphan's prefix is simply
+          whatever the directory happens to be named.
         - ``setup_status``: a coarse setup-health signal derived SOLELY from
           the record's ``setup_outcome`` (an ``Optional[SetupOutcome]``),
           never from ``status`` (the overall run status) -- full decoupling
