@@ -2992,6 +2992,322 @@ def test_worktree_create_invalid_repo_root_still_names_repo_root(tmp_path: Path)
     assert "checkout_path" not in msg
 
 
+# ---- Ticket #159: v0.3.10 worktree_remove/_teardown redesign regression
+# coverage (upstream lib-python-worktree#135). These four E2E scenarios --
+# dirty-tree refusal, dirty-tree forced removal, teardown-before-delete
+# ordering, and orphan-by-checkout_path removal -- are each their own
+# driving test, deliberately not conflated (attempt 1 of this ticket failed
+# planning review by reusing one test to claim coverage of two of these). ----
+
+
+def _write_teardown_probe_contract(
+    repo: Path, tmp_path: Path, marker_name: str
+) -> Path:
+    """Write a `.seretos/worktree-setup.yml` at `repo` with a single
+    `teardown:` step that runs a standalone probe script (written to
+    `tmp_path`, OUTSIDE any checkout). The probe reads `README.md` from its
+    own current working directory -- which the engine sets to the checkout
+    being removed for the duration of the teardown step -- and writes
+    `tmp_path/marker_name` recording both that cwd and the README content it
+    saw. Returns the marker's path.
+
+    This is only obtainable while the checkout still exists: if `teardown:`
+    ran AFTER the checkout was deleted, the probe's cwd/README would already
+    be gone, the script would fail, `SetupRunner`'s step failure is swallowed
+    (ticket #117's documented policy: a teardown step failure must never
+    block `git worktree remove`), and no marker would ever be written at
+    all. A marker existing, with `readme=` matching the committed content, is
+    therefore direct proof teardown ran before deletion -- not merely that
+    it ran at some point.
+    """
+    marker = tmp_path / marker_name
+    probe_script = tmp_path / f"{marker_name}.probe.py"
+    probe_lines = [
+        "import os",
+        "from pathlib import Path",
+        f"marker = Path({str(marker)!r})",
+        "cwd = os.getcwd()",
+        'readme = Path("README.md").read_text(encoding="utf-8").rstrip(chr(10))',
+        'marker.write_text("cwd=" + cwd + "\\nreadme=" + readme + "\\n", '
+        'encoding="utf-8")',
+    ]
+    probe_script.write_text("\n".join(probe_lines) + "\n", encoding="utf-8")
+
+    # Shell-agnostic, space-safe interpreter+script invocation (test-critic
+    # round-1, test-code Major 2, plus a reviewer round-2 finding on this
+    # same line): a leading `&` PowerShell call operator is a syntax error
+    # under `bash -c` on POSIX, so `&`-based quoting is out. But a fully
+    # UNQUOTED `<py> <script>` pair (the previous shape here) is only safe
+    # when neither path contains a space -- `sys.executable` is the actual
+    # running interpreter's path, not a fixture-derived one, and commonly
+    # contains a space on Windows (e.g. under `C:\Program Files\...`), so
+    # that assumption was wrong.
+    #
+    # `_cmdline_token` below instead leaves each path's leading run of
+    # "plain" characters (up to its first space or backslash) UNQUOTED, then
+    # wraps everything from that point on in a double-quoted segment, with
+    # no whitespace between the two pieces. This round-trips through both
+    # engines with the *same literal text*, no per-shell branching needed:
+    # - PowerShell decides command-mode vs. expression-mode parsing from
+    #   the very first character of a statement; a *quoted* leading token
+    #   is parsed as an expression and silently never launched without `&`
+    #   (see above), but our token starts with an unquoted character, so
+    #   PowerShell stays in command mode -- and an unquoted segment
+    #   immediately followed by a quoted segment (no space between them)
+    #   merges into a single token, so the whole thing is invoked as one
+    #   command/argument. PowerShell also never treats backslash as an
+    #   escape character (quoted or not), so the quoted tail's backslashes
+    #   survive unchanged.
+    # - `bash -c` merges adjacent quoted/unquoted segments into a single
+    #   word the same way. Its hazard is the mirror image of PowerShell's:
+    #   outside quotes, a backslash escapes (and is stripped along with)
+    #   the next character, which would silently eat a Windows path's
+    #   directory separators -- so every backslash must live inside the
+    #   quoted segment. Per POSIX, a backslash inside double quotes is only
+    #   special before `$`, `` ` ``, `"`, `\`, or a newline; none of those
+    #   follow a backslash in an ordinary Windows path, so the quoted tail
+    #   survives unchanged there too. (A plain fully-double-quoted path
+    #   would NOT be safe in general for this same reason if a backslash
+    #   happened to immediately precede one of those characters -- e.g. a
+    #   trailing backslash butting up against the closing quote -- which is
+    #   why this leaves a prefix unquoted rather than quoting the whole
+    #   token.)
+    def _cmdline_token(path_str: str) -> str:
+        for i, ch in enumerate(path_str):
+            if ch in (" ", "\\"):
+                return f'{path_str[:i]}"{path_str[i:]}"'
+        return path_str
+
+    run_line = f"{_cmdline_token(sys.executable)} {_cmdline_token(str(probe_script))}"
+    _write_contract(
+        repo,
+        "version: 1\n"
+        "isolation: full\n"
+        "teardown:\n"
+        "  - name: probe\n"
+        f"    run: {run_line}\n",
+    )
+    return marker
+
+
+def _parse_marker(marker: Path) -> Tuple[str, str]:
+    text = marker.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    cwd_line = next(l for l in lines if l.startswith("cwd="))
+    readme_line = next(l for l in lines if l.startswith("readme="))
+    return cwd_line[len("cwd=") :], readme_line[len("readme=") :]
+
+
+def test_worktree_remove_dirty_tree_refuses_without_force(
+    tmp_path: Path, temp_repo: Path
+):
+    """R2: a checkout with real dirt (a modified TRACKED file -- deliberately
+    not `.seretos/` content, which is exempted) is not removed when
+    `force=False`. Deterministic refusal -- not wrapped in
+    `_remove_with_ambient_retry`."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+
+    readme_path = Path(rec.path) / "README.md"
+    readme_path.write_text("dirty edit\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](environment_id=rec.id)
+
+    msg = str(excinfo.value)
+    assert "uncommitted changes" in msg
+    assert "force=True" in msg
+
+    # Nothing was touched: the checkout, its dirt, and the state record all
+    # survive the refused attempt.
+    assert Path(rec.path).exists()
+    assert readme_path.read_text(encoding="utf-8") == "dirty edit\n"
+    assert mgr.state.list() == [rec]
+
+
+def test_worktree_remove_dirty_tree_succeeds_with_force(
+    tmp_path: Path, temp_repo: Path
+):
+    """R3: the same real-dirt checkout IS removed when `force=True`."""
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+
+    readme_path = Path(rec.path) / "README.md"
+    readme_path.write_text("dirty edit\n", encoding="utf-8")
+
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](environment_id=rec.id, force=True),
+        what="worktree_remove(dirty tree, force=True)",
+    )
+
+    assert "error" not in result
+    assert result["id"] == rec.id
+    assert result["status"] == "removed"
+    assert not Path(rec.path).exists()
+    assert mgr.state.list() == []
+
+
+def test_worktree_remove_runs_teardown_steps_before_deleting_checkout(
+    tmp_path: Path, temp_repo: Path
+):
+    """R4: contract `teardown:` steps execute while the checkout still
+    exists -- see `_write_teardown_probe_contract`'s docstring for why the
+    marker's mere existence, with matching README content, discriminates
+    "ran before delete" from "ran after delete" (which would produce no
+    marker at all, not a wrong one)."""
+    marker = _write_teardown_probe_contract(
+        temp_repo, tmp_path, "teardown-marker.txt"
+    )
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](environment_id=rec.id),
+        what="worktree_remove(teardown-before-delete probe)",
+    )
+
+    assert "error" not in result
+    assert result["status"] == "removed"
+    assert not Path(rec.path).exists()
+
+    assert marker.exists(), (
+        "teardown marker was never written -- either the teardown step "
+        "never ran at all, or it ran AFTER the checkout was already "
+        "deleted (cwd/README gone), failed, and was silently swallowed"
+    )
+    recorded_cwd, recorded_readme = _parse_marker(marker)
+    assert recorded_readme == "hello", f"unexpected README content seen: {recorded_readme!r}"
+    assert Path(recorded_cwd).resolve() == Path(rec.path).resolve()
+
+
+def test_worktree_remove_orphan_by_checkout_path_through_redesigned_teardown(
+    tmp_path: Path, temp_repo: Path
+):
+    """R5: an orphan linked worktree (on disk, never persisted in the
+    manager's store) is SUCCESSFULLY removed when addressed by
+    `checkout_path` -- a genuine success case, not a refusal, and not the
+    same test as the primary-refusal tests. This must also run the
+    redesigned teardown for the untracked target (the engine loads the
+    contract from `record.repo_root`, independent of whether the record
+    itself was ever persisted)."""
+    orphan_path = _make_orphan(temp_repo, tmp_path)
+    marker = _write_teardown_probe_contract(
+        temp_repo, tmp_path, "orphan-teardown-marker.txt"
+    )
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    result = _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](checkout_path=str(orphan_path)),
+        what="worktree_remove(orphan by checkout_path, redesigned teardown)",
+    )
+
+    assert "error" not in result
+    assert re.search(r"-untracked-[0-9a-f]{8}$", result["id"])
+    assert result["status"] == "removed"
+    assert not orphan_path.exists()
+    assert mgr.state.list() == []
+
+    branches = subprocess.run(
+        ["git", "branch", "--list", "orphan-branch"],
+        cwd=temp_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "orphan-branch" in branches
+
+    assert marker.exists(), (
+        "teardown marker was never written for the untracked/orphan "
+        "removal target -- teardown must run for this target too"
+    )
+    recorded_cwd, recorded_readme = _parse_marker(marker)
+    assert recorded_readme == "hello", f"unexpected README content seen: {recorded_readme!r}"
+    assert Path(recorded_cwd).resolve() == orphan_path.resolve()
+
+
+def _prove_teardown_marker_mechanism_reachable(
+    mgr: WorktreeManager, fns: dict, temp_repo: Path, marker: Path
+) -> None:
+    """Positive control for primary-refusal probes (test-critic round-1
+    finding, plan-layer Major 1): create an ordinary linked worktree against
+    the same contract/repo and remove it normally, proving the teardown
+    probe marker mechanism is actually live BEFORE a caller relies on the
+    marker's absence to mean anything. Without this control, an
+    implementation where teardown silently no-ops for this contract (or for
+    unpersisted/primary-shaped targets generally) would make a later
+    "marker absent" assertion pass vacuously, never having proven the
+    marker mechanism was reachable at all.
+
+    Deliberately kept as its own module-level helper, not inlined into a
+    deterministic-refusal test body: this control's own removal is an
+    ordinary, ambient-retriable success (ticket #141), so it legitimately
+    uses `_remove_with_ambient_retry` -- but
+    `test_deterministic_refusal_tests_are_not_ambient_hardened` scans each
+    registered refusal test's own source text for that exact call, and a
+    refusal test merely *calling* this helper (rather than containing the
+    retry call inline) keeps that scan accurate: it is the refusal test's
+    own `worktree_remove` attempt that must never be retried, not this
+    unrelated control step.
+    """
+    control_rec = mgr.create(str(temp_repo), "feature/r6-positive-control")
+    _remove_with_ambient_retry(
+        lambda: fns["worktree_remove"](environment_id=control_rec.id),
+        what="worktree_remove(R6 positive control)",
+    )
+    assert marker.exists(), (
+        "positive control failed -- the teardown probe marker was not "
+        "written even for an ordinary (non-primary) removal against this "
+        "same contract, so its absence after the primary-refusal attempt "
+        "below would not prove anything about the primary guard"
+    )
+    marker.unlink()
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("addressing", ["environment_id", "checkout_path"])
+def test_worktree_remove_primary_refused_before_any_teardown_phase_runs(
+    tmp_path: Path, temp_repo: Path, addressing: str, force: bool
+):
+    """R6: removing the primary/main clone is refused structurally, before
+    any teardown work, regardless of `force`, on both addressing modes.
+    Deliberately not a copy of the existing primary-refusal tests: adds the
+    pre-teardown-marker-absence dimension -- proving the guard fires BEFORE
+    any teardown phase, not merely that it fires at all."""
+    marker = _write_teardown_probe_contract(
+        temp_repo, tmp_path, "primary-teardown-marker.txt"
+    )
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    _prove_teardown_marker_mechanism_reachable(mgr, fns, temp_repo, marker)
+
+    if addressing == "environment_id":
+        started = fns["environment_start"](checkout_path=str(temp_repo))
+        assert "error" not in started
+        kwargs = {"environment_id": started["id"], "force": force}
+    else:
+        kwargs = {"checkout_path": str(temp_repo), "force": force}
+
+    with pytest.raises(ValueError) as excinfo:
+        fns["worktree_remove"](**kwargs)
+
+    msg = str(excinfo.value)
+    assert "primary" in msg
+    assert "backing" in msg
+
+    assert temp_repo.exists()
+    assert (temp_repo / ".git").exists()
+    readme_content = (temp_repo / "README.md").read_text(encoding="utf-8")
+    assert readme_content == "hello\n"
+
+    assert not marker.exists(), (
+        "teardown marker was written despite the primary refusal -- the "
+        "primary guard must fire BEFORE any teardown phase runs"
+    )
+
+
 # ---- Ticket #141: ambient-handle hardening ----
 
 _MIRROR_BEGIN = "# ---- ticket #141 ambient-handle retry helper (MIRRORED) " + "BEGIN ----"
@@ -3023,6 +3339,9 @@ _HARDENED_REMOVAL_SITES = (
     "test_worktree_remove_untracked_orphan_by_checkout_path",
     "test_worktree_remove_orphan_leaves_branch_intact",
     "test_worktree_remove_by_checkout_path_on_tracked_worktree",
+    "test_worktree_remove_dirty_tree_succeeds_with_force",
+    "test_worktree_remove_runs_teardown_steps_before_deleting_checkout",
+    "test_worktree_remove_orphan_by_checkout_path_through_redesigned_teardown",
 )
 
 
@@ -3047,6 +3366,8 @@ _DETERMINISTIC_REFUSAL_TESTS_NOT_HARDENED = (
     "test_worktree_remove_checkout_path_nonexistent",
     "test_worktree_remove_checkout_path_is_a_file",
     "test_worktree_remove_invalid_checkout_path_identity_guard_different_path",
+    "test_worktree_remove_dirty_tree_refuses_without_force",
+    "test_worktree_remove_primary_refused_before_any_teardown_phase_runs",
 )
 
 

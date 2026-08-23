@@ -473,7 +473,7 @@ def _default_stop_variant(
             info = classify_checkout(checkout_path)
             if info.backing == "primary":
                 # Mirrors WorktreeManager._resolve_target()'s primary branch
-                # (manager.py:1698-1700): classify_checkout() documents that
+                # (manager.py:1783-1785, post-#135 relocation): classify_checkout() documents that
                 # info.repo_root is always the main clone's root regardless
                 # of which checkout checkout_path itself belongs to, so this
                 # lookup must only be attempted when checkout_path actually
@@ -485,7 +485,7 @@ def _default_stop_variant(
                 # checkout_path resolved to a linked worktree: go straight
                 # to the path/containment match, scoped to this repo's
                 # non-primary records, mirroring _resolve_target()'s
-                # "worktree" branch (manager.py:1701-1719).
+                # "worktree" branch (manager.py:1786-1812, post-#135 relocation).
                 target = Path(info.checkout_path).resolve()
                 repo_root_str = info.repo_root.as_posix()
                 for rec in manager.state.list():

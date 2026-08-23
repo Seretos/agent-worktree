@@ -16,6 +16,7 @@ from lib_python_worktree.setup.runner import (
     SetupFailedError,
     SetupRunner,
     _PlainStep,
+    _PS_EXIT_CODE_EPILOGUE,
     _build_step_command,
     _resolve_shell,
     log_dir_for,
@@ -210,6 +211,16 @@ def test_step_command_argv_shape_per_platform(monkeypatch):
     test on the ubuntu-22.04 CI leg the way it broke those two. This test
     keeps both the win32 and linux argv shapes drift-guarded on both CI
     legs, strictly more #109 coverage than the pre-#137 state.
+
+    Post-#159 (lib-python-worktree v0.3.10) update: upstream ticket #134,
+    bundled in the same version bump, made `_build_step_command` append
+    `_PS_EXIT_CODE_EPILOGUE` to the PowerShell/pwsh run line before it is
+    base64-encoded (an exit-code-propagating epilogue -- see the function's
+    own docstring). The encoded win32 blob therefore now covers
+    `run_line + _PS_EXIT_CODE_EPILOGUE`, not the bare `run_line`; the
+    unencoded `bash -c` shape on non-Windows platforms is untouched by #134
+    (POSIX shells already propagate exit status on their own), so the linux
+    assertion below is unchanged.
     """
     monkeypatch.setattr(sys, "platform", "win32")
     win32_shell = _resolve_shell(None)
@@ -219,7 +230,9 @@ def test_step_command_argv_shape_per_platform(monkeypatch):
         "-NoProfile",
         "-NonInteractive",
         "-EncodedCommand",
-        base64.b64encode("start-worker.sh".encode("utf-16-le")).decode("ascii"),
+        base64.b64encode(
+            ("start-worker.sh" + _PS_EXIT_CODE_EPILOGUE).encode("utf-16-le")
+        ).decode("ascii"),
     ]
 
     monkeypatch.setattr(sys, "platform", "linux")

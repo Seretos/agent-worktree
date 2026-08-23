@@ -20,3 +20,5 @@ dist/
 *.pyinstaller.tmp/
 .process-ticket-result.json
 .claude-session/
+
+.adev/
