@@ -30,12 +30,15 @@ The pinned engine (``lib-python-worktree`` v0.3.3, importable at
 ``.venv/Lib/site-packages/lib_python_worktree/core/process_lifecycle.py``
 in this checkout) has exactly this gap:
 
-- ``_send_graceful_signal()`` (process_lifecycle.py:671-683) does
+- ``_send_graceful_signal()`` (process_lifecycle.py:819-836, post-v0.3.10
+  relocation) does
   ``os.kill(pid, signal.CTRL_BREAK_EVENT)`` unconditionally on
   ``sys.platform == "win32"``, with **no check** that *pid* is a process
   group leader.
 - It is called from two non-group-leader call sites:
-  - ``_kill_process_tree`` (process_lifecycle.py:1163), signalling every
+  - ``_kill_process_tree`` (process_lifecycle.py:1563, post-v0.3.10
+    relocation; called from the redesigned teardown module's
+    ``_phase_stop_processes``), signalling every
     node of a discovered process *tree* -- children/grandchildren of the
     tracked pid, which are emphatically not group leaders of their own.
   - The orphan scan inside ``stop()`` (process_lifecycle.py:2308), same
@@ -51,7 +54,8 @@ in this checkout) has exactly this gap:
   resolve to just the intended child's own group can therefore be delivered
   back to that shared console -- reaching the server process too.
 - POSIX already guards exactly this class of mistake:
-  ``_signal_process_group`` (process_lifecycle.py:1030-1067) refuses to
+  ``_signal_process_group`` (process_lifecycle.py:1400-1437, post-v0.3.10
+  relocation) refuses to
   ``os.killpg`` unless *pid* is confirmed to be the leader of its own group
   (``os.getpgid(pid) == pid``) and that group is not the caller's own
   (``os.getpgid(pid) != os.getpgid(0)``). **Windows has no equivalent

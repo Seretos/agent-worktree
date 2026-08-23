@@ -19,7 +19,7 @@ from typing import Iterator
 
 import pytest
 
-import lib_python_worktree.core.manager as manager_module
+import lib_python_worktree.core._git_utils as git_utils_module
 from lib_python_worktree import (
     BranchAlreadyCheckedOutError,
     BranchNotFoundError,
@@ -415,7 +415,12 @@ def test_run_git_raises_timeout_when_subprocess_hangs(monkeypatch):
             killed["value"] = True
             self.returncode = -9
 
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _HangingPopen)
+    # `_run_git` was extracted into `core/_git_utils.py` (lib-python-worktree
+    # v0.3.10, ticket #159 bump); `subprocess.Popen` there resolves against
+    # `_git_utils`'s own module-level `subprocess` import, not `manager`'s
+    # (which no longer imports `subprocess` at all -- it only re-exports the
+    # `_run_git` function object itself). Patch it where it is actually used.
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _HangingPopen)
 
     with pytest.raises(GitTimeoutError) as excinfo:
         _run_git(["status"], timeout=0.05)
@@ -444,7 +449,9 @@ def test_run_git_timeout_respects_env_override(monkeypatch):
             pass
 
     monkeypatch.setenv("WORKTREE_GIT_TIMEOUT_SEC", "7.5")
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _CapturingPopen)
+    # See test_run_git_raises_timeout_when_subprocess_hangs above for why
+    # this patches `_git_utils.subprocess`, not `manager.subprocess`.
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _CapturingPopen)
 
     _run_git(["--version"])
     assert captured["timeout"] == 7.5
@@ -469,7 +476,9 @@ def test_run_git_closes_stdin(monkeypatch):
         def kill(self):  # pragma: no cover - not reached in this test
             pass
 
-    monkeypatch.setattr(manager_module.subprocess, "Popen", _RecordingPopen)
+    # See test_run_git_raises_timeout_when_subprocess_hangs above for why
+    # this patches `_git_utils.subprocess`, not `manager.subprocess`.
+    monkeypatch.setattr(git_utils_module.subprocess, "Popen", _RecordingPopen)
     _run_git(["--version"])
     assert captured_kwargs.get("stdin") is subprocess.DEVNULL
 
