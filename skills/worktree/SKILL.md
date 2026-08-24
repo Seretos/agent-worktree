@@ -62,7 +62,7 @@ only in a worktree checkout, and never at `<repo_root>/.seretos/worktree-setup.y
 still produces a no-op — `environment_start` returns `{"status": "ready", "pids": {}}`
 — but it is **not silent** and **not** indistinguishable from "no contract configured"
 (issue #87): the same response carries `contract_found: false`, `steps_run: 0`, and
-`no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-unconfigured
+`no_op_reason: "contract_misplaced"` (vs `"no_contract"` for the genuinely-unconfigured
 case) — ticket #103's contract diagnostics. The engine (`lib-python-worktree`, upstream
 #100) additionally sets `shadowed_contract` on the response — `None`, or `{path,
 used_path, reason, message}` with `reason` either `"differs"` or `"unreadable"` —
@@ -512,7 +512,7 @@ running under the given `role`).
    reads `<repo_root>/.seretos/worktree-setup.yml`, not a linked worktree checkout's
    copy. A contract placed only in the worktree checkout still produces
    `{"status": "ready", "pids": {}}`, but `environment_start`'s response also carries
-   `no_op_reason: "contract-misplaced"` (vs `"no-contract"` for the genuinely-
+   `no_op_reason: "contract_misplaced"` (vs `"no_contract"` for the genuinely-
    unconfigured case) — branch on that instead of inferring from `status`/`pids`. If
    instead the checkout-local copy was *edited* while a valid repo-root contract
    started normally, look for `shadowed_contract` in the response.

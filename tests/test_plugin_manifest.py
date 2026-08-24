@@ -371,19 +371,25 @@ def test_docs_no_longer_claim_misplaced_contract_is_silent():
     """Claim under protection (ticket #130, re-slicing #124): SKILL.md's
     "Critical:" contract block and its Pitfalls section must both describe
     the misplaced-contract case as diagnosable (no_op_reason:
-    "contract-misplaced"), not silent/indistinguishable-from-unconfigured."""
+    "contract_misplaced"), not silent/indistinguishable-from-unconfigured."""
     text = SKILL_MD.read_text(encoding="utf-8")
     norm = _normalize(text)
 
     assert "no_op_reason" in norm
-    assert "contract-misplaced" in norm
+    assert "contract_misplaced" in norm
+    # WP #162 test-critic round-1 note 4: pin presence of the remaining
+    # underscore literal SKILL.md must also carry (the "vs" contrast in the
+    # same sentence, "no_contract" for the genuinely-unconfigured case), so
+    # deleting that mention cannot pass this test as a mere rename of
+    # "contract_misplaced".
+    assert "no_contract" in norm
     assert "with no error" not in norm
 
     found_silent_far_from_diagnosis = False
     for m in re.finditer(r"(?<!not )\bsilent\b", norm):
         idx = m.start()
         window = norm[max(0, idx - 300) : idx + 300]
-        if "contract-misplaced" in window or "misplacement" in window:
+        if "contract_misplaced" in window or "misplacement" in window:
             found_silent_far_from_diagnosis = True
     assert not found_silent_far_from_diagnosis, (
         "SKILL.md must not describe the misplaced-contract case as "

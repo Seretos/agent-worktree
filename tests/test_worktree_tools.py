@@ -26,6 +26,7 @@ from lib_python_worktree import (
     CheckoutTargetError,
     ContractError,
     DuplicateWorktreeError,
+    GitCommandError,
     GitTimeoutError,
     InMemoryStateStore,
     KilledProcessInfo,
@@ -3533,3 +3534,298 @@ def test_deterministic_refusal_tests_are_not_ambient_hardened():
             f"{name} is a deterministic refusal/lock-mapping test and must "
             f"not be wrapped in _remove_with_ambient_retry (ticket #141)"
         )
+
+
+# ---------------------------------------------------------------------------
+# WP #162 R2 (ticket #157): worktree_create normalises the GitCommandError
+# raised for an invalid branch name instead of leaking git's raw argv --
+# including the store's absolute target path -- verbatim.
+# ---------------------------------------------------------------------------
+
+# Mirrors the planned `_INVALID_BRANCH_STDERR_MARKERS` production constant
+# (to be added to worktree.py in the implement phase -- this tests phase
+# writes no production code). Defined locally so the driving test and the
+# marker-table test below have a single source of truth for "which
+# git-emitted phrasing counts as an invalid-branch-name marker" without
+# importing a symbol that does not exist in the source tree yet.
+_INVALID_BRANCH_STDERR_MARKERS = (
+    "not a valid branch name",
+    "invalid branch name",
+    "not a valid ref name",
+)
+
+
+def test_worktree_create_invalid_branch_name_normalizes_git_stderr(
+    temp_repo: Path, tmp_path: Path
+):
+    """R2 driving test (ticket #157): a branch name git itself rejects
+    (contains '..', '~', '^', ':') must surface a normalised
+    `invalid_branch_name:` error instead of the raw `GitCommandError` text,
+    which leaks the full argv of the failed `git worktree add` command --
+    including the store's absolute target path -- verbatim.
+
+    Real git, no mocking -- mirrors the ticket's own repro exactly.
+
+    Expected RED reason: no arm in worktree_create classifies
+    GitCommandError today; the generic `except WorktreeError` tail at
+    worktree.py:807-808 re-raises `str(exc)` unchanged, i.e. `git command
+    failed (exit ...): git worktree add -b <branch> <store path> main
+    \\nfatal: ...` -- so `message.startswith("invalid_branch_name:")` fails
+    immediately (confirmed directly against this environment's real git
+    before writing this test).
+    """
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    branch = "bad..branch~name^:test"
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root=str(temp_repo), branch=branch)
+
+    message = str(exc_info.value)
+    assert message.startswith("invalid_branch_name:")
+    assert f"'{branch}'" in message
+    assert any(marker in message.lower() for marker in _INVALID_BRANCH_STDERR_MARKERS)
+    assert "Hint:" in message
+    # Negatives: none of the raw git argv/exit-code/store-path leak survives.
+    assert "git worktree add" not in message
+    assert "exit " not in message
+    assert str(tmp_path) not in message
+    assert tmp_path.as_posix() not in message
+    # Lower-case "hint:" would be git's own trailing hint line -- pins the
+    # "prefer the marker line, not the last line" correction; ours is "Hint:".
+    assert "hint:" not in message
+
+
+@pytest.mark.parametrize(
+    "stderr_line",
+    [
+        "fatal: 'bad..branch~name^:test' is not a valid branch name",
+        "fatal: invalid branch name: 'bad..name'",
+        "fatal: 'refs/heads/bad..name' is not a valid ref name",
+        "FATAL: 'Bad..Name' Is Not A Valid Branch Name",
+    ],
+    ids=[
+        "not-a-valid-branch-name",
+        "invalid-branch-name",
+        "not-a-valid-ref-name",
+        "mixed-case",
+    ],
+)
+def test_worktree_create_invalid_branch_marker_table(tmp_path: Path, stderr_line: str):
+    """R2 edge (a): marker-table test -- the executable definition of the
+    trigger. Every marker, wrapped in a realistic single-line stderr, plus a
+    mixed-case variant whose casing differs exactly where the marker sits
+    (genuinely exercising the case-insensitivity guarantee), must produce
+    the `invalid_branch_name:` message. Mock-based, precedent:
+    `mgr.create = MagicMock(side_effect=exc)` at
+    `test_worktree_create_setup_failed_raises_valueerror_not_runtimeerror`
+    above.
+
+    Expected RED reason: same as the driving test -- no classifying arm
+    exists yet, so the raised message is `str(exc)` unchanged and never
+    starts with `invalid_branch_name:`.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", "bad..name", "/store/x", "main"],
+        128,
+        stderr_line,
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="bad..name")
+
+    assert str(exc_info.value).startswith("invalid_branch_name:")
+
+
+def test_worktree_create_marker_free_git_error_stays_unrewritten(tmp_path: Path):
+    """R2 edge (b): no-collateral pinning test. A `GitCommandError` whose
+    stderr carries no branch-name marker at all (a credential-prompt
+    failure) must NOT be rewritten. Not tautological: the precondition is
+    only "it raises"; the assertion is that no rewriting occurred -- the
+    raised object is a ValueError carrying the injected exception's own
+    text, unrewritten, still carrying "git command failed (exit 128):".
+
+    Expected to already pass -- today's baseline (the generic
+    `except WorktreeError` tail) already re-raises `str(exc)` unchanged for
+    every GitCommandError, marker or not.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", "ok", "/store/x", "main"],
+        128,
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="ok")
+
+    assert str(exc_info.value) == str(exc)
+    assert "invalid_branch_name:" not in str(exc_info.value)
+
+
+def test_worktree_create_empty_stderr_git_error_stays_unrewritten(tmp_path: Path):
+    """R2 edge (c1): `stderr=""` hits the empty-`splitlines()` path the
+    planned classifier must guard against. Same observable as edge (b):
+    unrewritten ValueError.
+
+    Expected to already pass -- today's baseline unconditionally re-raises
+    `str(exc)` regardless of stderr content.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", "ok", "/store/x", "main"], 128, ""
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="ok")
+
+    assert str(exc_info.value) == str(exc)
+    assert "invalid_branch_name:" not in str(exc_info.value)
+
+
+def test_worktree_create_none_stderr_git_error_stays_unrewritten(tmp_path: Path):
+    """R2 edge (c2): `stderr=None` hits the `isinstance(..., str)` guard the
+    planned classifier must have. Orchestrator addendum resolution ("minor
+    untestable::F2"): the engine's own `.stderr` is always `str`
+    (`_run_git` uses `Popen(..., text=True)`), so this state does not occur
+    naturally -- it is constructed defensively in two steps: build the
+    instance with a valid `str` stderr first (so `GitCommandError.__init__`
+    succeeds and `str(exc)` is well-formed), then set `exc.stderr = None` on
+    the instance afterwards. This exercises the guard while keeping
+    `str(exc)` stable for the equality assertion below. The guard is
+    defensive; the engine does not produce this state today.
+
+    Expected to already pass -- today's baseline unconditionally re-raises
+    `str(exc)` regardless of `.stderr`.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", "ok", "/store/x", "main"],
+        128,
+        "fatal: some unrelated failure",
+    )
+    exc.stderr = None
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="ok")
+
+    assert str(exc_info.value) == str(exc)
+    assert "invalid_branch_name:" not in str(exc_info.value)
+
+
+def test_worktree_create_invalid_branch_multiline_stderr_uses_marker_line(
+    tmp_path: Path,
+):
+    """R2 edge (d): multi-line stderr -- the marker line, not the first or
+    last line, is what must be surfaced (real git emits a trailing `hint:`
+    line, so "last non-empty line" cleaning would surface the hint instead
+    of the informative `fatal:` line -- this is the plan's correction over
+    an earlier design). Fully mock-controlled stderr, so no git-version
+    dependence.
+
+    Expected RED reason: same as the driving test -- no classifying arm
+    exists yet, so none of these assertions about *which* line got
+    extracted can hold; the raised message is `str(exc)` unchanged.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", "b", "/store/x", "main"],
+        128,
+        "warning: some unrelated noise\n"
+        "fatal: 'b' is not a valid branch name\n"
+        "hint: see the manual",
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch="b")
+
+    message = str(exc_info.value)
+    assert "is not a valid branch name" in message
+    assert "unrelated noise" not in message
+    assert "hint: see" not in message
+
+
+def test_worktree_create_invalid_branch_interpolates_branch_and_reason(
+    tmp_path: Path,
+):
+    """R2 tightening (test-critic round-1 note 1, major): guards against a
+    hard-coded constant message. Every other test in this module either
+    reuses one branch name/reason combination or only asserts a known
+    marker substring (itself a fixed phrase), so a naive implementation
+    that emits a literal, unparameterised string could still satisfy them.
+    This test uses a branch name distinct from every other test here, and
+    a distinctive, test-controlled reason phrase appended to the matched
+    stderr line that cannot plausibly appear in any hard-coded string, and
+    asserts BOTH survive into the raised message -- forcing the
+    implementation to interpolate `branch` and to read the matched stderr
+    line rather than emit a constant.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    branch = "totally-different-probe-branch"
+    distinctive_reason = "zzz-probe-marker-8f3c2a-unique"
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", branch, "/store/probe", "main"],
+        128,
+        f"fatal: '{branch}' is not a valid branch name: {distinctive_reason}",
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch=branch)
+
+    message = str(exc_info.value)
+    assert message.startswith("invalid_branch_name:")
+    assert f"'{branch}'" in message
+    assert distinctive_reason in message
+
+
+def test_worktree_create_invalid_branch_reason_strips_fatal_prefix_and_collapses_whitespace(
+    tmp_path: Path,
+):
+    """R2 tightening (test-critic round-1 note 2, major): pins the
+    reason-line cleaning rule the plan requires -- a leading `fatal: `/
+    `error: `/`warning: ` prefix (case-insensitive) is stripped, and
+    internal whitespace in the surfaced reason is collapsed to single
+    spaces. Fully mock-controlled stderr, so nothing depends on the local
+    git version. The extra whitespace is placed around, not inside, the
+    marker phrase itself so marker detection is unaffected -- only the
+    cleaning rule is under test here.
+    """
+    from unittest.mock import MagicMock
+
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    branch = "whitespace-probe-branch"
+    exc = GitCommandError(
+        ["git", "worktree", "add", "-b", branch, "/store/probe2", "main"],
+        128,
+        f"FATAL:   '{branch}'   is not a valid branch name",
+    )
+    mgr.create = MagicMock(side_effect=exc)
+
+    with pytest.raises(ValueError) as exc_info:
+        fns["worktree_create"](repo_root="/repo", branch=branch)
+
+    message = str(exc_info.value)
+    assert message.startswith("invalid_branch_name:")
+    # No leftover "fatal:" (any case) prefix on the reason survives.
+    assert "fatal:" not in message.lower()
+    # Internal whitespace in the reason is collapsed -- no run of two or
+    # more spaces survives anywhere in the message.
+    assert "  " not in message

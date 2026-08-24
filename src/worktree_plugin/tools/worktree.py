@@ -50,6 +50,7 @@ from lib_python_worktree import (
     ContractError,
     DuplicateWorktreeError,
     EnvironmentEntry,
+    GitCommandError,
     InvalidRepoError,
     KilledProcessInfo,
     PrimaryCheckoutError,
@@ -92,6 +93,57 @@ from lib_python_worktree import (
 # the wrapper's error-format decision disagree with the engine's own
 # exception text for the same id, so it is intentionally left as-is.
 _UNTRACKED_ID_RE = re.compile(r"-untracked-[0-9a-f]{8}$")
+
+
+# WP #162 R2 (ticket #157): stderr phrasings that, when present on a line of
+# a failed `git worktree add -b <branch> ...`, name the `-b <branch>`
+# argument itself as invalid -- as opposed to the *base* ref, which git
+# reports separately (e.g. `fatal: invalid reference: <base>`). Deliberately
+# excludes "invalid reference" for that reason: keeping it would risk
+# mislabelling a bad-*base* failure as an invalid *branch* name. Version-
+# independent by construction -- this tuple is the feature's own single
+# source of truth for what counts as a branch-name-specific rejection, not a
+# reflection of any one git version's exact wording.
+_INVALID_BRANCH_STDERR_MARKERS = (
+    "not a valid branch name",
+    "invalid branch name",
+    "not a valid ref name",
+)
+
+# Strips a leading `fatal: `/`error: `/`warning: ` prefix (case-insensitive,
+# with any amount of surrounding whitespace) from the matched stderr line
+# before it is surfaced as the cleaned "reason" -- git's own severity tag
+# carries no information once this wrapper has already classified the line.
+_INVALID_BRANCH_PREFIX_RE = re.compile(r"^\s*(?:fatal|error|warning):\s*", re.IGNORECASE)
+
+
+def _invalid_branch_reason(stderr: Optional[str]) -> Optional[str]:
+    """Return a cleaned, human-readable reason if ``stderr`` (from a failed
+    ``git worktree add -b <branch> ...``) names an invalid branch/ref-name
+    argument, else ``None``.
+
+    Scans ``stderr`` **line by line**; the first line whose lower-cased form
+    contains one of ``_INVALID_BRANCH_STDERR_MARKERS`` is both the
+    classification trigger *and* the cleaned reason -- matching and
+    cleaning on the same line (rather than, say, the last non-empty line)
+    is what keeps this version-robust: real git commonly emits a trailing
+    ``hint:`` line after the informative ``fatal:`` line, and last-line
+    cleaning would surface the hint instead. The returned reason has its
+    leading ``fatal: ``/``error: ``/``warning: `` prefix stripped
+    (case-insensitive) and internal whitespace collapsed to single spaces.
+
+    Returns ``None`` for a non-``str`` ``stderr`` (defensive -- the engine's
+    own ``.stderr`` is always ``str`` in practice), for ``""``, and when no
+    line matches any marker.
+    """
+    if not isinstance(stderr, str) or not stderr:
+        return None
+    for line in stderr.splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in _INVALID_BRANCH_STDERR_MARKERS):
+            cleaned = _INVALID_BRANCH_PREFIX_RE.sub("", line)
+            return " ".join(cleaned.split())
+    return None
 
 
 def _record_to_dict(record: WorktreeRecord) -> Dict[str, Any]:
@@ -275,7 +327,7 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
       surface -- see the plan's "deferred to the engine repo" notes).
 
     Never raises: any ``OSError``/``ContractError`` degrades to
-    ``no_op_reason == "contract-unreadable"`` rather than propagating.
+    ``no_op_reason == "contract_unreadable"`` rather than propagating.
     """
     contract_path = Path(record.repo_root) / CONTRACT_FILENAME
     contract_found = False
@@ -289,9 +341,9 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
             contract = load_contract(contract_path)
             contract_isolation = contract.isolation
             if contract.isolation == "none":
-                no_op_reason = "isolation-none"
+                no_op_reason = "isolation_none"
             elif not contract.start:
-                no_op_reason = "no-start-steps"
+                no_op_reason = "no_start_steps"
             elif role in record.pids:
                 # By this point `contract.start` is non-empty and no
                 # exception was raised, so the engine's `_lifecycle_start`
@@ -303,15 +355,15 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
                 # record.pids`, not on `status == "running"`.
                 steps_run = 1
             else:
-                no_op_reason = "no-start-steps"
+                no_op_reason = "no_start_steps"
         else:
             checkout_dir = Path(record.path)
             same_dir = checkout_dir.resolve() == Path(record.repo_root).resolve()
             checkout_contract_path = checkout_dir / CONTRACT_FILENAME
             if not same_dir and checkout_contract_path.exists():
-                no_op_reason = "contract-misplaced"
+                no_op_reason = "contract_misplaced"
             else:
-                no_op_reason = "no-contract"
+                no_op_reason = "no_contract"
     except (OSError, ContractError):
         # `contract_found` is deliberately left as whatever it was already
         # set to above: if `contract_path.exists()` returned True before
@@ -332,7 +384,7 @@ def _contract_diagnostics(record: WorktreeRecord, role: str) -> Dict[str, Any]:
             no_op_reason = None
         else:
             steps_run = 0
-            no_op_reason = "contract-unreadable"
+            no_op_reason = "contract_unreadable"
 
     return {
         "contract_found": contract_found,
@@ -621,9 +673,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         yet), since there is then no checked-out branch to default to.
 
         The ``ports`` field is a dict mapping port name to host port number;
-        empty dict ``{}`` for ``isolation: none`` worktrees or before setup
-        runs. Agents read it to discover which host ports the worktree's
-        services are bound to.
+        empty dict ``{}`` in the response for ``isolation: none`` worktrees
+        or before setup runs. Agents read it to discover which host ports
+        the worktree's services are bound to. Do not confuse this with the
+        contract's own ``ports:`` input block, which is a list of named
+        port slots (``- name: app`` entries, each optionally pinning
+        ``port:``) -- schema validation rejects any other shape there.
 
         Returns the canonical worktree record.
 
@@ -660,6 +715,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           ``variant="default"`` call to ``environment_start`` will
           actually select -- see that tool's docstring for the three-tier
           resolution rule.
+
+        Omitting ``variant`` entirely (or passing ``variant="default"``)
+        still resolves the contract's single unnamed ``start:`` step --
+        such a step is deliberately absent from this list, so an empty
+        ``[]`` here does not mean nothing is startable.
 
         Contract file (``.seretos/worktree-setup.yml``)
         -------------------------------------------------
@@ -723,7 +783,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         drifted, which signal to check depends on whether ``repo_root``'s own
         contract exists: if it is missing entirely while the checkout-local
         copy is present, ``environment_start``'s response carries
-        ``no_op_reason: "contract-misplaced"``. If both exist but disagree,
+        ``no_op_reason: "contract_misplaced"``. If both exist but disagree,
         ``no_op_reason`` stays ``None`` (the start proceeds normally against
         ``repo_root``'s contract) -- check that response's
         ``shadowed_contract`` field (``reason: "differs"``) instead; see
@@ -804,6 +864,22 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
                     f' existing_path: "{existing.path}")'
                 ) from exc
             raise ValueError(str(exc)) from exc
+        except GitCommandError as exc:
+            # GitCommandError subclasses WorktreeError, so this catch must
+            # come before the generic `except WorktreeError` tail below --
+            # same MRO-ordering concern as DuplicateWorktreeError above.
+            # WP #162 R2 (ticket #157): normalise the raw git stderr for an
+            # invalid `-b <branch>` argument instead of leaking git's full
+            # argv (including the store's absolute target path) verbatim.
+            reason = _invalid_branch_reason(getattr(exc, "stderr", None))
+            if reason is None:
+                raise ValueError(str(exc)) from exc  # baseline, byte-identical
+            raise ValueError(
+                f"invalid_branch_name: '{branch}' was rejected by git: {reason}. "
+                f"Hint: use only characters git accepts in a ref name (no '..', "
+                f"'~', '^', ':', spaces, or a trailing '/'); see "
+                f"'git check-ref-format --branch'."
+            ) from exc
         except WorktreeError as exc:
             raise ValueError(str(exc)) from exc
 
@@ -878,7 +954,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           this way tears down the checkout but never touches the state
           store (there was nothing there to remove) and never deletes its
           branch, even with ``force=True``, since the checkout was never
-          recorded as owning one.
+          recorded as owning one. An untracked/orphan checkout holding
+          uncommitted or untracked local changes may therefore need
+          ``force=True`` to remove -- that is a git safety guard, not a
+          bug in this tool.
 
         Neither is schema-required, but the engine (not this wrapper)
         enforces the resolution: passing both is fine only when they agree
@@ -942,9 +1021,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             case is a matter of ordering, not filtering.
 
         Returns the removed worktree record on success. The ``ports`` field is
-        a dict mapping port name to host port number; empty dict ``{}`` for
-        ``isolation: none`` worktrees or before setup runs. Agents read it to
-        discover which host ports the worktree's services are bound to.
+        a dict mapping port name to host port number; empty dict ``{}`` in
+        the response for ``isolation: none`` worktrees or before setup runs.
+        Agents read it to discover which host ports the worktree's services
+        are bound to. Do not confuse this with the contract's own ``ports:``
+        input block, which is a list of named port slots (``- name: app``
+        entries, each optionally pinning ``port:``) -- schema validation
+        rejects any other shape there.
 
         The response includes a ``killed_pids`` list (may be empty). Each entry
         is a dict with ``pid`` (int), ``name`` (str), ``cmdline`` (list of str)
@@ -1177,6 +1260,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           contain a repo slug and a branch slug even though it does not
           derive from either -- a hand-made orphan's prefix is simply
           whatever the directory happens to be named.
+
+          A tracked record's ``status`` becomes ``orphaned`` when its
+          record in the state store survives even though git no longer
+          lists a live worktree for it -- ``tracked: true`` still holds.
+          The opposite, an unmanaged checkout live on disk, is
+          ``status: created`` with ``tracked: false``. Filter on
+          ``tracked``, never ``status``.
         - ``setup_status``: a coarse setup-health signal derived SOLELY from
           the record's ``setup_outcome`` (an ``Optional[SetupOutcome]``),
           never from ``status`` (the overall run status) -- full decoupling
@@ -1314,7 +1404,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``{"status": "ready", "pids": {}}`` no-op -- but it is **not silent**
         and **not** indistinguishable from "no contract configured": the same
         response carries ``contract_found: false``, ``steps_run: 0``, and
-        ``no_op_reason: "contract-misplaced"`` (vs ``"no-contract"`` for the
+        ``no_op_reason: "contract_misplaced"`` (vs ``"no_contract"`` for the
         genuinely-unconfigured case). Callers should branch on ``no_op_reason``
         rather than inferring the cause from ``status``/``pids`` alone -- see
         the "Contract diagnostics" block below for the full five-key set. The
@@ -1571,12 +1661,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - ``steps_run`` (int): ``1`` when a ``start:`` step was actually
           spawned for ``role``; ``0`` for every no-op flavour.
         - ``no_op_reason`` (str or ``None``): ``None`` on a real start;
-          otherwise exactly one of ``"no-contract"`` (nothing at
-          ``repo_root``), ``"contract-misplaced"`` (found only in the
-          worktree checkout, not ``repo_root``), ``"isolation-none"``
-          (contract read but ``isolation: none``), ``"no-start-steps"``
+          otherwise exactly one of ``"no_contract"`` (nothing at
+          ``repo_root``), ``"contract_misplaced"`` (found only in the
+          worktree checkout, not ``repo_root``), ``"isolation_none"``
+          (contract read but ``isolation: none``), ``"no_start_steps"``
           (contract read, isolation allows it, but no ``start:`` step ran),
-          or ``"contract-unreadable"`` (the contract exists but could not be
+          or ``"contract_unreadable"`` (the contract exists but could not be
           read/parsed).
 
         The record additionally carries one diagnostic produced by the
@@ -1612,7 +1702,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           copy was separately edited to differ (``no_op_reason`` is
           ``null`` there, and the five wrapper-derived keys above see
           nothing wrong) -- but it fires just as readily alongside a
-          non-``null`` ``no_op_reason``, notably ``"contract-misplaced"``:
+          non-``null`` ``no_op_reason``, notably ``"contract_misplaced"``:
           no file exists at ``repo_root``, the implicit fallback contract is
           what gets compared, and a checkout-local copy that diverges from
           that fallback still shadows it.
