@@ -337,6 +337,69 @@ lost. None of it has been confirmed, and none of it is acted on in this repo.
   it. Investigating it requires building the binary and sending real console
   control events to it.
 
+## Running the suite (agent sessions: read this before you run pytest)
+
+The full suite is slow enough on a local Windows checkout that a single
+foreground `pytest` invocation risks running past a tool call's timeout. Do
+not run the whole suite in one call. Instead, run it in the four chunks
+below, one after another, each as its own foreground `pytest` call.
+
+| Chunk | Files / selector | Tests | Measured (local Windows) |
+| --- | --- | --- | --- |
+| 1 | `tests/test_environment_tools.py` | 120 | 266 s |
+| 2 | `tests/test_worktree_tools.py` | 125 | 118 s |
+| 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 58 passed + 2 xfailed | 290 s |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py` | 80 | 1 s |
+| **Total** | all 13 `tests/test_*.py` files | 383 passed + 2 xfailed | **675 s** |
+
+The Total row is the **sum of the measured chunks**, **not a single**
+end-to-end measured run of the whole suite in one `pytest` invocation — the
+four chunks were timed separately, in separate `pytest` processes, and their
+wall-clock times added together. Nobody has run the whole suite as one
+uninterrupted local measurement; a single-run total could differ (lower, from
+avoided per-process pytest-collection overhead paid four times over here;
+or higher, from shared-resource contention across a longer single process)
+from this sum.
+
+**Operational rule.** Run the chunks one after another, synchronously, inside
+a single turn. Never start the suite as a background task and end the turn
+waiting for it to finish — a headless agent process dies when its turn ends,
+and a backgrounded suite dies with it, silently, with no result ever
+delivered. Commit at each chunk boundary, and commit and push before any turn
+that might end, so a lost turn never loses already-measured or already-passing
+work.
+
+**CI note.** This chunking is an agent-session constraint only. CI still runs
+the whole test suite in one go, in a single job step, via
+`.github/workflows/test.yml` — this document does not change, and is not
+proposing to change, the CI workflow.
+
+**Local vs. CI caution.** Do not assume local wall-clock numbers generalize
+to CI, in either direction. This repo's own CI runs of the same suite have
+been observed at 301 s, 315 s, 397 s, and 406 s — sometimes faster than the
+675 s summed-local figure above, sometimes not, because CI runners and a
+local Windows workstation have different CPU counts, disk speed, and
+antivirus/filesystem-filter overhead. The sibling `lib-python-worktree`
+project shows the same local/CI mismatch even more starkly: 245-508 s in CI
+versus 567 s measured locally. Treat both this table's numbers and any CI
+number as approximate, machine-dependent data points, not a portable
+benchmark.
+
+**Slow-test clustering.** Durations were not flat within every chunk.
+Chunk 1 (`tests/test_environment_tools.py`) clusters ten
+`test_worktree_remove_*` tests at roughly 21-23 s each (real worktree
+create/teardown subprocess and git operations dominate); the rest of that
+file's 110 tests run in a combined ~4 s. Chunk 2
+(`tests/test_worktree_tools.py`) similarly clusters five `test_create_*`
+tests at roughly 21 s each, with the remaining 120 tests in well under a
+second combined. Chunk 3 is the most skewed: two tests in
+`tests/test_thread_leak_regression.py` alone
+(`test_create_remove_cycles_do_not_leak_threads` at ~171 s and
+`test_create_remove_cycles_with_kill_blocking_processes_do_not_leak_threads`
+at ~106 s — both XFAIL, see the thread-leak note above) account for ~277 s of
+that chunk's ~290 s total; the other five files in chunk 3 are fast. Chunk 4
+is flat and fast throughout, with no cluster.
+
 ## Security
 
 Setup scripts run with the user's own OS privileges — see `SECURITY.md` for the full threat model.
