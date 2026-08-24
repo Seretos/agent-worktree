@@ -27,6 +27,7 @@ modules).
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -57,7 +58,23 @@ def _get_tool_docstring(tool_name: str) -> str:
     fn = mcp._tool_manager._tools[tool_name].fn
     doc = fn.__doc__
     assert doc, f"{tool_name} has no docstring at all"
-    return doc
+    # `fn.__doc__` is the *raw* compiled docstring constant. Since CPython
+    # 3.13 (gh-81283) the compiler itself strips each docstring's common
+    # leading whitespace at compile time, matching `inspect.cleandoc()` --
+    # but on 3.11/3.12 (CI pins 3.12, see .github/workflows/test.yml) the
+    # docstring's original source indentation (this file's tool functions
+    # are nested one level inside `register()`, so every continuation line
+    # after the first carries 8+ literal leading spaces) survives verbatim
+    # in `__doc__`. A dev box on 3.13+ therefore sees already-dedented text
+    # while CI's 3.12 runner sees the raw indented text for the exact same
+    # commit -- silently, since nothing in FastMCP or this plugin dedents
+    # it (confirmed: no `cleandoc`/`dedent` call anywhere in `mcp` or in
+    # `worktree_plugin`). Column-0-anchored regexes/assertions below
+    # (e.g. the R4 structural bullet count) would find 0 matches under the
+    # un-dedented 3.12 text while passing locally on 3.13+ -- exactly the
+    # "found 0" CI failure this normalization fixes. `inspect.cleandoc` is
+    # idempotent on already-dedented text, so this is a no-op on 3.13+.
+    return inspect.cleandoc(doc)
 
 
 def _sentence_containing(region: str, needle: str) -> str:
