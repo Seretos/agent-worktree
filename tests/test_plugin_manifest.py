@@ -1044,3 +1044,116 @@ def test_docs_document_decoded_cmdline_and_cmdline_raw():
             f"{path.name} still contains the stale 'cmdline (list of str) "
             "describing' phrasing that predates the v0.3.9 decode (ticket #153)"
         )
+
+
+# ---- Ticket #166: "Running the suite" measured chunk table + agent rule ----
+
+
+def _running_suite_section(text: str) -> str:
+    """Return the ``## Running the suite`` section's text, from its heading
+    up to (but not including) the next top-level ``## `` heading or EOF.
+    Returns ``""`` if the heading is absent."""
+    match = re.search(r"^##\s+Running the suite", text, flags=re.MULTILINE)
+    if not match:
+        return ""
+    rest = text[match.start() :]
+    next_heading = re.search(r"\n## ", rest)
+    if next_heading:
+        return rest[: next_heading.start()]
+    return rest
+
+
+def _chunk_table(section: str) -> str:
+    """Return only the markdown table lines of ``section`` -- every line
+    whose ``strip()`` starts with ``|``, rejoined with ``\\n``. Prose lines
+    (the rule paragraph, the CI note, the local-vs-CI caution) are excluded
+    by construction."""
+    lines = [line for line in section.splitlines() if line.strip().startswith("|")]
+    return "\n".join(lines)
+
+
+def _missing_from_chunk_table(table: str, names: list[str]) -> list[str]:
+    """Return the filenames from ``names`` not contained verbatim in
+    ``table``. Safe as plain substring containment: no one of the 13
+    ``tests/test_*.py`` filenames is a substring of another."""
+    return [name for name in names if name not in table]
+
+
+def _measured_figures(table: str) -> list[str]:
+    """Return every measured-seconds figure (e.g. ``12s``, ``7 s``) found
+    in ``table``."""
+    return re.findall(r"\b\d{1,4}\s*s\b", table)
+
+
+def test_agents_documents_running_the_suite_chunks():
+    """AGENTS.md must gain a '## Running the suite' section containing a
+    measured per-chunk timing table covering every tests/test_*.py file,
+    the sum-of-measured-chunks disclosure, the never-background/synchronous
+    rule, and the CI-runs-whole-suite note.
+
+    RED (pre-fix): AGENTS.md has no '## Running the suite' heading at all,
+    so _running_suite_section returns "" and assertion 1 fails.
+    """
+    text = AGENTS_MD.read_text(encoding="utf-8")
+    section = _running_suite_section(text)
+    assert section, "AGENTS.md must have a '## Running the suite' section"
+
+    table = _chunk_table(section)
+    table_lines = [line for line in table.splitlines() if line.strip()]
+    assert len(table_lines) >= 3, (
+        "the Running the suite section must contain a markdown table with "
+        "a header, separator, and at least one data row"
+    )
+
+    names = sorted(p.name for p in (REPO_ROOT / "tests").glob("test_*.py"))
+    assert len(names) >= 13, (
+        "expected at least 13 tests/test_*.py files -- an accidental empty "
+        "glob must not vacuously pass this test"
+    )
+    missing = _missing_from_chunk_table(table, names)
+    assert missing == [], (
+        f"the chunk table in AGENTS.md's Running the suite section is "
+        f"missing these tests/test_*.py filenames: {missing!r}"
+    )
+
+    figures = _measured_figures(table)
+    assert len(figures) >= 2, (
+        "the chunk table must contain at least two measured second-figures "
+        f"(e.g. '12s'), found: {figures!r}"
+    )
+
+    section_lower = section.lower()
+    assert "sum of the measured chunks" in section_lower
+    assert "not a single" in section_lower
+
+    assert "background" in section_lower
+    assert "synchronous" in section_lower or "synchronously" in section_lower
+    assert "single turn" in section_lower
+
+    assert "CI" in section and "whole suite" in section_lower
+
+
+def test_running_suite_guard_detects_a_missing_test_file():
+    table = (
+        "| file | seconds |\n"
+        "| --- | --- |\n"
+        "| tests/test_config.py | 3s |\n"
+        "| tests/test_contract.py | 4s |\n"
+    )
+    names = ["tests/test_config.py", "tests/test_contract.py", "tests/test_setup_runner.py"]
+    assert _missing_from_chunk_table(table, names) == ["tests/test_setup_runner.py"]
+
+
+def test_running_suite_guard_ignores_prose_outside_the_table():
+    section = (
+        "## Running the suite\n\n"
+        "CI runs 301 s / 406 s; most of the time is in "
+        "tests/test_environment_tools.py.\n\n"
+        "| file | seconds |\n"
+        "| --- | --- |\n"
+        "| placeholder | - |\n"
+    )
+    table = _chunk_table(section)
+    missing = _missing_from_chunk_table(table, ["tests/test_environment_tools.py"])
+    assert missing == ["tests/test_environment_tools.py"]
+    assert _measured_figures(table) == []
