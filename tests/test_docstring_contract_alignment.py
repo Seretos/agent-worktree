@@ -30,9 +30,14 @@ from __future__ import annotations
 import inspect
 import re
 from pathlib import Path
+from typing import Tuple
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
+WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
 
 
 def _normalize(text: str) -> str:
@@ -459,3 +464,552 @@ def test_skill_md_orphan_recovery_recipe_keeps_force_true_with_uncommitted_ratio
     force_idx = recipe.index("force=true")
     window = recipe[max(0, force_idx - 300) : force_idx + 300]
     assert "uncommitted" in window
+
+
+# ---------------------------------------------------------------------------
+# WP #165 R1/R2: "Contract authoring quick reference" block (gap 1),
+# front-loaded onto worktree_create (and a shorter one onto
+# environment_start) so a truncating MCP client still delivers the
+# load-bearing facts. Region delimiters are content-independent and
+# identical for both docstrings (plan rev.3):
+#   heading:  "Contract authoring quick reference"
+#   sentinel: "Details for every point above follow below." (fixed sentinel,
+#             last line of the block, byte-identical in both docstrings).
+#
+# Every test below is a driving test for WP #165's phase=tests dispatch:
+# neither the heading nor the sentinel exists in any docstring yet (verified
+# absent repo-wide at plan time), so `_quick_reference_region` raises
+# `ValueError` ("substring not found") for every test that calls it -- the
+# expected RED reason, attributable to the missing block content, not to an
+# import/fixture/environment problem.
+# ---------------------------------------------------------------------------
+
+_QR_HEADING = "contract authoring quick reference"
+_QR_SENTINEL = "details for every point above follow below."
+
+# Per-item bullet cap for this dispatch (plan: "pick a concrete, exact
+# number <=150" -- previously left as "~150 chars"). Checked against the
+# *raw* (cleandoc'd, not whitespace-collapsed) docstring text, one physical
+# source line at a time -- the normalized region collapses newlines so it
+# cannot be used for a per-line check.
+_QR_MAX_LINE_LEN = 150
+
+# R3's "proximity window" around each file's WORKTREE_PORT_ mention (plan:
+# "pick a fixed, exact window size, e.g. +/-500 chars"). Mirrors this file's
+# existing R4 +/-300-char window convention, widened because R3 additionally
+# requires three more tokens (ports:, an uppercase cue, WORKTREE_ID) to fall
+# in the same window, not just one.
+_QR_ENV_VAR_WINDOW = 500
+
+
+def _quick_reference_region(doc: str) -> Tuple[int, int, str]:
+    """Compute ``(start, end, block_text)`` for the "Contract authoring
+    quick reference" block within a *normalized* (lower-cased,
+    backtick/emphasis-stripped, whitespace-collapsed) docstring ``doc`` --
+    mirrors this file's existing ``_normalize`` convention, matching WP
+    #165 plan rev.3's region computation::
+
+        start = norm_doc.index("contract authoring quick reference")
+        end   = norm_doc.index("details for every point above follow below.") + len(sentinel)
+
+    Raises ``ValueError`` (via ``str.index``) when either delimiter is
+    absent -- the expected RED signal for every test below before the block
+    is authored (WP #165 phase=implement work, not this dispatch's).
+    """
+    start = doc.index(_QR_HEADING)
+    end = doc.index(_QR_SENTINEL) + len(_QR_SENTINEL)
+    return start, end, doc[start:end]
+
+
+def _raw_quick_reference_block(raw_doc: str) -> str:
+    """Locate the quick-reference block in the *raw* (``inspect.cleandoc``'d
+    but not whitespace-collapsed) docstring text, case-insensitively --
+    needed for the per-line length budget (R1a edge case), since
+    ``_quick_reference_region``'s normalized text has no newlines left to
+    split on."""
+    lower = raw_doc.lower()
+    start = lower.index(_QR_HEADING)
+    end = lower.index(_QR_SENTINEL, start) + len(_QR_SENTINEL)
+    return raw_doc[start:end]
+
+
+def test_worktree_create_quick_reference_fits_truncation_budget():
+    """R1a driving test: worktree_create's quick-reference block must start
+    near the top of the docstring (well before the plan's measured
+    ~2,240-char truncation cut) and fit the plan's budget -- block content
+    (heading through sentinel, inclusive) <= 1,000 chars, absolute block END
+    <= 1,100.
+
+    Expected RED reason: neither the heading nor the sentinel exists yet in
+    worktree_create's docstring -- ``_quick_reference_region`` raises
+    ``ValueError`` (substring not found).
+    """
+    raw_doc = _get_tool_docstring("worktree_create")
+    doc = _normalize(raw_doc)
+    start, end, _block = _quick_reference_region(doc)
+
+    assert start < 200, f"heading starts too late (offset {start})"
+    assert end <= 1100, f"block end exceeds budget (offset {end})"
+    assert end - start <= 1000, f"block content exceeds 1000 chars ({end - start})"
+
+    raw_block = _raw_quick_reference_block(raw_doc)
+    for line in raw_block.splitlines():
+        assert len(line) <= _QR_MAX_LINE_LEN, (
+            f"quick-reference line exceeds {_QR_MAX_LINE_LEN} chars "
+            f"({len(line)}): {line!r}"
+        )
+
+
+def test_environment_start_quick_reference_fits_truncation_budget():
+    """R1a driving test, environment_start's shorter block: block content
+    <= 500 chars, absolute block END <= 700 (the plan's own measured
+    ~710-char cut for this docstring's CAUTION block).
+
+    Expected RED reason: same as worktree_create's -- heading/sentinel
+    absent today.
+    """
+    raw_doc = _get_tool_docstring("environment_start")
+    doc = _normalize(raw_doc)
+    start, end, _block = _quick_reference_region(doc)
+
+    assert start < 200, f"heading starts too late (offset {start})"
+    assert end <= 700, f"block end exceeds budget (offset {end})"
+    assert end - start <= 500, f"block content exceeds 500 chars ({end - start})"
+
+    raw_block = _raw_quick_reference_block(raw_doc)
+    for line in raw_block.splitlines():
+        assert len(line) <= _QR_MAX_LINE_LEN, (
+            f"quick-reference line exceeds {_QR_MAX_LINE_LEN} chars "
+            f"({len(line)}): {line!r}"
+        )
+
+
+def test_quick_reference_sentinel_is_unique_and_terminates_block():
+    """R1h driving test: the sentinel line must appear exactly once per
+    docstring, strictly after the heading, and exactly twice total in
+    worktree.py's source (once per docstring). Edge case: the sentinel must
+    never leak into SKILL.md/AGENTS.md.
+
+    Expected RED reason: the sentinel string doesn't exist anywhere yet --
+    ``count() == 1`` fails as ``0 == 1`` for the first tool checked.
+    """
+    for tool_name in ("worktree_create", "environment_start"):
+        doc = _normalize(_get_tool_docstring(tool_name))
+        count = doc.count(_QR_SENTINEL)
+        assert count == 1, f"{tool_name}: sentinel must appear exactly once, found {count}"
+        assert doc.index(_QR_SENTINEL) > doc.index(_QR_HEADING), (
+            f"{tool_name}: sentinel must come after the heading"
+        )
+
+    source_lower = WORKTREE_PY.read_text(encoding="utf-8").lower()
+    source_count = source_lower.count(_QR_SENTINEL)
+    assert source_count == 2, (
+        f"expected the sentinel exactly twice in worktree.py's source (once "
+        f"per docstring), found {source_count}"
+    )
+
+    skill_text = SKILL_MD.read_text(encoding="utf-8").lower()
+    agents_text = AGENTS_MD.read_text(encoding="utf-8").lower()
+    assert _QR_SENTINEL not in skill_text, "sentinel must not leak into SKILL.md"
+    assert _QR_SENTINEL not in agents_text, "sentinel must not leak into AGENTS.md"
+
+
+def test_worktree_create_quick_reference_does_not_displace_existing_prose():
+    """R1b: regression pin, not a driving test -- must PASS both before and
+    after the quick-reference block lands. Six sentinel substrings from
+    worktree_create's existing tail (including the R5 driving-test anchors
+    already defined in this file) must survive, in their original relative
+    order, once the new block is inserted at the very top of the docstring
+    (right after the one-line summary) -- a pure prefix insertion preserves
+    every existing substring's *relative* order even though every absolute
+    offset shifts upward by the same amount.
+
+    Expected to already PASS -- untouched by WP #165's test phase (which
+    writes no production content), and the plan's insertion point (a
+    prefix, not a mid-document splice) cannot reorder anything that already
+    exists.
+    """
+    doc = _normalize(_get_tool_docstring("worktree_create"))
+
+    anchors = [
+        "returns the canonical worktree record",
+        "caution: a worktree",
+        _R5_REGION_START,
+        _R5_REGION_END,
+        'transport-level failure ("connection closed"): confirm before retrying',
+        "honest limit: this tells you the worktree exists",
+    ]
+    indices = [doc.index(a) for a in anchors]
+    assert indices == sorted(indices), (
+        f"existing tail anchors out of order: {list(zip(anchors, indices))}"
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["worktree_create", "environment_start"])
+def test_quick_reference_states_isolation_none_forbids_blocks(tool_name):
+    """R1c driving test: within the quick-reference block, the contract's
+    full key set and the ``isolation: none`` prohibition must both be
+    stated (plan item 3). The forbidden-key set was verified against the
+    real installed validator rather than trusted blindly (the plan-critic
+    flagged this as previously unverified): ``load_text("version: 1\\n"
+    "isolation: none\\nseed_postprocess:\\n  - run: echo hi\\n")`` raises
+    ``ContractValidationError`` with message "isolation: none forbids
+    fields: seed_postprocess" against the installed ``lib_python_worktree``
+    package, confirming ``seed_postprocess`` belongs in this forbidden set
+    alongside ``setup:``/``start:``/``stop:``/``teardown:``/``ports:``.
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``
+    -- neither the heading nor the sentinel exists in either docstring yet.
+    """
+    doc = _normalize(_get_tool_docstring(tool_name))
+    start, end, region = _quick_reference_region(doc)
+
+    assert "isolation: none" in region
+    for token in ("setup:", "start:", "stop:", "teardown:", "ports:", "seed_postprocess:"):
+        assert token in region, f"{tool_name}: quick reference must mention {token!r}"
+    assert re.search(r"forbid|reject|invalid|schema error", region), (
+        f"{tool_name}: quick reference must state a prohibition cue"
+    )
+
+    # Edge case: the tail's own pre-existing "isolation: none forbids ..."
+    # sentence must survive, distinct from (and strictly after) the new
+    # block -- not conflated with or displaced by it.
+    tail_idx = doc.index("isolation: none forbids", end)
+    assert tail_idx >= end
+
+
+@pytest.mark.parametrize("tool_name", ["worktree_create", "environment_start"])
+def test_quick_reference_states_named_start_steps_are_variants(tool_name):
+    """R1d driving test: the block must state both the mechanism (named
+    ``start:`` steps are selected via ``environment_start(variant=...)``)
+    AND the plan-critic-flagged nuance that named steps do NOT run by
+    default (plan item 4). Deliberately paraphrases the existing
+    ``start_variants`` bullet's own wording (per the plan's fragility
+    rules) rather than cloning ``"start_variants (always present, unlike
+    warning)"`` verbatim.
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``.
+    """
+    doc = _normalize(_get_tool_docstring(tool_name))
+    start, end, region = _quick_reference_region(doc)
+
+    assert "environment_start(variant=" in region
+    assert "start:" in region
+    assert re.search(r"named|name:", region), (
+        f"{tool_name}: quick reference must use a naming cue"
+    )
+    assert "variant" in region
+    assert re.search(r"not run by default|do not run by default|not run unless", region), (
+        f"{tool_name}: quick reference must state named steps don't run by default"
+    )
+
+    # Edge case: must not clone the existing start_variants bullet's own
+    # anchor sentence verbatim -- paraphrase only (fragility rule).
+    assert _R5_REGION_START not in region
+
+
+@pytest.mark.parametrize("tool_name", ["worktree_create", "environment_start"])
+def test_quick_reference_states_injected_env_vars(tool_name):
+    """R1e driving test: the block must name all four injected env vars and
+    the uppercase-derivation rule (plan item 5).
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``.
+    """
+    doc = _normalize(_get_tool_docstring(tool_name))
+    start, end, region = _quick_reference_region(doc)
+
+    for token in ("worktree_id", "worktree_path", "worktree_branch", "worktree_port_"):
+        assert token in region, f"{tool_name}: quick reference must mention {token!r}"
+    assert re.search(r"upper|uppercas", region), (
+        f"{tool_name}: quick reference must state the uppercase-derivation rule"
+    )
+
+    if tool_name == "worktree_create":
+        # Edge case: the R3 tail paragraph (documenting the same vars in
+        # prose, added elsewhere by this same ticket) occurs at an index
+        # greater than the block end -- the quick reference states it once,
+        # up front; the tail paragraph is the detailed follow-up, not a
+        # duplicate inside the block itself.
+        tail_idx = doc.index("worktree_id", end)
+        assert tail_idx >= end
+
+
+def test_quick_reference_states_teardown_force_true():
+    """R1f driving test: worktree_create's block must state that teardown
+    normally needs ``worktree_remove(force=True)`` and frame that as the
+    expected happy-path end state, not an emergency override (plan item 6).
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``.
+    """
+    doc = _normalize(_get_tool_docstring("worktree_create"))
+    start, end, region = _quick_reference_region(doc)
+
+    assert "worktree_remove" in region
+    assert "force=true" in region
+    assert re.search(r"expected|normal|routine", region), (
+        "worktree_create quick reference must frame force=True as expected/normal"
+    )
+
+
+def test_quick_reference_teardown_force_true_absent_from_environment_start():
+    """R1f edge case: environment_start's shorter block (items 3/4/5 only,
+    per the plan) must NOT carry the teardown item -- that item is specific
+    to worktree_create's checkout lifecycle.
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``
+    (the block doesn't exist yet, so the absence check below is unreached
+    until the driving test above turns green -- listed here as a
+    forward-looking regression guard, matching this file's existing
+    edge-case convention).
+    """
+    doc = _normalize(_get_tool_docstring("environment_start"))
+    start, end, region = _quick_reference_region(doc)
+
+    assert "worktree_remove" not in region
+
+
+def test_quick_reference_states_required_version_and_isolation():
+    """R1g driving test: worktree_create's block must state the required
+    keys -- ``version: 1`` (the only accepted value) and ``isolation:``
+    (``full``/``partial``/``none``) -- plan item 1.
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``.
+    """
+    doc = _normalize(_get_tool_docstring("worktree_create"))
+    start, end, region = _quick_reference_region(doc)
+
+    assert "version: 1" in region
+    assert "isolation:" in region
+    for value in ("full", "partial", "none"):
+        assert value in region, f"quick reference must mention isolation value {value!r}"
+    assert re.search(r"required|must", region), (
+        "quick reference must state version/isolation are required"
+    )
+
+    # Edge case: no other version value is claimed acceptable.
+    assert not re.search(r"version:\s*(?!1\b)\d", region), (
+        "quick reference must not claim any version value other than 1"
+    )
+
+
+def test_quick_reference_lists_every_contract_top_level_key():
+    """R2 driving test: every ``WorktreeContract.model_fields`` name (as
+    installed) must appear inside worktree_create's quick-reference block --
+    pinned to the real schema rather than a hand-maintained list, so a
+    future contract-schema field addition trips this test instead of
+    silently drifting out of sync with the docstring.
+
+    Expected RED reason: ``_quick_reference_region`` raises ``ValueError``.
+    """
+    from lib_python_worktree import WorktreeContract
+
+    field_names = list(WorktreeContract.model_fields.keys())
+    assert "seed_postprocess" in field_names, (
+        "sanity check: the installed schema must still declare "
+        "seed_postprocess for this test's premise to hold"
+    )
+
+    doc = _normalize(_get_tool_docstring("worktree_create"))
+    start, end, region = _quick_reference_region(doc)
+
+    for field in field_names:
+        if field in ("version", "isolation"):
+            # Covered by R1g as required keys, not part of the "full
+            # top-level key set" bullet (item 2) this test targets.
+            continue
+        assert field in region, f"quick reference must list contract key {field!r}"
+
+    # Edge case: seed_postprocess carries a "not run by any tool" cue,
+    # since it is schema-valid but no tool in this MCP surface ever runs it
+    # (verified by grepping every manager.*() call site at plan time).
+    idx = region.index("seed_postprocess")
+    window = region[idx : idx + 200]
+    assert re.search(r"not run by (any|this)|never run|not executed", window), (
+        "seed_postprocess mention must note it is not run by any tool in "
+        "this surface"
+    )
+
+
+def test_quick_reference_key_set_matches_environment_starts_existing_schema_list():
+    """R2 edge case: cross-check worktree_create's new quick-reference key
+    set against environment_start's own pre-existing "Contract file schema"
+    paragraph (``"Top-level keys: version ... setup:, start:, stop:,
+    teardown: ... and ports:"``), so the two documented key sets can never
+    silently disagree.
+
+    Expected RED reason: same as the driving test -- the quick-reference
+    region doesn't exist in worktree_create yet.
+    """
+    doc_create = _normalize(_get_tool_docstring("worktree_create"))
+    start, end, region = _quick_reference_region(doc_create)
+
+    doc_start = _normalize(_get_tool_docstring("environment_start"))
+    schema_start = doc_start.index("top-level keys: version")
+    schema_end = doc_start.index("isolation rule:", schema_start)
+    schema_region = doc_start[schema_start:schema_end]
+
+    for token in ("setup:", "start:", "stop:", "teardown:", "ports:"):
+        assert token in schema_region, (
+            f"pre-condition failed: environment_start's existing schema "
+            f"list must already mention {token!r}"
+        )
+        assert token in region, (
+            f"worktree_create's quick reference must also mention {token!r}, "
+            f"matching environment_start's existing schema list"
+        )
+
+
+# ---------------------------------------------------------------------------
+# WP #165 R3: the four WORKTREE_* env vars the engine injects into contract
+# steps (gap 3), documented outside the quick-reference block too -- in
+# worktree.py's docstrings (prose, not just the block), SKILL.md, and
+# AGENTS.md. Token checks are deliberately case-SENSITIVE against the *raw*
+# (non-lower-cased) text: ``worktree_id`` (lower-case) is a pervasive,
+# unrelated Python parameter/variable name throughout worktree.py, and also
+# appears in existing docstring prose naming the engine's internal
+# ``worktree_id`` parameter (see ``_addressing_error_text``'s docstring) --
+# a case-insensitive check would find that pre-existing, unrelated mention
+# and never go RED. ``WORKTREE_ID`` (upper-case, the actual injected env var
+# spelling) has zero case-sensitive occurrences repo-wide today (verified).
+# ---------------------------------------------------------------------------
+
+_ENV_VAR_TOKENS = ("WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH", "WORKTREE_PORT_")
+
+_DOC_FILES_FOR_ENV_VARS = {
+    "worktree.py": WORKTREE_PY,
+    "SKILL.md": SKILL_MD,
+    "AGENTS.md": AGENTS_MD,
+}
+
+
+@pytest.mark.parametrize("file_key", ["worktree.py", "SKILL.md", "AGENTS.md"])
+def test_docs_document_injected_worktree_env_vars(file_key):
+    """R3 driving test: all four ``WORKTREE_*`` env vars injected by the
+    engine must be documented (gap 3) in worktree.py's docstrings,
+    SKILL.md, and AGENTS.md alike. The ``WORKTREE_PORT_`` mention's
+    +/-500-char window must also name ``ports:``, an uppercase-derivation
+    cue, and ``WORKTREE_ID`` -- so the port-slot-name-to-env-var-suffix
+    derivation rule is stated together with the other vars, not just four
+    bare tokens scattered anywhere in the file.
+
+    Expected RED reason: none of these four tokens exist (case-sensitively)
+    in any of the three files today (verified absent repo-wide at plan
+    time).
+    """
+    path = _DOC_FILES_FOR_ENV_VARS[file_key]
+    text = path.read_text(encoding="utf-8")
+
+    for token in _ENV_VAR_TOKENS:
+        assert token in text, f"{file_key} must document {token!r}"
+
+    port_idx = text.index("WORKTREE_PORT_")
+    window = text[max(0, port_idx - _QR_ENV_VAR_WINDOW) : port_idx + _QR_ENV_VAR_WINDOW]
+    window_lower = window.lower()
+    assert "ports:" in window_lower, f"{file_key}: WORKTREE_PORT_ window must name ports:"
+    assert re.search(r"upper|uppercas", window_lower), (
+        f"{file_key}: WORKTREE_PORT_ window must state the uppercase-derivation rule"
+    )
+    assert "WORKTREE_ID" in window, (
+        f"{file_key}: WORKTREE_PORT_ window must also name WORKTREE_ID nearby"
+    )
+
+
+def test_environment_stop_cross_references_injected_env_vars():
+    """R3 edge (a): environment_stop's docstring must cross-reference the
+    injected ``WORKTREE_*`` vars (plan Approach/R3: "a cross-reference
+    sentence in environment_stop's docstring"), even though
+    environment_stop itself never spawns a process and so never injects
+    them directly.
+
+    Case-sensitive, same rationale as the driving test above:
+    environment_stop's docstring already contains the lower-case substring
+    "worktree_id" today (the engine-internal-parameter prose, unrelated to
+    the env var), so a case-insensitive check on that one token alone would
+    false-pass without this test ever going RED.
+
+    Expected RED reason: none of the four upper-case tokens are present.
+    """
+    doc = _get_tool_docstring("environment_stop")
+    for token in _ENV_VAR_TOKENS:
+        assert token in doc, f"environment_stop must cross-reference {token!r}"
+
+
+def test_environment_start_docs_pin_env_param_overrides_injected_values():
+    """R3 edge (b): environment_start's docs must state that its ``env=``
+    parameter can override an injected ``WORKTREE_*`` value -- mirrors the
+    engine's own merge order in ``_build_worktree_env`` (identity/port vars
+    first, then ``caller_env`` merged in last).
+
+    Expected RED reason: no such pin exists in the docstring today
+    (verified: no "env"..."overrid"/"overrid"..."env" proximity match).
+    """
+    doc = _normalize(_get_tool_docstring("environment_start"))
+    assert re.search(r"env(?:=| parameter)[^.]{0,200}overrid", doc) or re.search(
+        r"overrid[^.]{0,200}env(?:=| parameter)", doc
+    ), "environment_start docs must state env= overrides injected WORKTREE_* values"
+
+
+# ---------------------------------------------------------------------------
+# WP #165 R5: worktree_remove's `force=True` reframed as the expected
+# happy-path teardown flag (gap 4), not an emergency override.
+# ---------------------------------------------------------------------------
+
+# Boundaries for the `force:` parameter's own entry, chosen for this
+# dispatch (plan: "define its region precisely") -- from the `force:`
+# parameter label to the next parameter's label
+# (`kill_blocking_processes:`), both unique substrings in the normalized
+# docstring.
+_FORCE_PARAM_REGION_START = "force: when true, removes the worktree even if it contains"
+_FORCE_PARAM_REGION_END = "kill_blocking_processes: when true, attempts to terminate"
+
+
+def test_worktree_remove_force_param_frames_dirty_checkout_as_expected():
+    """R5 driving test (gap 4): worktree_remove's ``force:`` parameter
+    entry must frame a dirty checkout needing ``force=True`` as the
+    *expected* happy-path teardown state, not an emergency override.
+
+    Expected RED reason: today this region is the bare mechanical
+    description only ("removes the worktree even if it contains
+    uncommitted changes. Defaults to False.") -- no "force=true" restated
+    with an expectation-framing cue.
+    """
+    doc = _normalize(_get_tool_docstring("worktree_remove"))
+    start = doc.index(_FORCE_PARAM_REGION_START)
+    end = doc.index(_FORCE_PARAM_REGION_END)
+    region = doc[start:end]
+
+    assert "force=true" in region, (
+        "worktree_remove's force: parameter region must restate force=true "
+        "explicitly, alongside the new expectation framing"
+    )
+    sentence = _sentence_containing(region, "force=true")
+    assert re.search(r"expected|normal|routine|not an emergency", sentence), (
+        f"expectation-framing cue missing from: {sentence!r}"
+    )
+
+
+def test_skill_md_states_force_true_is_normal_teardown_not_emergency():
+    """R5 edge (b): SKILL.md must also reframe force=True as the routine
+    happy-path teardown flag -- not scoped to the orphan-recovery recipe
+    alone (that recipe's own force=true/uncommitted pairing is pinned
+    separately by
+    ``test_skill_md_orphan_recovery_recipe_keeps_force_true_with_uncommitted_rationale``
+    above and must not be disturbed).
+
+    Expected RED reason: no SKILL.md force=true mention today sits near an
+    expectation-framing cue (verified: every existing force=true window in
+    SKILL.md is False for this cue).
+    """
+    norm = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+
+    match = None
+    for m in re.finditer(r"force=true", norm):
+        window = norm[max(0, m.start() - 200) : m.start() + 200]
+        if re.search(r"expected|normal|routine|not an emergency", window):
+            match = m
+            break
+    assert match is not None, (
+        "SKILL.md must state, near some force=true mention, that a dirty "
+        "checkout needing force=True is expected/normal/routine, not an "
+        "emergency override"
+    )

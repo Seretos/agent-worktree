@@ -159,6 +159,99 @@ def test_env_vars_injected(tmp_path: Path, monkeypatch):
     assert env["WORKTREE_PORT_DB"] == "31001"
 
 
+def test_setup_runner_injected_env_names_match_environment_start_response(
+    tmp_path: Path,
+):
+    """WP #165 R4 engine-fidelity mirror test (test_setup_runner.py half):
+    the WORKTREE_*-prefixed var *names* environment_start's new
+    `injected_env` response key reports for a given record's ports must
+    match exactly what `SetupRunner` itself injects into a contract step's
+    environment via `port_mapping` -- the sibling implementation
+    `_build_worktree_env` mirrors by convention, per that function's own
+    docstring ("Variable names mirror SetupRunner._build_env in
+    setup/runner.py ... Do NOT extract a shared helper"). Reuses this
+    file's `fake_run` env-capture pattern from `test_env_vars_injected`
+    above for the SetupRunner half; the companion mirror test in
+    test_environment_tools.py compares against `_build_worktree_env`
+    directly.
+
+    RED reason: `injected_env` is not a key on environment_start's response
+    yet -- `result["injected_env"]` raises KeyError.
+    """
+    from unittest.mock import patch as _patch
+
+    from mcp.server.fastmcp import FastMCP
+
+    from lib_python_worktree import (
+        InMemoryStateStore,
+        ManagerConfig,
+        WorktreeManager,
+        WorktreeRecord,
+    )
+    from worktree_plugin.tools.worktree import register
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    seen_env: List[dict] = []
+
+    def fake_run(cmd, *, cwd, env):
+        seen_env.append(dict(env))
+        return _FakeProc(returncode=0, stdout="ok", stderr="")
+
+    runner = SetupRunner(log_root=tmp_path / "logs", runner=fake_run)
+    runner.run(
+        setup=[_PlainStep(run="anything", name="probe")],
+        worktree_id="wt-mirror",
+        worktree_path=wt,
+        branch="feature/mirror",
+        port_mapping={"app": 31002, "db": 31003},
+    )
+    setup_runner_names = sorted(
+        k
+        for k in seen_env[0]
+        if k in ("WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH")
+        or k.startswith("WORKTREE_PORT_")
+    )
+
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    seretos = repo_root / ".seretos"
+    seretos.mkdir()
+    (seretos / "worktree-setup.yml").write_text(
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        encoding="utf-8",
+    )
+    record = WorktreeRecord(
+        id="wt-mirror",
+        repo_root=str(repo_root),
+        branch="feature/mirror",
+        path=str(wt),
+        status="created",
+        ports={"app": 31002, "db": 31003},
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=state
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with _patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fn(environment_id="wt-mirror")
+
+    assert sorted(result["injected_env"]) == setup_runner_names
+
+
 def test_shell_override_pwsh(monkeypatch):
     assert _resolve_shell("pwsh") == [
         "pwsh",
