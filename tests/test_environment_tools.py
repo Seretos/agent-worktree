@@ -1461,7 +1461,7 @@ def test_environment_start_without_contract_reports_no_contract(
     assert "error" not in result
     assert result["contract_found"] is False
     assert result["steps_run"] == 0
-    assert result["no_op_reason"] == "no-contract"
+    assert result["no_op_reason"] == "no_contract"
     assert result["contract_path"].endswith(".seretos/worktree-setup.yml")
     assert str(temp_repo.resolve()).replace("\\", "/") in result["contract_path"].replace(
         "\\", "/"
@@ -1514,7 +1514,7 @@ def test_environment_start_real_start_reports_steps_run_for_any_status(
     command (`echo hi`) instead leaves `status == "exited"`. Before the
     #103 fix, `_contract_diagnostics` required `status == "running"` to
     report a real start, so a real start whose process exited quickly was
-    misreported as `steps_run == 0`, `no_op_reason == "no-start-steps"` --
+    misreported as `steps_run == 0`, `no_op_reason == "no_start_steps"` --
     indistinguishable from the true no-op case #103 exists to separate out.
 
     Ticket #107: the original version of this test raced a real `echo hi`
@@ -1607,7 +1607,7 @@ def test_environment_start_isolation_none_reports_isolation_none(
     assert result["contract_found"] is True
     assert result["contract_isolation"] == "none"
     assert result["steps_run"] == 0
-    assert result["no_op_reason"] == "isolation-none"
+    assert result["no_op_reason"] == "isolation_none"
 
 
 def test_environment_start_contract_without_start_block_reports_no_start_steps(
@@ -1625,7 +1625,7 @@ def test_environment_start_contract_without_start_block_reports_no_start_steps(
     assert result["contract_found"] is True
     assert result["contract_isolation"] == "full"
     assert result["steps_run"] == 0
-    assert result["no_op_reason"] == "no-start-steps"
+    assert result["no_op_reason"] == "no_start_steps"
 
 
 def test_environment_start_contract_only_in_checkout_reports_misplaced(
@@ -1642,7 +1642,7 @@ def test_environment_start_contract_only_in_checkout_reports_misplaced(
 
     assert "error" not in result
     assert result["contract_found"] is False
-    assert result["no_op_reason"] == "contract-misplaced"
+    assert result["no_op_reason"] == "contract_misplaced"
     assert result["steps_run"] == 0
 
 
@@ -1658,14 +1658,14 @@ def test_environment_start_primary_same_path_never_reports_misplaced(
 
     assert "error" not in result
     assert result["contract_found"] is True
-    assert result["no_op_reason"] != "contract-misplaced"
+    assert result["no_op_reason"] != "contract_misplaced"
 
 
 def test_environment_start_diagnostics_degrade_for_unreachable_repo_root(
     tmp_path: Path,
 ):
     """A nonexistent repo_root/path pair (`/r`, `/p`) hits the ordinary
-    "no-contract" branch cleanly -- `Path.exists()` returns False rather
+    "no_contract" branch cleanly -- `Path.exists()` returns False rather
     than raising -- so this is NOT the `except (OSError, ContractError)`
     degrade path (see `test_environment_start_contract_unreadable_degrades_
     without_raising` below for that). This test only proves that an
@@ -1689,7 +1689,7 @@ def test_environment_start_diagnostics_degrade_for_unreachable_repo_root(
 
     assert "error" not in result
     assert result["contract_found"] is False
-    assert result["no_op_reason"] == "no-contract"
+    assert result["no_op_reason"] == "no_contract"
 
 
 def test_environment_start_contract_unreadable_degrades_without_raising(
@@ -1730,7 +1730,7 @@ def test_environment_start_contract_unreadable_degrades_without_raising(
     2. No process spawned at all (`role not in record.pids`, e.g. a
        contract with no `start:` steps) when the second read fails --
        this is a genuine no-op: `steps_run == 0`, `no_op_reason ==
-       "contract-unreadable"`.
+       "contract_unreadable"`.
 
     Both sub-cases keep `contract_found is True` (the file did exist) and
     `contract_isolation is None` (the second, failed read never parsed an
@@ -1767,7 +1767,7 @@ def test_environment_start_contract_unreadable_with_no_spawn_stays_no_op(
     `start:` steps to run at all, nothing was ever spawned for `role`, so
     `role not in record.pids`. If the diagnostics helper's own second read
     then fails, this is a genuine no-op -- not a real start -- and must
-    still report `steps_run == 0`, `no_op_reason == "contract-unreadable"`.
+    still report `steps_run == 0`, `no_op_reason == "contract_unreadable"`.
     """
     from lib_python_worktree import ContractError
 
@@ -1787,7 +1787,7 @@ def test_environment_start_contract_unreadable_with_no_spawn_stays_no_op(
     assert result["contract_found"] is True
     assert result["contract_isolation"] is None
     assert result["steps_run"] == 0
-    assert result["no_op_reason"] == "contract-unreadable"
+    assert result["no_op_reason"] == "contract_unreadable"
 
 
 def test_environment_start_soft_errors_carry_no_diagnostic_keys(tmp_path: Path):
@@ -2201,7 +2201,7 @@ def test_default_stop_variant_no_contract_degrades_to_default(
     test_environment_stop_variant_resolution_failure_raises_valueerror's
     zero-match-typo case, which never even reaches this helper's contract
     read since role/variant resolution happens inside manager.stop()
-    itself; this test isolates the helper's own degrade-on-no-contract
+    itself; this test isolates the helper's own degrade-on-no_contract
     path directly)."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     seeded = _seed_record(
@@ -2543,22 +2543,22 @@ def test_environment_start_docstring_no_longer_claims_silent_misplaced_contract(
     """Claim under protection (ticket #130, re-slicing #124): a contract
     placed only in a worktree checkout (not at repo_root) is still a
     {"status": "ready", "pids": {}} no-op, but it is a diagnosable one --
-    the same response carries no_op_reason: "contract-misplaced" (distinct
-    from "no-contract") -- and the stale "silent .../no error to indicate
+    the same response carries no_op_reason: "contract_misplaced" (distinct
+    from "no_contract") -- and the stale "silent .../no error to indicate
     the misplacement" claim must be gone."""
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     doc = fns["environment_start"].__doc__ or ""
     norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
 
     assert "no_op_reason" in norm
-    assert "contract-misplaced" in norm
+    assert "contract_misplaced" in norm
     assert "with no error to indicate the misplacement" not in norm
 
     found_silent_far_from_diagnosis = False
     for m in re.finditer(r"(?<!not )\bsilent\b", norm):
         idx = m.start()
         window = norm[max(0, idx - 300) : idx + 300]
-        if "contract-misplaced" in window or "misplacement" in window:
+        if "contract_misplaced" in window or "misplacement" in window:
             found_silent_far_from_diagnosis = True
     assert not found_silent_far_from_diagnosis, (
         "docstring must not describe the misplaced-contract case as "
