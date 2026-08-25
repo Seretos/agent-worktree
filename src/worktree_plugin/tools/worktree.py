@@ -1309,10 +1309,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         and ``environment_stop``.
 
         **Fields this call never populates.** Each entry carries every
-        ``WorktreeRecord`` key, but three of them are transient by design
+        ``WorktreeRecord`` key, but four of them are transient by design
         and are never persisted to ``state.yaml``: ``stop_attempt``,
-        ``killed_pids`` and ``shadowed_contract``. Because this call
-        rebuilds every entry from persisted state, those three are always
+        ``killed_pids``, ``shadowed_contract`` and ``orphan_scan`` (the
+        engine's warn-only orphan-process scan result, written only by
+        ``worktree_remove``'s teardown phase). Because this call
+        rebuilds every entry from persisted state, those four are always
         ``null``/``[]`` here regardless of what actually happened. They
         are readable ONLY on the response of the call that produced them
         (``environment_stop``, ``worktree_remove``,

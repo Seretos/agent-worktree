@@ -206,7 +206,7 @@ The server uses a persistent, disk-backed state store (`~/.agent-worktree/state.
 
 ## Signal handling on Windows
 
-Ticket #112 ("Connection closed (intermittent)"): the pinned `lib-python-worktree` engine's `_send_graceful_signal` (`process_lifecycle.py:819-836`, post-v0.3.10 relocation) sends `CTRL_BREAK_EVENT` via `os.kill(pid, signal.CTRL_BREAK_EVENT)` to non-group-leader pids from two call sites — `_kill_process_tree` (`process_lifecycle.py:1563`, post-v0.3.10 relocation; reached from the redesigned teardown module's `_phase_stop_processes`) and the `environment_stop(kill_orphans=True)` orphan scan (`process_lifecycle.py:2308`). On Windows, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — what that `os.kill` call maps to — takes a *process group id*, not an arbitrary pid; sent to a non-group-leader, the OS is free to deliver it elsewhere on the same console, including back to this MCP server itself. `_spawn_detached` (`process_lifecycle.py:321-331`) deliberately keeps the spawned child attached to the server's own console (no `DETACHED_PROCESS`, so ctrl-break delivery to the *intended* child stays possible at all) — the tradeoff that makes the stray-delivery-back-to-the-server failure mode reachable. POSIX already guards this exact class of mistake in `_signal_process_group` (`process_lifecycle.py:1400-1437`, post-v0.3.10 relocation; refuses to signal a non-leader or the caller's own group); Windows has no equivalent guard in the engine today.
+Ticket #112 ("Connection closed (intermittent)"): the pinned `lib-python-worktree` engine's `_send_graceful_signal` (`process_lifecycle.py:819-836`, verified against v0.3.11) sends `CTRL_BREAK_EVENT` via `os.kill(pid, signal.CTRL_BREAK_EVENT)` to non-group-leader pids from two call sites — `_kill_process_tree` (`process_lifecycle.py:1579`, verified against v0.3.11; reached from the redesigned teardown module's `_phase_stop_processes`) and the `environment_stop(kill_orphans=True)` orphan scan inside `_kill_blocking_processes` (`process_lifecycle.py:3165`, verified against v0.3.11). On Windows, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — what that `os.kill` call maps to — takes a *process group id*, not an arbitrary pid; sent to a non-group-leader, the OS is free to deliver it elsewhere on the same console, including back to this MCP server itself. `_spawn_detached` (`process_lifecycle.py:441`, comment at `469-479`, verified against v0.3.11) deliberately keeps the spawned child attached to the server's own console (no `DETACHED_PROCESS`, so ctrl-break delivery to the *intended* child stays possible at all) — the tradeoff that makes the stray-delivery-back-to-the-server failure mode reachable. POSIX already guards this exact class of mistake in `_signal_process_group` (`process_lifecycle.py:1416-1453`, verified against v0.3.11; refuses to signal a non-leader or the caller's own group); Windows has no equivalent guard in the engine today.
 
 **This plugin's mitigation:** `worktree_plugin.server` installs a `SIGBREAK` handler (`_install_signal_guards()`, called from `main()` before `mcp.run()`) that logs and swallows a received `CTRL_BREAK_EVENT` instead of letting Python's default disposition terminate the process. It is a no-op on POSIX (no `SIGBREAK` there). **`SIGINT` is deliberately left completely unchanged/untouched** — this guard never calls `signal.signal` for it, and Ctrl+C keeps working exactly as before.
 
@@ -263,10 +263,10 @@ hint there would also fire on ordinary typos.
 self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
 
 **Structural constraint on any future recipe.** `yaml_store._record_to_dict`
-does not persist `stop_attempt`, `killed_pids` or `shadowed_contract`, and
-`environment_list` rebuilds every entry from `state.yaml`. Those three keys are
-present in the output but always `null`/`[]` there. Never write a recipe that
-reads them back.
+does not persist `stop_attempt`, `killed_pids`, `shadowed_contract` or
+`orphan_scan`, and `environment_list` rebuilds every entry from `state.yaml`.
+Those four keys are present in the output but always `null`/`[]` there. Never
+write a recipe that reads them back.
 
 ### Build provenance of the #116 sweep (verified 2026-08-19)
 
@@ -349,15 +349,15 @@ below, one after another, each as its own foreground `pytest` call.
 | 1 | `tests/test_environment_tools.py` | 120 | 266 s |
 | 2 | `tests/test_worktree_tools.py` | 125 | 118 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 58 passed + 2 xfailed | 290 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 114 | 3 s |
-| **Total** | all 14 `tests/test_*.py` files | 417 passed + 2 xfailed | **677 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 115 | 1 s |
+| **Total** | all 14 `tests/test_*.py` files | 418 passed + 2 xfailed | **675 s** |
 
 **Chunk 4 dependency note.** `tests/test_release_dispatch_payload.py` has a
 `requires_bash_and_jq`-gated "layer (b)" of 18 tests (of its 34 total) that
 drive the real `bash`+`jq` interpreters; they silently `skip` (not fail) when
-`bash` or `jq` is not on `PATH`, so a local run without `jq` reports 96
+`bash` or `jq` is not on `PATH`, so a local run without `jq` reports 97
 passed/18 skipped for chunk 4 (16 passed/18 skipped for the file alone), not
-the 114-passed figure above. Both `windows-latest` and `ubuntu-22.04`
+the 115-passed figure above. Both `windows-latest` and `ubuntu-22.04`
 GitHub-hosted runners ship `jq` preinstalled, so CI always runs the full 34;
 this caveat is local-dev only.
 
@@ -380,8 +380,11 @@ work.
 
 **CI note.** This chunking is an agent-session constraint only. CI still runs
 the whole test suite in one go, in a single job step, via
-`.github/workflows/test.yml` — this document does not change, and is not
-proposing to change, the CI workflow.
+`.github/workflows/test.yml`. This document does not change, and is not
+proposing to change, that chunking-avoidance behaviour — the one thing that
+has changed is the job's `timeout-minutes` budget, raised 10 → 20 (see the
+next paragraph); the single-job-step structure and chunking guidance above
+are unaffected.
 
 **Local vs. CI caution.** Do not assume local wall-clock numbers generalize
 to CI, in either direction. This repo's own CI runs of the same suite have
@@ -393,6 +396,20 @@ project shows the same local/CI mismatch even more starkly: 245-508 s in CI
 versus 567 s measured locally. Treat both this table's numbers and any CI
 number as approximate, machine-dependent data points, not a portable
 benchmark.
+
+After bumping the `lib-python-worktree` pin to v0.3.11 (new orphan-scan
+overhead), the `windows-latest` leg of the `pytest` job was observed
+cancelled twice at ~10m17s — a cancellation wall-clock forced by the (then)
+`timeout-minutes: 10` budget, not a completion time, so the true post-bump
+Windows duration is unknown but at least that long. `timeout-minutes` has
+been raised 10 → 20, sized from a ~2x-overhead hypothesis on the 406 s
+pre-bump worst case (~13.5 min) plus margin. The per-test `timeout=60`
+configured in `pyproject.toml` (plus explicit longer marks on the
+thread-leak tests) is what actually catches an individual wedged test; this
+job-level `timeout-minutes` is only the outer backstop for the whole run.
+Follow-up: once the Windows leg completes green in CI under the new budget,
+replace the "~10m17s cancellation" datum above with its real measured
+duration.
 
 **Slow-test clustering.** Durations were not flat within every chunk.
 Chunk 1 (`tests/test_environment_tools.py`) clusters ten

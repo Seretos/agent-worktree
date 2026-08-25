@@ -441,21 +441,21 @@ def test_environment_start_staleness_caveat_is_inside_the_heuristic_window():
 def test_environment_list_documents_transient_fields():
     """Driving test (RED before the docstring edit, GREEN after).
 
-    environment_list's docstring must name all three fields that are
+    environment_list's docstring must name all four fields that are
     structurally never persisted to state.yaml (stop_attempt, killed_pids,
-    shadowed_contract) together with a transience cue, and must separately
-    state that retrying environment_list itself is always safe."""
+    shadowed_contract, orphan_scan -- the last added by the pinned engine's
+    v0.3.11 bump, ticket #169) together with a transience cue, and must
+    separately state that retrying environment_list itself is always safe."""
     doc = _normalize(_get_tool_docstring("environment_list"))
 
-    for field in ("stop_attempt", "killed_pids", "shadowed_contract"):
+    for field in ("stop_attempt", "killed_pids", "shadowed_contract", "orphan_scan"):
         assert field in doc, (
             f"environment_list's docstring must name {field!r} as a field "
             f"it never populates"
         )
     assert re.search(r"transient|never|not persisted", doc), (
         "environment_list's docstring must carry a transience cue "
-        "(transient/never/not persisted) near the three never-populated "
-        "fields"
+        "(transient/never/not persisted) near the never-populated fields"
     )
     assert "never writes state" in doc, (
         "environment_list's docstring must state that it never writes "
