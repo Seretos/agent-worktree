@@ -60,16 +60,19 @@ unconditionally.
 **Post-#159 (lib-python-worktree v0.3.10, upstream #135) relocation:** the
 ``~830``-line ``_teardown`` monolith was extracted into a standalone
 ``lib_python_worktree.core.teardown`` module; the call site this test's
-mechanism depends on now lives at ``teardown._phase_gate_a_blocking_preflight``
-(``teardown.py:666``), which -- exactly like the pre-#135
-``WorktreeManager._teardown`` it replaces -- calls
+mechanism depends on lived at ``teardown._phase_gate_a_blocking_preflight``
+(``teardown.py:666`` at v0.3.10; ``teardown.py:693`` verified against
+v0.3.11 -- the #140 orphan-scan feature added lines above it, shifting the
+def line again without changing its behaviour), which -- exactly like the
+pre-#135 ``WorktreeManager._teardown`` it replaces -- calls
 ``process_lifecycle._find_blocking_processes`` unconditionally for every
 non-target-absent removal attempt on Windows (still gated only on
 ``sys.platform == "win32" and not ctx.target_absent``, not on any blocking
 indicator). ``_find_blocking_processes``, ``_win_handle_holders``, and
-``_BoundedQueryWorker`` themselves are untouched by the #135 redesign --
-they still live in ``lib_python_worktree.core.process_lifecycle`` -- so the
-leak mechanism is identical; only the caller's module/function name changed.
+``_BoundedQueryWorker`` themselves are untouched by the #135 redesign or by
+the #140 v0.3.11 bump -- they still live in
+``lib_python_worktree.core.process_lifecycle`` -- so the leak mechanism is
+identical; only the caller's module/function name and line number changed.
 
 **Empirical result against the actually-installed v0.3.3** (see the xfail
 reason below, and ticket #111's change report for the full measured series):
@@ -96,9 +99,23 @@ and the always-create-an-initial-worker behaviour are unchanged in v0.3.10.
 Measured: ``growth_series=[1, 2, 3, 4, 5, 6]`` (default call site, +1
 leak-signature thread per cycle, no plateau) and ``growth_series=[1, 2, 3]``
 (``kill_blocking_processes=True`` call site, same +1/cycle rate) -- both
-XFAIL, matching v0.3.3's originally measured shape byte-for-byte. Both tests
-therefore stay ``xfail`` rather than flipping to plain assertions; see the
-updated ``_XFAIL_REASON`` below for the full evidence this run added.
+XFAIL, matching v0.3.3's originally measured shape byte-for-byte.
+
+**Re-measured against the actually-installed v0.3.11 (ticket #169,
+2026-08-25):** both tests still XFAIL (never XPASS -- the pytest summary
+line was checked explicitly, not inferred from a green exit code) -- the
+defect is unchanged in kind, but the measured *rate* doubled:
+``growth_series=[2, 4, 6, 8, 10, 12]`` (default call site, +2
+leak-signature threads per cycle, no plateau; was +1/cycle at v0.3.10) and
+``growth_series=[2, 4, 6]`` (``kill_blocking_processes=True`` call site,
+same +2/cycle rate; was +1/cycle at v0.3.10). ``_MAX_WEDGED_HANDLE_WORKERS``
+and the always-create-an-initial-worker behaviour remain unchanged in
+v0.3.11 -- the doubled rate was not re-derived from a source diff (the
+#140 orphan-scan feature does not touch ``_win_handle_holders``); it is
+reported here purely as the newly-measured empirical shape, matching this
+module's existing "measure, don't guess" discipline. Both tests therefore
+stay ``xfail`` rather than flipping to plain assertions; see the updated
+``_XFAIL_REASON`` below for the full evidence this run added.
 
 **Cross-reference (ticket #112):** a *separate* investigation into an
 intermittent "Connection closed" symptom on Windows considered this ticket's
@@ -246,7 +263,8 @@ _XFAIL_REASON = (
     "single scan, but every scan -- i.e. every worktree_remove call on "
     "Windows, since teardown._phase_gate_a_blocking_preflight (post-#159/"
     "upstream-#135 relocation of the former manager._teardown monolith; "
-    "teardown.py:666) reaches process_lifecycle._find_blocking_processes "
+    "teardown.py:693, verified against v0.3.11) reaches "
+    "process_lifecycle._find_blocking_processes "
     "Pass 1c unconditionally -- still always creates its own initial worker "
     "regardless of whether the cap is already full, and that worker's thread "
     "is never joined if it wedges. So once the cap fills, each subsequent "
@@ -267,8 +285,13 @@ _XFAIL_REASON = (
     "growth_series=[1, 2, 3, 4, 5, 6] over 6 measured cycles (+1/cycle, no "
     "plateau), still XFAIL. The #135 _teardown/teardown: redesign did not "
     "touch _win_handle_holders/_BoundedQueryWorker/_MAX_WEDGED_HANDLE_WORKERS "
-    "at all -- only the caller's module/function name moved. Flip to a plain "
-    "(non-xfail) test once a fixed pin lands."
+    "at all -- only the caller's module/function name moved (teardown.py:666 "
+    "at v0.3.10; teardown.py:693 verified against v0.3.11). Re-measured "
+    "against the actually-installed v0.3.11 (agent-worktree#169, 2026-08-25): "
+    "still XFAIL (never XPASS), same defect, doubled rate -- "
+    "growth_series=[2, 4, 6, 8, 10, 12] over 6 measured cycles (+2/cycle, no "
+    "plateau; was +1/cycle at v0.3.10). Flip to a plain (non-xfail) test once "
+    "a fixed pin lands."
 )
 
 
@@ -457,7 +480,10 @@ def test_create_remove_cycles_do_not_leak_threads(tmp_path: Path, capsys):
         "3 cycles here vs. the <=2 plateau bound). Re-measured against the "
         "actually-installed v0.3.10 (agent-worktree#159, 2026-08-23): "
         "identical defect at the identical rate, growth_series=[1, 2, 3] "
-        "over 3 measured cycles, still XFAIL."
+        "over 3 measured cycles, still XFAIL. Re-measured against the "
+        "actually-installed v0.3.11 (agent-worktree#169, 2026-08-25): still "
+        "XFAIL (never XPASS), doubled rate, growth_series=[2, 4, 6] over 3 "
+        "measured cycles (+2/cycle; was +1/cycle at v0.3.10)."
     ),
 )
 def test_create_remove_cycles_with_kill_blocking_processes_do_not_leak_threads(

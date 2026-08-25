@@ -20,6 +20,8 @@ AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
 README_MD = REPO_ROOT / "README.md"
 SPEC_FILE = REPO_ROOT / "worktree.spec"
+TEST_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 
 
 def _read_frontmatter_and_body(text: str) -> tuple[dict, str]:
@@ -1157,3 +1159,49 @@ def test_running_suite_guard_ignores_prose_outside_the_table():
     missing = _missing_from_chunk_table(table, ["tests/test_environment_tools.py"])
     assert missing == ["tests/test_environment_tools.py"]
     assert _measured_figures(table) == []
+
+
+# ---- Ticket #168: CI trigger must be pull_request-only, not push ----
+
+
+def test_test_workflow_triggers_on_pull_request_only():
+    """Claim under protection (ticket #168): `.github/workflows/test.yml`
+    must fire only on `pull_request`, never on `push` -- gatekeeper-mandated
+    so branch protection on `main` (an out-of-band repo setting, not part of
+    this diff) is the sole gate, and CI doesn't double-run on every push to
+    an open PR's branch.
+
+    YAML 1.1 gotcha: `yaml.safe_load` parses a bare top-level `on:` key as
+    the boolean `True`, not the string `"on"` -- resolved below by checking
+    both.
+
+    RED (pre-fix): the current `on:` block has both `push: {branches:
+    ["**"]}` and `pull_request:`, and the header comment (lines 3-9) claims
+    "Runs pytest on every push to any branch and on every PR" -- so
+    `"push" not in triggers` and the header-comment assertion both fail RED
+    for that reason, not for an unrelated reason (e.g. FileNotFoundError).
+    """
+    raw_text = TEST_WORKFLOW.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw_text)
+    triggers = data[True] if True in data else data["on"]
+
+    assert "pull_request" in triggers, (
+        "test.yml's `on:` block must still trigger on pull_request"
+    )
+    assert "push" not in triggers, (
+        "test.yml's `on:` block must no longer trigger on push -- branch "
+        "protection on main is the sole gate (ticket #168)"
+    )
+
+    # yaml parsing drops comments -- assert against the raw text directly.
+    assert "every push" not in raw_text, (
+        "test.yml's header comment must no longer claim push-triggering"
+    )
+    assert re.search(r"\bpull[- ]request\b", raw_text, flags=re.IGNORECASE), (
+        "test.yml's header comment must state PR-only triggering"
+    )
+
+    # Guard the out-of-scope release.yml -- its workflow_dispatch trigger
+    # must be untouched by this change.
+    release_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "workflow_dispatch" in release_text

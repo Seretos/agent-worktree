@@ -25,25 +25,27 @@ event to whichever process(es) that "group id" actually names on the
 system -- including, if the calling/host process (this MCP server) happens
 to share that console/group, **the server itself**.
 
-The pinned engine (``lib-python-worktree`` v0.3.3, importable at
+The pinned engine (``lib-python-worktree`` v0.3.11, importable at
 ``lib_python_worktree.core.process_lifecycle`` -- see
 ``.venv/Lib/site-packages/lib_python_worktree/core/process_lifecycle.py``
 in this checkout) has exactly this gap:
 
-- ``_send_graceful_signal()`` (process_lifecycle.py:819-836, post-v0.3.10
-  relocation) does
+- ``_send_graceful_signal()`` (process_lifecycle.py:819-836, verified
+  against v0.3.11) does
   ``os.kill(pid, signal.CTRL_BREAK_EVENT)`` unconditionally on
   ``sys.platform == "win32"``, with **no check** that *pid* is a process
   group leader.
 - It is called from two non-group-leader call sites:
-  - ``_kill_process_tree`` (process_lifecycle.py:1563, post-v0.3.10
-    relocation; called from the redesigned teardown module's
+  - ``_kill_process_tree`` (process_lifecycle.py:1579, verified against
+    v0.3.11; called from the redesigned teardown module's
     ``_phase_stop_processes``), signalling every
     node of a discovered process *tree* -- children/grandchildren of the
     tracked pid, which are emphatically not group leaders of their own.
-  - The orphan scan inside ``stop()`` (process_lifecycle.py:2308), same
-    story for orphaned grandchildren.
-- ``_spawn_detached`` (process_lifecycle.py:321-331) spawns the tracked
+  - The orphan scan inside ``_kill_blocking_processes``, itself reached
+    from ``stop()`` (process_lifecycle.py:3165, verified against v0.3.11),
+    same story for orphaned grandchildren.
+- ``_spawn_detached`` (process_lifecycle.py:441, comment at 469-479,
+  verified against v0.3.11) spawns the tracked
   child with ``CREATE_NEW_PROCESS_GROUP`` alone, **without**
   ``DETACHED_PROCESS`` -- documented in-source (see the comment at that
   exact location) as deliberate, because ``DETACHED_PROCESS`` would sever
@@ -54,8 +56,8 @@ in this checkout) has exactly this gap:
   resolve to just the intended child's own group can therefore be delivered
   back to that shared console -- reaching the server process too.
 - POSIX already guards exactly this class of mistake:
-  ``_signal_process_group`` (process_lifecycle.py:1400-1437, post-v0.3.10
-  relocation) refuses to
+  ``_signal_process_group`` (process_lifecycle.py:1416-1453, verified
+  against v0.3.11) refuses to
   ``os.killpg`` unless *pid* is confirmed to be the leader of its own group
   (``os.getpgid(pid) == pid``) and that group is not the caller's own
   (``os.getpgid(pid) != os.getpgid(0)``). **Windows has no equivalent
