@@ -380,8 +380,11 @@ work.
 
 **CI note.** This chunking is an agent-session constraint only. CI still runs
 the whole test suite in one go, in a single job step, via
-`.github/workflows/test.yml` — this document does not change, and is not
-proposing to change, the CI workflow.
+`.github/workflows/test.yml`. This document does not change, and is not
+proposing to change, that chunking-avoidance behaviour — the one thing that
+has changed is the job's `timeout-minutes` budget, raised 10 → 20 (see the
+next paragraph); the single-job-step structure and chunking guidance above
+are unaffected.
 
 **Local vs. CI caution.** Do not assume local wall-clock numbers generalize
 to CI, in either direction. This repo's own CI runs of the same suite have
@@ -393,6 +396,20 @@ project shows the same local/CI mismatch even more starkly: 245-508 s in CI
 versus 567 s measured locally. Treat both this table's numbers and any CI
 number as approximate, machine-dependent data points, not a portable
 benchmark.
+
+After bumping the `lib-python-worktree` pin to v0.3.11 (new orphan-scan
+overhead), the `windows-latest` leg of the `pytest` job was observed
+cancelled twice at ~10m17s — a cancellation wall-clock forced by the (then)
+`timeout-minutes: 10` budget, not a completion time, so the true post-bump
+Windows duration is unknown but at least that long. `timeout-minutes` has
+been raised 10 → 20, sized from a ~2x-overhead hypothesis on the 406 s
+pre-bump worst case (~13.5 min) plus margin. The per-test `timeout=60`
+configured in `pyproject.toml` (plus explicit longer marks on the
+thread-leak tests) is what actually catches an individual wedged test; this
+job-level `timeout-minutes` is only the outer backstop for the whole run.
+Follow-up: once the Windows leg completes green in CI under the new budget,
+replace the "~10m17s cancellation" datum above with its real measured
+duration.
 
 **Slow-test clustering.** Durations were not flat within every chunk.
 Chunk 1 (`tests/test_environment_tools.py`) clusters ten

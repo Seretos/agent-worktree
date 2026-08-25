@@ -1205,3 +1205,38 @@ def test_test_workflow_triggers_on_pull_request_only():
     # must be untouched by this change.
     release_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     assert "workflow_dispatch" in release_text
+
+
+def test_test_workflow_pytest_job_has_headroom_for_windows():
+    """Claim under protection (ticket #169/PR #173): the `pytest` job's
+    `timeout-minutes` budget must have enough headroom for post-v0.3.11
+    Windows runtimes, without drifting to something effectively unbounded.
+
+    Evidence: pre-bump CI durations were 301s / 315s / 397s / 406s. After
+    bumping lib-python-worktree to v0.3.11 (new orphan-scan overhead), the
+    `windows-latest` leg of this job was cancelled twice at ~10m17s -- a
+    cancellation wall-clock forced by the old `timeout-minutes: 10` budget,
+    not a completion time, so the true post-bump Windows duration is unknown
+    but at least that long. Sizing hypothesis: ~2x overhead on the 406s
+    pre-bump worst case is ~812s (~13.5 min); the fix bumps the budget to 20
+    minutes, comfortably covering that estimate plus margin while still
+    catching a runaway/hung job.
+
+    RED (pre-fix): `.github/workflows/test.yml` still has
+    `timeout-minutes: 10`, so the `15 <= value` floor fails on a plain
+    value comparison (10 is not >= 15) -- not a KeyError, not a YAML parse
+    error, not a missing-file error.
+    """
+    raw_text = TEST_WORKFLOW.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw_text)
+
+    timeout_minutes = data["jobs"]["pytest"]["timeout-minutes"]
+
+    assert isinstance(timeout_minutes, int), (
+        "timeout-minutes must be a real integer, not a string like '20'"
+    )
+    assert 15 <= timeout_minutes <= 30, (
+        "timeout-minutes must be bumped enough to cover post-v0.3.11 "
+        "Windows runtimes (floor) without becoming effectively unbounded "
+        f"(ceiling); got {timeout_minutes}"
+    )

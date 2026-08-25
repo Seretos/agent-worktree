@@ -23,7 +23,15 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # Pre-bump CI wall-clock (lib-python-worktree < v0.3.11): 301s / 315s /
+    # 397s / 406s across observed runs. After bumping the pin to v0.3.11,
+    # the new orphan-scan overhead roughly doubles Windows wall-clock time:
+    # the windows-latest leg was cancelled twice at ~10m17s against the old
+    # 10-minute budget -- a cancellation, not a completion, so the true
+    # post-bump duration is unknown but at least that long. Sized from a
+    # ~2x-overhead reading of the 406s pre-bump worst case (~13.5 min) plus
+    # margin; still tight enough to catch a genuinely wedged/hung job.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
