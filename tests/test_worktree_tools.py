@@ -3253,6 +3253,100 @@ def test_worktree_create_docstring_documents_start_variants(tmp_path: Path):
     assert re.search(r"empty list|\[\]", window)
 
 
+# ---- WP #165 R4: additive `injected_env` response key (gap 2) ----
+#
+# `InMemoryStateStore` (used by every fixture in this module) wires a
+# no-op port allocator -- real dynamic port allocation is
+# `YamlStateStore`-only (see `WorktreeManager.__init__`) -- so a contract's
+# `ports:` block alone never populates `record.ports` via a real
+# `manager.create()` call in these tests. Where a non-empty `ports` dict is
+# needed, `mgr._allocator.allocate` is stubbed directly, mirroring how
+# `test_tool_environment_start_env_vars_reach_child` above sidesteps the
+# same no-op allocator by constructing `WorktreeRecord.ports` by hand.
+
+
+def test_worktree_create_surfaces_injected_env(tmp_path: Path, temp_repo: Path):
+    """R4 driving test: worktree_create's response must surface an
+    additive `injected_env` key listing the WORKTREE_* env var names the
+    engine injects into contract steps for this record, sorted by port
+    slot name after the three fixed base vars -- so an agent can discover
+    the available vars from the same call that creates the worktree,
+    without cross-referencing docs.
+
+    RED reason: `injected_env` is not a key in worktree_create's response
+    today -- `result["injected_env"]` raises KeyError.
+    """
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nports:\n  - name: app\n  - name: db\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr._allocator.allocate = lambda *a, **k: {"app": 30001, "db": 30002}
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["injected_env"] == [
+        "WORKTREE_ID",
+        "WORKTREE_PATH",
+        "WORKTREE_BRANCH",
+        "WORKTREE_PORT_APP",
+        "WORKTREE_PORT_DB",
+    ]
+
+
+def test_worktree_create_injected_env_isolation_none_has_base_vars_only(
+    tmp_path: Path, temp_repo: Path
+):
+    """R4 edge case: `isolation: none` forbids a `ports:` block entirely,
+    so `injected_env` must still be present and hold exactly the three
+    fixed base vars -- never absent, never `None`."""
+    _write_contract(temp_repo, "version: 1\nisolation: none\n")
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["injected_env"] == ["WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH"]
+
+
+def test_worktree_create_injected_env_no_contract_has_base_vars_only(
+    tmp_path: Path, temp_repo: Path
+):
+    """R4 edge case: no contract file at all -- still the three base vars,
+    matching `start_variants`' own "missing contract is not an error"
+    precedent above."""
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["injected_env"] == ["WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH"]
+
+
+def test_worktree_create_injected_env_ports_are_sorted(tmp_path: Path, temp_repo: Path):
+    """R4 edge case: port-derived vars are sorted by slot name, regardless
+    of the contract's own declaration order or the allocator's return
+    order."""
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: full\nports:\n  - name: zeta\n  - name: alpha\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+    mgr._allocator.allocate = lambda *a, **k: {"zeta": 30003, "alpha": 30004}
+
+    result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert "error" not in result
+    assert result["injected_env"] == [
+        "WORKTREE_ID",
+        "WORKTREE_PATH",
+        "WORKTREE_BRANCH",
+        "WORKTREE_PORT_ALPHA",
+        "WORKTREE_PORT_ZETA",
+    ]
+
+
 # ---- Ticket #141: ambient-handle hardening ----
 
 

@@ -1810,6 +1810,248 @@ def test_environment_start_soft_errors_carry_no_diagnostic_keys(tmp_path: Path):
     assert "contract_found" not in already_running
 
 
+# ---- WP #165 R4: additive `injected_env` response key (gap 2) ----
+
+
+def test_environment_start_surfaces_injected_env(tmp_path: Path):
+    """R4 driving test: environment_start's response must surface an
+    additive `injected_env` key listing the WORKTREE_* env var names the
+    engine injects for this record -- mirrors worktree_create's own
+    `injected_env` (test_worktree_tools.py), so an agent starting an
+    environment can discover exactly which vars its `start:` step can read
+    without cross-referencing docs.
+
+    RED reason: `injected_env` is not a key in environment_start's response
+    today -- `result["injected_env"]` raises KeyError.
+    """
+    wt_path = tmp_path / "store" / "repo" / "wt-injected-env-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+    )
+
+    worktree_id = "wt-injected-env-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/injected-env",
+        path=str(wt_path),
+        status="created",
+        ports={"app": 30001, "db": 30002},
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=state
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fn(environment_id=worktree_id)
+
+    assert "error" not in result
+    assert result["injected_env"] == [
+        "WORKTREE_ID",
+        "WORKTREE_PATH",
+        "WORKTREE_BRANCH",
+        "WORKTREE_PORT_APP",
+        "WORKTREE_PORT_DB",
+    ]
+
+
+def test_environment_start_injected_env_isolation_none_has_base_vars_only(
+    tmp_path: Path,
+):
+    """R4 edge case: `isolation: none` is a no-op start (nothing spawned),
+    but `injected_env` must still be present and hold exactly the three
+    fixed base vars."""
+    wt_path = tmp_path / "store" / "repo" / "wt-iso-none-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(repo_root, "version: 1\nisolation: none\n")
+
+    worktree_id = "wt-iso-none-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/iso-none",
+        path=str(wt_path),
+        status="created",
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=state
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    result = fn(environment_id=worktree_id)
+
+    assert "error" not in result
+    assert result["injected_env"] == ["WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH"]
+
+
+def test_environment_start_injected_env_ports_are_sorted(tmp_path: Path):
+    """R4 edge case: port-derived vars are sorted by slot name."""
+    wt_path = tmp_path / "store" / "repo" / "wt-sorted-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+    )
+
+    worktree_id = "wt-sorted-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/sorted",
+        path=str(wt_path),
+        status="created",
+        ports={"zeta": 30005, "alpha": 30006},
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=state
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fn(environment_id=worktree_id)
+
+    assert result["injected_env"] == [
+        "WORKTREE_ID",
+        "WORKTREE_PATH",
+        "WORKTREE_BRANCH",
+        "WORKTREE_PORT_ALPHA",
+        "WORKTREE_PORT_ZETA",
+    ]
+
+
+def test_environment_start_injected_env_absent_on_soft_errors(tmp_path: Path):
+    """R4 edge case: neither the `not_found` nor the `already_running`
+    soft-error dict carries an `injected_env` key -- mirrors
+    `test_environment_start_soft_errors_carry_no_diagnostic_keys` above for
+    the pre-existing `contract_found`-family diagnostic keys."""
+    from unittest.mock import MagicMock
+
+    from lib_python_worktree import ProcessAlreadyRunningError, WorktreeNotFoundError
+
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+
+    mgr.start = MagicMock(side_effect=WorktreeNotFoundError("wt-missing"))
+    not_found = fns["environment_start"](environment_id="wt-missing")
+    assert "error" in not_found
+    assert "injected_env" not in not_found
+
+    mgr.start = MagicMock(
+        side_effect=ProcessAlreadyRunningError("wt-id", "main", 12345)
+    )
+    already_running = fns["environment_start"](environment_id="wt-id")
+    assert "error" in already_running
+    assert "injected_env" not in already_running
+
+
+def test_environment_start_injected_env_matches_real_build_worktree_env(
+    tmp_path: Path,
+):
+    """R4 engine-fidelity mirror test: `injected_env`'s var *names* must
+    match exactly what the engine's own `_build_worktree_env` actually
+    injects for the same record -- not a hand-maintained duplicate list
+    that could silently drift from the real engine convention (mirrors the
+    sibling mirror test in `test_setup_runner.py`, comparing against
+    `SetupRunner`'s independent env-building path for the same ports).
+
+    The comparison is scoped to exactly the four known names/prefix
+    (`WORKTREE_ID`, `WORKTREE_PATH`, `WORKTREE_BRANCH`,
+    `WORKTREE_PORT_*`) rather than a blanket `WORKTREE_`-prefix diff
+    against the ambient/user-profile environment `_build_worktree_env`
+    also merges in -- this is deliberately immune to any coincidental
+    `WORKTREE_*`-prefixed variable already set in the real environment
+    (e.g. `WORKTREE_STORE_ROOT`), so it needs no `os.environ` patching to
+    stay correct.
+
+    RED reason: same KeyError as the driving test above -- `injected_env`
+    is not surfaced yet.
+    """
+    from lib_python_worktree.core.manager import _build_worktree_env
+
+    wt_path = tmp_path / "store" / "repo" / "wt-mirror-12345678"
+    wt_path.mkdir(parents=True)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir()
+    _write_contract(
+        repo_root,
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+    )
+
+    worktree_id = "wt-mirror-12345678"
+    record = WorktreeRecord(
+        id=worktree_id,
+        repo_root=str(repo_root),
+        branch="feature/mirror",
+        path=str(wt_path),
+        status="created",
+        ports={"app": 30007, "db": 30008},
+    )
+    state = InMemoryStateStore()
+    state.add(record)
+    mgr = WorktreeManager(
+        config=ManagerConfig(store_root=tmp_path / "store"), state=state
+    )
+    mcp = FastMCP("test")
+    register(mcp, mgr)
+    fn = mcp._tool_manager._tools["environment_start"].fn
+
+    def _fake_lifecycle_start(worktree_id, cmd, *, store, role, env, cwd, variant=None):
+        record.status = "running"
+        record.pids = {role: 99999}
+        return record
+
+    with patch(
+        "lib_python_worktree.core.manager._lifecycle_start",
+        side_effect=_fake_lifecycle_start,
+    ):
+        result = fn(environment_id=worktree_id)
+
+    real_env = _build_worktree_env(record, None)
+    expected_names = sorted(
+        k
+        for k in real_env
+        if k in ("WORKTREE_ID", "WORKTREE_PATH", "WORKTREE_BRANCH")
+        or k.startswith("WORKTREE_PORT_")
+    )
+    assert sorted(result["injected_env"]) == expected_names
+
+
 def test_worktree_create_docstring_documents_contract_schema(tmp_path: Path):
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     doc = fns["worktree_create"].__doc__ or ""

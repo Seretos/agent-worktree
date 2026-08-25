@@ -197,6 +197,14 @@ ports:
   - name: db
 ```
 
+**Injected env vars.** Every `setup:`/`start:`/`stop:`/`teardown:` step's shell
+process automatically receives `WORKTREE_ID`, `WORKTREE_PATH`, and
+`WORKTREE_BRANCH` identifying the environment it runs against, plus one
+`WORKTREE_PORT_<NAME>` per allocated `ports:` slot — `<NAME>` is the slot's
+`name:` upper-cased (e.g. a `ports:` slot named `app` becomes
+`WORKTREE_PORT_APP`). `environment_start`'s own `env=` parameter is merged in
+last and can override any of these injected values.
+
 ## `isolation: none` vs `full`
 
 - `isolation: full` is **required** whenever any `setup:`, `start:`, `stop:`,
@@ -220,7 +228,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 | Tool | Best for |
 |---|---|
 | `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD) |
-| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. Structurally refuses to delete a primary checkout, even with `force=True` |
+| `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. A dirty checkout needing `force=True` is the expected, routine teardown case, not an emergency override. Structurally refuses to delete a primary checkout, even with `force=True` |
 
 **Environment lifecycle** (the process running against any checkout, primary included):
 
@@ -563,3 +571,8 @@ running under the given `role`).
    one. Check `worktree_create`'s returned `start_variants` field (or this
    contract's `start:` list) up front and pass `variant=<name>` explicitly
    whenever more than one step exists.
+10. **A dirty checkout needing `force=True` at teardown is normal, not an
+    emergency.** After `setup:`/`start:` steps run, the checkout typically
+    holds generated files or uncommitted changes; `worktree_remove(force=True)`
+    is the expected, routine way to tear it down — not a rescue flag reserved
+    for crashes or corruption.

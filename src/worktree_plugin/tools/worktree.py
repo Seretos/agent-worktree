@@ -443,6 +443,34 @@ def _start_step_names(repo_root: str) -> Optional[List[str]]:
         return None
 
 
+def _injected_env_names(record: WorktreeRecord) -> List[str]:
+    """Return the names of every ``WORKTREE_*`` env var the engine injects
+    into this record's ``setup:``/``start:``/``stop:``/``teardown:`` steps
+    (WP #165 R4) -- a pure, never-raising mirror of
+    ``lib_python_worktree.core.manager._build_worktree_env``'s and
+    ``SetupRunner._build_env``'s shared naming convention (that function's
+    own docstring: "Variable names mirror SetupRunner._build_env ... Do NOT
+    extract a shared helper"), so a caller can discover exactly which vars
+    its contract steps can read without cross-referencing docs.
+
+    Always includes the three fixed base vars (``WORKTREE_ID``,
+    ``WORKTREE_PATH``, ``WORKTREE_BRANCH``) -- never empty, never ``None``,
+    even for ``isolation: none`` or a record with no contract at all -- plus
+    one ``WORKTREE_PORT_<NAME>`` per allocated ``ports:`` slot
+    (``record.ports``), sorted by slot name so the result is deterministic
+    regardless of the contract's declaration order or the allocator's
+    return order. ``<NAME>`` is the slot name upper-cased, matching
+    ``_build_worktree_env``'s own ``slot.upper()`` derivation (port slot
+    names are constrained to ``^[a-z][a-z0-9_]{0,31}$``, so this is
+    lossless).
+    """
+    return [
+        "WORKTREE_ID",
+        "WORKTREE_PATH",
+        "WORKTREE_BRANCH",
+    ] + [f"WORKTREE_PORT_{slot.upper()}" for slot in sorted(record.ports)]
+
+
 def _default_stop_variant(
     manager: WorktreeManager,
     environment_id: Optional[str],
@@ -663,6 +691,32 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
     ) -> Dict[str, Any]:
         """Create a git worktree for ``branch`` rooted at ``repo_root``.
 
+        Contract authoring quick reference
+        -----------------------------------
+        - Required: ``version: 1`` (only accepted value) and
+          ``isolation:`` (``full``, ``partial``, or ``none``) -- both
+          required.
+        - Full top-level key set: ``setup:``, ``start:``, ``stop:``,
+          ``teardown:``, ``ports:``, ``seed_postprocess:``
+          (seed_postprocess is schema-valid but not run by any tool in
+          this surface).
+        - ``isolation: none`` forbids ALL of those blocks -- adding one
+          is a hard schema error (rejected as invalid), not a silent
+          no-op.
+        - Named ``start:`` steps are variants, chosen via
+          ``environment_start(variant=<name>)``; a named step does not
+          run by default unless it is the contract's only ``start:``
+          step.
+        - Injected env vars for every step: ``WORKTREE_ID``,
+          ``WORKTREE_PATH``, ``WORKTREE_BRANCH``, and
+          ``WORKTREE_PORT_<NAME>`` per allocated ``ports:`` slot
+          (upper-cased slot name).
+        - Teardown normally needs ``worktree_remove(force=True)`` -- a
+          dirty checkout is the expected, routine end state, not an
+          emergency.
+
+        Details for every point above follow below.
+
         ``base`` is the name of a local branch to base the new worktree on;
         the tool fetches the latest commits from ``origin`` automatically so
         the new worktree always starts from an up-to-date remote state.
@@ -720,6 +774,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         still resolves the contract's single unnamed ``start:`` step --
         such a step is deliberately absent from this list, so an empty
         ``[]`` here does not mean nothing is startable.
+
+        Injected env vars for setup/start/stop/teardown steps
+        ---------------------------------------------------------
+        Every step's shell process (``setup:``, ``start:``, ``stop:``, and
+        ``teardown:`` alike) automatically receives ``WORKTREE_ID``,
+        ``WORKTREE_PATH``, and ``WORKTREE_BRANCH`` identifying this
+        worktree, plus one ``WORKTREE_PORT_<NAME>`` per allocated
+        ``ports:`` slot -- ``<NAME>`` is the slot's ``name:`` upper-cased
+        (e.g. a slot named ``app`` becomes ``WORKTREE_PORT_APP``).
+        ``environment_start``'s own ``env=`` parameter is merged in last
+        and can override any of these injected values.
 
         Contract file (``.seretos/worktree-setup.yml``)
         -------------------------------------------------
@@ -920,6 +985,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         # per the warning block above.
         result["start_variants"] = _start_step_names(record.repo_root)
 
+        # WP #165 R4: surface the WORKTREE_* env var names the engine will
+        # inject into this record's contract steps, so a caller can discover
+        # them from the same call that creates the worktree.
+        result["injected_env"] = _injected_env_names(record)
+
         return result
 
     @mcp.tool()
@@ -995,7 +1065,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             "Addressing the target" above.
         force:
             When ``True``, removes the worktree even if it contains
-            uncommitted changes. Defaults to ``False``.
+            uncommitted changes. Defaults to ``False``. A dirty checkout
+            needing ``force=True`` is the expected, routine teardown case
+            after ``setup:``/``start:`` steps have run -- not an emergency
+            override reserved for exceptional situations.
         kill_blocking_processes:
             When ``True``, attempts to terminate **foreign** processes whose
             current working directory is inside the worktree directory before
@@ -1392,6 +1465,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         """Start a detached process for a target environment -- a linked
         worktree or the repo's own primary/main clone.
 
+        Contract authoring quick reference
+        -----------------------------------
+        - ``isolation: none`` forbids ALL blocks (``setup:``,
+          ``start:``, ``stop:``, ``teardown:``, ``ports:``,
+          ``seed_postprocess:``) -- a schema error, not a no-op.
+        - Named ``start:`` steps are variants via
+          ``environment_start(variant=<name>)``; a named step does not
+          run by default unless it's the only step.
+        - Env vars per step: ``WORKTREE_ID``, ``WORKTREE_PATH``,
+          ``WORKTREE_BRANCH``, ``WORKTREE_PORT_<NAME>`` (slot name
+          upper-cased).
+
+        Details for every point above follow below.
+
         The command to run is **not** supplied by the caller -- it is read
         from the environment's contract's ``start:`` steps in
         ``.seretos/worktree-setup.yml``. The engine reads this file from
@@ -1592,8 +1679,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             resolution when the lone-step fallback resolves a named step.
         env:
             Optional dict of extra environment variables merged into the process
-            environment by the engine. Omit (or pass ``None``) to inherit the
-            current environment unchanged.
+            environment by the engine. The engine merges this in **last**,
+            after the injected ``WORKTREE_ID``/``WORKTREE_PATH``/
+            ``WORKTREE_BRANCH``/``WORKTREE_PORT_<NAME>`` values (see the
+            quick reference above), so ``env=`` can override any of them.
+            Omit (or pass ``None``) to inherit the current environment
+            unchanged.
 
         The operation is idempotent in the sense that if a process is already
         running under the given ``role``, this tool returns a soft error dict
@@ -1802,6 +1893,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             **_record_to_dict(record),
             "start_log_path": record.start_log_paths.get(role),
             **_contract_diagnostics(record, role),
+            "injected_env": _injected_env_names(record),
         }
 
     @mcp.tool()
@@ -1949,7 +2041,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         file from ``repo_root`` -- the original repository clone -- not from a
         linked worktree checkout itself, and it reads it **live from disk on
         every call**, never the checkout-local copy; a contract placed only in
-        the checkout is silently ignored.
+        the checkout is silently ignored. Those ``stop:`` steps' shell
+        processes receive the same injected ``WORKTREE_ID``,
+        ``WORKTREE_PATH``, ``WORKTREE_BRANCH``, and ``WORKTREE_PORT_<NAME>``
+        env vars documented on ``environment_start``'s docstring, even
+        though this call never spawns a process of its own.
 
         Step schema: ``stop:`` steps share the same per-step shape as
         ``start:`` steps -- each entry is a YAML mapping with a required

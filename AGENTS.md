@@ -104,6 +104,10 @@ Because the two are independent, two variants started concurrently against the s
 
 **Symmetry with environment_stop (ticket #139).** When tier 3 (the lone-step fallback) resolves a *named* step from a bare `variant="default"` call, the *engine* records that step's own name in `record.variants[role]` (e.g. `"main"`) — never the literal string `"default"` — because the engine itself records `variant=step.name or variant`. This wrapper compensates: `environment_stop(variant="default")` **does resolve** against that role — before calling the engine, `environment_stop` pre-resolves a bare `"default"` to the contract's single named `start:` step (mirroring `environment_start`'s own tier-3 rule), so the call that started a lone named step can stop it the same way, with no need to track or pass the step's actual name. Passing the step's actual name as `variant`, or omitting `variant` and relying on `role="main"` (the default), both keep working exactly as before.
 
+#### Injected env vars
+
+Every `setup:`/`start:`/`stop:`/`teardown:` step's shell process automatically receives `WORKTREE_ID`, `WORKTREE_PATH`, and `WORKTREE_BRANCH` identifying the environment it runs against, plus one `WORKTREE_PORT_<NAME>` per allocated `ports:` slot — `<NAME>` is the slot's `name:` upper-cased (e.g. a `ports:` slot named `app` becomes `WORKTREE_PORT_APP`). `environment_start`'s `env=` parameter is merged in last and can override any of these injected values.
+
 #### environment_list
 
 ```
