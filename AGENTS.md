@@ -349,8 +349,17 @@ below, one after another, each as its own foreground `pytest` call.
 | 1 | `tests/test_environment_tools.py` | 120 | 266 s |
 | 2 | `tests/test_worktree_tools.py` | 125 | 118 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 58 passed + 2 xfailed | 290 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py` | 80 | 1 s |
-| **Total** | all 13 `tests/test_*.py` files | 383 passed + 2 xfailed | **675 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 114 | 3 s |
+| **Total** | all 14 `tests/test_*.py` files | 417 passed + 2 xfailed | **677 s** |
+
+**Chunk 4 dependency note.** `tests/test_release_dispatch_payload.py` has a
+`requires_bash_and_jq`-gated "layer (b)" of 18 tests (of its 34 total) that
+drive the real `bash`+`jq` interpreters; they silently `skip` (not fail) when
+`bash` or `jq` is not on `PATH`, so a local run without `jq` reports 96
+passed/18 skipped for chunk 4 (16 passed/18 skipped for the file alone), not
+the 114-passed figure above. Both `windows-latest` and `ubuntu-22.04`
+GitHub-hosted runners ship `jq` preinstalled, so CI always runs the full 34;
+this caveat is local-dev only.
 
 The Total row is the **sum of the measured chunks**, **not a single**
 end-to-end measured run of the whole suite in one `pytest` invocation — the

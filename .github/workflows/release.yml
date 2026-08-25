@@ -314,33 +314,100 @@ jobs:
       - name: Dispatch to agent-marketplace
         shell: bash
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
-          VERSION: ${{ inputs.version }}
-          NAME:    ${{ needs.stamp.outputs.plugin_name }}
-          TAG:     ${{ needs.stamp.outputs.tag }}
+          GH_PAT:   ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          VERSION:  ${{ inputs.version }}
+          TAG:      ${{ needs.stamp.outputs.tag }}
         run: |
-          # The orphan-checkout step above wiped `stamped/` via
-          # `git clean -fdx`, then restored the release-branch
-          # contents into the worktree -- so plugin.json lives at
-          # `.claude-plugin/plugin.json` from here on.
+          # plugin.json is expected at `.claude-plugin/plugin.json` in the
+          # workspace by this point: release.yml's orphan-checkout step
+          # (above, in this same job) restores the release-branch contents
+          # here after wiping `stamped/`; dispatch.yml's checkout of `ref:
+          # release` (this workflow's only checkout) puts it there directly.
+          set -euo pipefail
+
+          NAME=$(jq -r '.name' .claude-plugin/plugin.json)
           DESC=$(jq -r '.description' .claude-plugin/plugin.json)
-          curl -fsSL -X POST \
-            -H "Authorization: Bearer $GH_PAT" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
-            -d @- <<EOF
-          {
-            "event_type": "plugin-release",
-            "client_payload": {
-              "name":        "${NAME}",
-              "description": "${DESC}",
-              "repo":        "${{ github.repository }}",
-              "category":    "mcp",
-              "version":     "${VERSION}",
-              "ref":         "${TAG}",
-              "icon":            "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
-              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md",
-              "tags":            ["git", "environment"]
+
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/${TAG}"
+          ICON_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/assets/icon.png"
+          DESCRIPTION_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/description.md"
+
+          # Fetch the release's generated notes for the changelog field. This
+          # call is explicitly guarded (never a bare `gh api ...` relying on
+          # `set -e` to abort the step) -- a failed fetch must warn and omit
+          # the changelog, never abort the dispatch itself.
+          HAVE_CHANGELOG=false
+          CHANGELOG=""
+          if ! RAW_CHANGELOG=$(gh api "repos/${REPO}/releases/generate-notes" -f tag_name="${TAG}" --jq '.body' 2>&1); then
+            echo "::warning::Failed to fetch generated release notes for tag ${TAG}; omitting changelog from the marketplace dispatch payload."
+          else
+            # Trim leading/trailing whitespace via jq's regex engine, not a
+            # bash extglob pattern -- `${VAR##+([[:space:]])}` is
+            # catastrophically slow (multi-second-plus) on changelog bodies
+            # in the tens of thousands of characters.
+            TRIMMED_CHANGELOG=$(printf '%s' "$RAW_CHANGELOG" | jq -Rsj 'gsub("^[[:space:]]+|[[:space:]]+$"; "")')
+            if [ -z "$TRIMMED_CHANGELOG" ] || [ "$TRIMMED_CHANGELOG" = "null" ]; then
+              echo "::warning::Generated release notes for tag ${TAG} are empty/null; omitting changelog from the marketplace dispatch payload."
+            else
+              HAVE_CHANGELOG=true
+              CHANGELOG="$RAW_CHANGELOG"
+            fi
+          fi
+
+          # The changelog body is read from a temp file via --rawfile, not
+          # passed as a --arg -- a large-enough release-notes body (tens of
+          # thousands of chars) as a literal argv value overflows the OS
+          # argument-list limit ("Argument list too long"), which --rawfile
+          # (reads the content from disk) never hits.
+          CHANGELOG_FILE=$(mktemp)
+          trap 'rm -f "$CHANGELOG_FILE"' EXIT
+          printf '%s' "$CHANGELOG" > "$CHANGELOG_FILE"
+
+          # GitHub's repository_dispatch client_payload allows at most 10
+          # top-level properties; changelog is the 10th (name, description,
+          # repo, category, version, ref, icon, description_url, tags = 9
+          # already present). Any future field must nest under an existing
+          # object rather than adding an 11th key.
+          jq -n -c \
+            --arg name "$NAME" \
+            --arg description "$DESC" \
+            --arg repo "$REPO" \
+            --arg version "$VERSION" \
+            --arg ref "$TAG" \
+            --arg icon "$ICON_URL" \
+            --arg description_url "$DESCRIPTION_URL" \
+            --rawfile changelog "$CHANGELOG_FILE" \
+            --argjson have_changelog "$HAVE_CHANGELOG" \
+            --argjson max_changelog_len 30000 \
+            --arg release_url "$RELEASE_URL" \
+            '
+            def truncated_changelog:
+              if (. | length) > $max_changelog_len then
+                .[0:$max_changelog_len] + "\n\n...truncated — see the full release notes: " + $release_url
+              else
+                .
+              end;
+            {
+              event_type: "plugin-release",
+              client_payload: (
+                {
+                  name: $name,
+                  description: $description,
+                  repo: $repo,
+                  category: "mcp",
+                  version: $version,
+                  ref: $ref,
+                  icon: $icon,
+                  description_url: $description_url,
+                  tags: ["git", "environment"]
+                }
+                + (if $have_changelog then { changelog: ($changelog | truncated_changelog) } else {} end)
+              )
             }
-          }
-          EOF
+            ' | curl -fsSL -X POST \
+              -H "Authorization: Bearer $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+              -d @-
