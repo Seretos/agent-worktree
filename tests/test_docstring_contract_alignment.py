@@ -27,6 +27,7 @@ modules).
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from pathlib import Path
@@ -38,6 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
+PYPROJECT_TOML = REPO_ROOT / "pyproject.toml"
+THREAD_LEAK_TEST = REPO_ROOT / "tests" / "test_thread_leak_regression.py"
+TIMEOUT_CONFIG_TEST = REPO_ROOT / "tests" / "test_pytest_timeout_config.py"
 
 
 def _normalize(text: str) -> str:
@@ -1197,3 +1201,226 @@ def test_skill_md_states_force_true_is_normal_teardown_not_emergency():
         "checkout needing force=True is expected/normal/routine, not an "
         "emergency override"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q3, #111 half): the daemon-thread-leak narrative in
+# tests/test_thread_leak_regression.py, pyproject.toml's timeout rationale
+# comment, tests/test_pytest_timeout_config.py's module docstring, and
+# AGENTS.md's chunk table all still describe the leak as a live, unbounded
+# defect measured against v0.3.11 -- falsified by upstream ticket #148
+# (shipped in the now-pinned v0.3.12), which introduces a persistent bounded
+# query worker (_persistent_query_worker/_handle_scan_lock, capped by
+# _handle_scan_max_live_workers) closing the residual per-scan leak. This
+# block's four driving tests gate that rewrite; mirrors this file's existing
+# _R176_SIGNAL_FORBIDDEN block's shape and reuses _normalize/
+# _sentence_containing.
+# ---------------------------------------------------------------------------
+
+
+def _module_docstring(path: Path) -> str:
+    """Return the raw (``ast.get_docstring``, default ``clean=True``) module
+    docstring of the Python source file at *path* -- preserves blank-line
+    paragraph breaks (unlike this file's whitespace-collapsing
+    ``_normalize``), which the History-confinement checks below need."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    doc = ast.get_docstring(tree)
+    assert doc, f"{path} has no module docstring"
+    return doc
+
+
+def test_thread_leak_tests_are_no_longer_xfail():
+    """Behavioural requirement 1 (plan): the leak tests must stop being
+    ``xfail`` once the v0.3.12 measurement plateaus. Scoped deliberately to
+    the marker/decorator usage (``@pytest.mark.xfail`` and the
+    ``_XFAIL_REASON`` constant), not a bare ``"xfail" not in source"`` --
+    a legitimately labelled historical mention of the word inside the
+    rewritten History paragraph must not be forbidden (the same pattern
+    already accepted in ``tests/test_signal_resilience.py``). The survivor
+    assertions prove the flip cannot be achieved by deleting or weakening
+    the tests themselves.
+
+    Expected RED reason: the file today contains
+    ``@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)`` (line 306), a
+    second ``@pytest.mark.xfail(`` decorator (line 473), and
+    ``_XFAIL_REASON = (`` (line 257) -- all verified present at plan/test
+    time.
+    """
+    source = THREAD_LEAK_TEST.read_text(encoding="utf-8")
+
+    assert "@pytest.mark.xfail" not in source
+    assert "_XFAIL_REASON" not in source
+
+    # Survivors: the flip must not be achieved by deleting or weakening the
+    # tests themselves.
+    assert "skipif(" in source
+    assert "timeout(300)" in source
+    assert "growth <= 2" in source
+
+
+_THREAD_LEAK_FORBIDDEN = (
+    "still xfail (never xpass",
+    "both xfail, matching v0.3.3's originally measured shape",
+    "today's leak is linear and unbounded from the very first call",
+)
+
+_THREAD_LEAK_REQUIRED_ANY = ("_persistent_query_worker", "_handle_scan_lock")
+
+# "v0.3.1" is deliberately checked with a "not followed by another digit"
+# guard (see `_history_token_pattern`) rather than plain substring
+# containment -- "v0.3.1" is itself a substring of "v0.3.10"/"v0.3.11"/
+# "v0.3.12", so a naive `"v0.3.1" not in block` check would misfire against
+# the v0.3.12 lead paragraph that every GREEN rewrite must contain.
+_THREAD_LEAK_HISTORY_TOKENS = (
+    "v0.3.1",
+    "v0.3.3",
+    "v0.3.10",
+    "v0.3.11",
+    "teardown.py:666",
+    "teardown.py:693",
+)
+
+_THREAD_LEAK_HISTORY_TICKET_LINKS = ("#114", "#159", "#169")
+
+
+def _history_token_pattern(token: str) -> "re.Pattern[str]":
+    return re.compile(re.escape(token) + r"(?!\d)")
+
+
+def test_thread_leak_module_docstring_describes_v0_3_12_state():
+    """Behavioural requirement 2 (plan): the module docstring must lead with
+    the v0.3.12/#148 state (citing the upstream ticket, the new bounded-
+    worker internals, and the re-measured ``growth_series=``) and confine
+    the v0.3.1..v0.3.11 narrative to a single labelled History block that
+    keeps its ticket links. Also repairs the #112 cross-reference paragraph
+    to cite upstream PR #151.
+
+    Expected RED reason: the docstring today contains every forbidden phrase
+    verbatim (the v0.3.11 doubled-rate paragraph, the v0.3.10 paragraph, and
+    the "Known limitation" paragraph) and zero occurrences of "v0.3.12"
+    (grep-verified: 0 hits repo-wide in this file) -- the first forbidden-
+    phrase assertion below fails immediately. Separately, "history" occurs
+    zero times in the docstring today (grep-verified), so the
+    exactly-one-History-block check would also fail (0 != 1) once reached.
+    """
+    raw_doc = _module_docstring(THREAD_LEAK_TEST)
+    norm = _normalize(raw_doc)
+
+    for forbidden in _THREAD_LEAK_FORBIDDEN:
+        assert forbidden not in norm, (
+            f"falsified upstream-defect phrase must be removed: {forbidden!r}"
+        )
+
+    assert "v0.3.12" in norm
+    assert "seretos/lib-python-worktree#148" in norm
+    assert any(tok in norm for tok in _THREAD_LEAK_REQUIRED_ANY), (
+        f"docstring must mention one of {_THREAD_LEAK_REQUIRED_ANY}"
+    )
+    assert "_handle_scan_max_live_workers" in norm
+    assert "teardown.py:732" in norm
+
+    v0312_idx = norm.index("v0.3.12")
+    assert v0312_idx < 800, f"v0.3.12 must lead the docstring (found at {v0312_idx})"
+    for older in ("v0.3.3", "v0.3.10", "v0.3.11"):
+        if older in norm:
+            assert v0312_idx < norm.index(older), (
+                f"v0.3.12 must precede {older!r} in the docstring"
+            )
+
+    # History-confinement: split the *raw* (blank-line-preserving) docstring
+    # into paragraphs -- _normalize collapses "\n\n" into a single space, so
+    # this check deliberately does not use it.
+    blocks = [b for b in raw_doc.split("\n\n") if b.strip()]
+    history_blocks = [b for b in blocks if "history" in b.lower()]
+    assert len(history_blocks) == 1, (
+        f"expected exactly one History block, found {len(history_blocks)}"
+    )
+    history_block = history_blocks[0]
+    assert len(history_block) <= 900, (
+        f"History block too long ({len(history_block)} chars)"
+    )
+
+    non_history_blocks = [b for b in blocks if b is not history_block]
+    for token in _THREAD_LEAK_HISTORY_TOKENS:
+        pattern = _history_token_pattern(token)
+        for block in non_history_blocks:
+            assert not pattern.search(block), (
+                f"{token!r} must be confined to the History block, found "
+                f"elsewhere: {block[:80]!r}..."
+            )
+
+    assert any(link in history_block for link in _THREAD_LEAK_HISTORY_TICKET_LINKS), (
+        "History block must keep at least one prior-bump ticket link "
+        f"({_THREAD_LEAK_HISTORY_TICKET_LINKS})"
+    )
+
+    growth_match = re.search(r"growth_series=\[([0-9,\s]*)\]", raw_doc)
+    assert growth_match is not None, (
+        "the v0.3.12 section must cite a freshly measured growth_series=[...]"
+    )
+    growth_values = [int(v) for v in growth_match.group(1).split(",") if v.strip()]
+    assert growth_values, "growth_series literal must not be empty"
+    assert max(growth_values) <= 2
+
+    send_sentence = _sentence_containing(norm, "_send_graceful_signal")
+    assert "#151" in send_sentence, (
+        "the sentence mentioning _send_graceful_signal must also cite #151"
+    )
+
+
+def test_timeout_rationale_is_not_falsified():
+    """Behavioural requirement 3 (plan): the pytest-timeout rationale stops
+    citing a live, untracked-down upstream leak. Checks two *scoped*
+    regions, not two whole files -- a whole-file check on pyproject.toml
+    would trivially pass because the v0.3.12 pin already sits on line 15,
+    which would make the test worthless against an untouched rationale
+    comment.
+
+    Expected RED reason: ``pyproject.toml``'s comment block (between
+    ``addopts = `` and ``timeout = 60``) contains "...useful diagnostics for
+    tracking down the upstream leak." and no "v0.3.12"/"#148" inside that
+    slice; ``tests/test_pytest_timeout_config.py``'s module docstring opens
+    with "The suite has a load-dependent daemon-thread leak" -- both
+    verified present verbatim at plan/test time.
+    """
+    pyproject_raw = PYPROJECT_TOML.read_text(encoding="utf-8")
+    start = pyproject_raw.index("addopts = ")
+    end = pyproject_raw.index("timeout = 60")
+    rationale_slice = pyproject_raw[start:end]
+
+    assert "tracking down the upstream leak" not in rationale_slice
+    assert "v0.3.12" in rationale_slice
+    assert "#148" in rationale_slice
+    assert "backstop" in rationale_slice or "defence-in-depth" in rationale_slice
+
+    # Survivors, checked against the whole file (unambiguous, not scope-
+    # sensitive the way the forbidden/required tokens above are).
+    assert "timeout = 60" in pyproject_raw
+    assert "#105" in pyproject_raw
+
+    timeout_doc = _normalize(_module_docstring(TIMEOUT_CONFIG_TEST))
+
+    assert "the suite has a load-dependent daemon-thread leak" not in timeout_doc
+    assert "v0.3.12" in timeout_doc
+    assert "#148" in timeout_doc
+    assert "backstop" in timeout_doc or "defence-in-depth" in timeout_doc
+    assert "#105" in timeout_doc
+
+
+def test_agents_md_suite_counts_carry_no_xfail_status():
+    """Behavioural requirement 4 (plan): ``AGENTS.md``'s chunk table must
+    carry no stale XFAIL/XPASS status once the markers are flipped --
+    scanned across the *entire* file (safe because ``AGENTS.md`` already
+    delegates all leak-test status to the module docstring elsewhere, so any
+    xfail/xpass token left in this file is by construction a re-divergence).
+    Also asserts the leak-test file citation survives, so the fix cannot be
+    achieved by deleting the table row that names it.
+
+    Expected RED reason: ``AGENTS.md:362`` reads "58 passed + 2 xfailed" and
+    ``:364`` reads "454 passed + 2 xfailed" (grep-verified: these are the
+    only two ``xfail``/``xpass`` hits in the whole file today).
+    """
+    agents_raw = AGENTS_MD.read_text(encoding="utf-8")
+
+    assert not re.search(r"x(?:fail|pass)", agents_raw, re.IGNORECASE)
+    assert "tests/test_thread_leak_regression.py" in agents_raw
