@@ -65,6 +65,22 @@ in this checkout) has exactly this gap:
   before calling ``os.kill(..., CTRL_BREAK_EVENT)``. That asymmetry is the
   defect.
 
+Status at v0.3.12 (ticket #176)
+--------------------------------
+Upstream PR #151, shipped in the now-pinned v0.3.12, closed the gap
+described above: ``_send_graceful_signal`` gained a ``group_leader``
+keyword and now refuses/skips issuing ``CTRL_BREAK_EVENT`` at all unless
+the caller has confirmed process-group leadership, bringing Windows to
+parity with the POSIX guard already described below. The investigation
+record above (written against v0.3.11) is kept as-is for its historical
+and diagnostic value; the engine-side "no check"/"no equivalent guard"
+language it uses describes that pinned version, not the current one. This
+plugin's own SIGBREAK handler (``worktree_plugin.server``) remains
+installed as a backstop / defence-in-depth layer rather than the sole
+mitigation -- see its docstring for the current framing. The tests below
+continue to guard this plugin's own handler and remain valid regardless
+of the engine-side fix.
+
 Manual repro recipe (outside pytest, for a future reader chasing a pin
 bump): start any long-lived Windows console process (e.g.
 ``python -c "import time; time.sleep(60)"``) without

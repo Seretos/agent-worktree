@@ -263,7 +263,7 @@ name their target — pass one or the other (or both, if they agree):
   chars), plus the first 8 hex characters of a SHA-256 hash of its resolved path (no
   repo slug and no branch slug are involved) — and that id can never resolve via
   `environment_id` — pass the checkout's `path` (from `environment_list`) as
-  `checkout_path` instead. See "Orphan worktree recovery" below for the full recipe.
+  `checkout_path` instead. See the orphan-checkout recovery recipe below for the full walkthrough.
 
 Passing both is fine only when they agree — a mismatch raises `ValueError`. Passing
 neither also raises `ValueError`. This resolution is entirely the *engine's* job, not
@@ -472,10 +472,13 @@ what happened. Read them only from the response of the call that produced
 them.
 
 **What this does and does not fix.** The transport drop itself is outside this
-plugin's reach. The Windows `SIGBREAK` guard (ticket #112) addresses one
-mechanism — a server killed by a `CTRL_BREAK_EVENT` during a stop/remove — and
-is already in place; it does not eliminate transport drops, and it does not
-explain a dropped *first* `environment_start` call, which fails during argument
+plugin's reach. As of the pinned v0.3.12, the engine's own
+`_send_graceful_signal` refuses/skips `CTRL_BREAK_EVENT` delivery to a
+non-group-leader pid (upstream PR #151), closing the mechanism ticket #112
+originally pinned; this plugin's Windows `SIGBREAK` guard remains installed
+as a backstop / defence-in-depth layer on top of that engine-side fix, not
+the only mitigation, and is already in place; it does not eliminate transport
+drops, and it does not explain a dropped *first* `environment_start` call, which fails during argument
 resolution before any signal code runs at all.
 
 **Orphan worktree recovery**
@@ -588,7 +591,11 @@ running under the given `role`).
    `ValueError` listing the available names instead of silently picking
    one. Check `worktree_create`'s returned `start_variants` field (or this
    contract's `start:` list) up front and pass `variant=<name>` explicitly
-   whenever more than one step exists.
+   whenever more than one step exists. Note the divergence: `worktree_create`'s
+   `start_variants` is purely the contract's declared names, while
+   `environment_list`'s own `start_variants` key is engine-populated and may
+   include the synthesised `"default"` entry when a fallback tier is
+   reachable.
 10. **A dirty checkout needing `force=True` at teardown is normal, not an
     emergency.** After `setup:`/`start:` steps run, the checkout typically
     holds generated files or uncommitted changes; `worktree_remove(force=True)`

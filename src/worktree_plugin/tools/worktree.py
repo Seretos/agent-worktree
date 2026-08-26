@@ -66,6 +66,7 @@ from lib_python_worktree import (
     WorktreeNotFoundError,
     WorktreeRecord,
     WorktreeRemovalBlockedError,
+    available_variants,
     classify_checkout,
     load as load_contract,
     primary_id_for,
@@ -403,10 +404,13 @@ def _start_step_names(repo_root: str) -> Optional[List[str]]:
     discovering them from an ``UnknownVariantError`` on the first failed
     call.
 
-    This is a byte-for-byte mirror of the engine's own ``available``
-    computation in ``UnknownVariantError`` (``[s.name for s in
-    contract.start if s.name]``) -- unnamed steps are deliberately excluded,
-    exactly as the engine excludes them from its own error message.
+    Delegates the reachability/ordering computation to the engine's own
+    ``available_variants(contract.start)`` (ticket #176, v0.3.12), then
+    projects the result down to only the contract-declared step names --
+    filtering out the synthesised ``"default"`` entry ``available_variants``
+    may append for a reachable fallback tier. Unnamed steps are deliberately
+    excluded from the declared set, exactly as the engine excludes them from
+    its own ``UnknownVariantError`` message.
 
     Sentinel semantics -- the two ``None``/``[]`` return values are NOT
     interchangeable:
@@ -438,7 +442,8 @@ def _start_step_names(repo_root: str) -> Optional[List[str]]:
         if not contract_path.exists():
             return None
         contract = load_contract(contract_path)
-        return [s.name for s in contract.start if s.name]
+        declared = {s.name for s in contract.start if s.name}
+        return [v for v in available_variants(contract.start) if v in declared]
     except (OSError, ContractError):
         return None
 
@@ -764,8 +769,13 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           *named* ``start:`` steps (e.g. ``isolation: none``, an empty
           ``start:`` list, or a ``start:`` list whose entries are all
           unnamed) -- these two states are deliberately distinct and must
-          not be conflated. This is purely the contract's declared names,
-          **not** a prediction of which step a bare
+          not be conflated. This is purely the contract's declared names.
+          Contrast this with ``environment_list``'s own ``start_variants``
+          key, which is engine-populated and may include the synthesised
+          ``"default"`` entry when a fallback tier is reachable --
+          ``worktree_create``'s ``start_variants`` here never does, since
+          it is derived purely from the contract's declared step names.
+          It is **not** a prediction of which step a bare
           ``variant="default"`` call to ``environment_start`` will
           actually select -- see that tool's docstring for the three-tier
           resolution rule.
@@ -983,6 +993,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         # environment_start call. Read from record.repo_root (never the
         # caller's repo_root argument) -- the engine may have re-rooted it,
         # per the warning block above.
+        #
+        # Ticket #176 (v0.3.12): this explicit override now matters more
+        # than it used to. `asdict(record)` (see `_record_to_dict` above)
+        # already populates a `start_variants` key straight off
+        # `WorktreeRecord.start_variants`, which the engine itself computes
+        # via `available_variants()` and which may include the synthesised
+        # `"default"` entry. Without this override, `worktree_create`'s
+        # response would silently inherit that engine-side value instead of
+        # `_start_step_names`'s declared-names-only projection -- the two
+        # are no longer definitionally identical now that the engine's own
+        # computation can add a tier the wrapper's contract never declared.
         result["start_variants"] = _start_step_names(record.repo_root)
 
         # WP #165 R4: surface the WORKTREE_* env var names the engine will

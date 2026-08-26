@@ -40,6 +40,7 @@ worktree_create(repo_root: str, branch: str, base: Optional[str] = None) -> dict
 - `path` — absolute checkout location under `<store_root>/<repo_slug>/<id>/` where `store_root` defaults to `~/agent-worktree-store` or the value of `$WORKTREE_STORE_ROOT`.
 - `ports` — dict mapping port name to host port number; `{}` for `isolation: none` worktrees or before setup runs.
 - `warning` (optional) — present when `repo_root` was silently re-rooted; contains the original and resolved paths.
+- `start_variants` (always present, unlike `warning`) — the raw list of *named* `start:` step names declared by the contract (unnamed steps excluded); `None` when there is no contract file to read or it exists but couldn't be read/parsed, `[]` when the contract was read successfully but declares no named `start:` steps. This is purely the contract's declared names — contrast with `environment_list`'s own `start_variants` key, which is engine-populated and may include the synthesised `"default"` entry when a fallback tier is reachable; `worktree_create`'s value here never does.
 
 **Errors:** raises `ValueError` (surfaces to the caller as a tool error) for any `WorktreeError` — e.g. branch conflicts or filesystem failures. Retrying a create whose response was lost raises a duplicate error that names the landed environment inline: `(existing_environment_id: "<id>", existing_path: "<path>")` (ticket #116) — best-effort only: when the landed record's lookup misses or raises, only the engine's own bare "already exists" text is raised and no id is invented.
 
@@ -210,13 +211,15 @@ The server uses a persistent, disk-backed state store (`~/.agent-worktree/state.
 
 ## Signal handling on Windows
 
-Ticket #112 ("Connection closed (intermittent)"): the pinned `lib-python-worktree` engine's `_send_graceful_signal` (`process_lifecycle.py:819-836`, verified against v0.3.11) sends `CTRL_BREAK_EVENT` via `os.kill(pid, signal.CTRL_BREAK_EVENT)` to non-group-leader pids from two call sites — `_kill_process_tree` (`process_lifecycle.py:1579`, verified against v0.3.11; reached from the redesigned teardown module's `_phase_stop_processes`) and the `environment_stop(kill_orphans=True)` orphan scan inside `_kill_blocking_processes` (`process_lifecycle.py:3165`, verified against v0.3.11). On Windows, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — what that `os.kill` call maps to — takes a *process group id*, not an arbitrary pid; sent to a non-group-leader, the OS is free to deliver it elsewhere on the same console, including back to this MCP server itself. `_spawn_detached` (`process_lifecycle.py:441`, comment at `469-479`, verified against v0.3.11) deliberately keeps the spawned child attached to the server's own console (no `DETACHED_PROCESS`, so ctrl-break delivery to the *intended* child stays possible at all) — the tradeoff that makes the stray-delivery-back-to-the-server failure mode reachable. POSIX already guards this exact class of mistake in `_signal_process_group` (`process_lifecycle.py:1416-1453`, verified against v0.3.11; refuses to signal a non-leader or the caller's own group); Windows has no equivalent guard in the engine today.
+Ticket #112 ("Connection closed (intermittent)"): before the v0.3.12 pin, the `lib-python-worktree` engine's `_send_graceful_signal` (`process_lifecycle.py:819-836`, verified against v0.3.11) sent `CTRL_BREAK_EVENT` via `os.kill(pid, signal.CTRL_BREAK_EVENT)` to non-group-leader pids from two call sites — `_kill_process_tree` (`process_lifecycle.py:1579`, verified against v0.3.11; reached from the redesigned teardown module's `_phase_stop_processes`) and the `environment_stop(kill_orphans=True)` orphan scan inside `_kill_blocking_processes` (`process_lifecycle.py:3165`, verified against v0.3.11). On Windows, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` — what that `os.kill` call maps to — takes a *process group id*, not an arbitrary pid; sent to a non-group-leader, the OS was free to deliver it elsewhere on the same console, including back to this MCP server itself. `_spawn_detached` (`process_lifecycle.py:441`, comment at `469-479`, verified against v0.3.11) deliberately kept the spawned child attached to the server's own console (no `DETACHED_PROCESS`, so ctrl-break delivery to the *intended* child stayed possible at all) — the tradeoff that made the stray-delivery-back-to-the-server failure mode reachable. POSIX already guarded this exact class of mistake in `_signal_process_group` (`process_lifecycle.py:1416-1453`, verified against v0.3.11; refuses to signal a non-leader or the caller's own group). **As of the pinned v0.3.12, upstream PR #151 closed the Windows gap too:** `_send_graceful_signal` gained a `group_leader` keyword-only parameter and now refuses/skips issuing `CTRL_BREAK_EVENT` at all unless the caller has confirmed process-group leadership, bringing Windows to parity with the POSIX guard above.
 
-**This plugin's mitigation:** `worktree_plugin.server` installs a `SIGBREAK` handler (`_install_signal_guards()`, called from `main()` before `mcp.run()`) that logs and swallows a received `CTRL_BREAK_EVENT` instead of letting Python's default disposition terminate the process. It is a no-op on POSIX (no `SIGBREAK` there). **`SIGINT` is deliberately left completely unchanged/untouched** — this guard never calls `signal.signal` for it, and Ctrl+C keeps working exactly as before.
+**This plugin's backstop (defence-in-depth):** `worktree_plugin.server` installs a `SIGBREAK` handler (`_install_signal_guards()`, called from `main()` before `mcp.run()`) that logs and swallows a received `CTRL_BREAK_EVENT` instead of letting Python's default disposition terminate the process. It is a no-op on POSIX (no `SIGBREAK` there). As of v0.3.12 this handler is a defence-in-depth layer on top of the engine's own group-leader guard, not the only mitigation in play. **`SIGINT` is deliberately left completely unchanged/untouched** — this guard never calls `signal.signal` for it, and Ctrl+C keeps working exactly as before.
 
-**Tradeoff, by design:** the guard swallows *every* `SIGBREAK`/`CTRL_BREAK_EVENT` unconditionally, including a hypothetical legitimate one aimed at this process itself (an operator's own Ctrl+Break, or a launcher/supervisor that might use it for graceful teardown). Windows carries no metadata on the signal that distinguishes "stray, meant for a child sharing our console" from "intentional, meant for us" — there is no way to swallow only the former, so this is an unavoidable consequence of the chosen approach, not a bug to code around. It is accepted because it loses no legitimate capability: the supported ways to stop this server are (a) the MCP host closing stdin or killing the process, and (b) `SIGINT` (Ctrl+C) for interactive use. `CTRL_BREAK_EVENT` is never a supported shutdown signal for this server.
+**Tradeoff, by design:** the guard swallows *every* `SIGBREAK`/`CTRL_BREAK_EVENT` it receives, including a hypothetical legitimate one aimed at this process itself (an operator's own Ctrl+Break, or a launcher/supervisor that might use it for graceful teardown). Windows carries no metadata on the signal that distinguishes "stray, meant for a child sharing our console" from "intentional, meant for us" — there is no way to swallow only the former, so this remains an unavoidable consequence of the chosen approach, not a bug to code around, even now that the engine's own guard makes the stray case rarer. It is accepted because it loses no legitimate capability: the supported ways to stop this server are (a) the MCP host closing stdin or killing the process, and (b) `SIGINT` (Ctrl+C) for interactive use. `CTRL_BREAK_EVENT` is never a supported shutdown signal for this server.
 
-**Upstream recommendation (not implemented in this repo):** the correct fix belongs in `lib-python-worktree` itself — `_send_graceful_signal` should refuse (or route around) sending `CTRL_BREAK_EVENT` to a pid that is not confirmed to be the leader of its own process group, mirroring the POSIX guard already in `_signal_process_group`. See `tests/test_signal_resilience.py`'s module docstring in this repo for the full executable evidence and exact source citations.
+**Upstream fix landed in v0.3.12 (PR #151).** `_send_graceful_signal` now refuses (skips) sending `CTRL_BREAK_EVENT` to a pid that is not confirmed to be the leader of its own process group, mirroring the POSIX guard already in `_signal_process_group` — exactly the fix this document previously described as unimplemented. See `tests/test_signal_resilience.py`'s module docstring in this repo for the full executable evidence and exact source citations, including its own v0.3.12 status update.
+
+**History.** This repo's own already-closed thread-leak ticket (unrelated to upstream's numbering -- see `tests/test_thread_leak_regression.py`) was mitigated by pinning v0.3.3 → #112 (this stray-`CTRL_BREAK_EVENT` defect, mitigated in-repo by the SIGBREAK guard above and, at the source-dependency level, by upstream PR #151) → #116 ("Connection closed" / lost responses, a partially-overlapping symptom, see below -- the relevant fix has not shipped in any released build, see the build-provenance note below) → #159 and #169 (follow-up investigation and hardening of this plugin's signal-handling story) → #176 (this pin bump to v0.3.12, which brings in upstream PR #151's group-leader guard at the source-dependency level and retires the "upstream recommendation, not implemented" framing above).
 
 ## Transport-level failures ("Connection closed")
 
@@ -226,11 +229,15 @@ landed. Two sub-symptoms have been reported (ticket #116):
 
 **Masked success on a stop/remove.** `environment_stop` and `worktree_remove`
 both traverse `_send_graceful_signal` (via `_kill_process_tree` and teardown) --
-the exact call sites ticket #112 pinned. The server dies after the state
-mutation, before the response is written, so the caller sees a transport error
-for an operation that fully succeeded. This is *consistent with* the #112
-mechanism above (it is Windows-only: `CTRL_BREAK_EVENT` has no POSIX analogue
-on this path); it is not per-incident proof for any individual report.
+the exact call sites ticket #112 pinned (before v0.3.12). If the server died
+after the state mutation but before the response was written, the caller
+would see a transport error for an operation that fully succeeded. This was
+*consistent with* the pre-v0.3.12 #112 mechanism above (it is Windows-only:
+`CTRL_BREAK_EVENT` has no POSIX analogue on this path); it was not per-incident
+proof for any individual report, and as of v0.3.12 the underlying group-leader
+gap that made it possible is closed upstream (see above) -- though a lost
+response from *some* transport-level cause remains generically possible, which
+is why the read-back recipe below still applies regardless of root cause.
 
 **A first `environment_start` invocation that drops. NOT explained by #112.**
 `environment_start()` called with neither `environment_id` nor `checkout_path`
@@ -351,10 +358,10 @@ below, one after another, each as its own foreground `pytest` call.
 | Chunk | Files / selector | Tests | Measured (local Windows) |
 | --- | --- | --- | --- |
 | 1 | `tests/test_environment_tools.py` | 120 | 266 s |
-| 2 | `tests/test_worktree_tools.py` | 125 | 118 s |
+| 2 | `tests/test_worktree_tools.py` | 130 | 214 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 58 passed + 2 xfailed | 290 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 115 | 1 s |
-| **Total** | all 14 `tests/test_*.py` files | 418 passed + 2 xfailed | **675 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 146 | 7 s |
+| **Total** | all 14 `tests/test_*.py` files | 454 passed + 2 xfailed | **777 s** |
 
 **Chunk 4 dependency note.** `tests/test_release_dispatch_payload.py` has a
 `requires_bash_and_jq`-gated "layer (b)" of 18 tests (of its 34 total) that
@@ -426,7 +433,8 @@ second combined. Chunk 3 is the most skewed: two tests in
 `tests/test_thread_leak_regression.py` alone
 (`test_create_remove_cycles_do_not_leak_threads` at ~171 s and
 `test_create_remove_cycles_with_kill_blocking_processes_do_not_leak_threads`
-at ~106 s — both XFAIL, see the thread-leak note above) account for ~277 s of
+at ~106 s — status per `tests/test_thread_leak_regression.py`'s own module
+docstring, not repeated here) account for ~277 s of
 that chunk's ~290 s total; the other five files in chunk 3 are fast. Chunk 4
 is flat and fast throughout, with no cluster.
 

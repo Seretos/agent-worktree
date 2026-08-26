@@ -27,6 +27,7 @@ modules).
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from pathlib import Path
@@ -38,6 +39,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
+PYPROJECT_TOML = REPO_ROOT / "pyproject.toml"
+THREAD_LEAK_TEST = REPO_ROOT / "tests" / "test_thread_leak_regression.py"
+TIMEOUT_CONFIG_TEST = REPO_ROOT / "tests" / "test_pytest_timeout_config.py"
 
 
 def _normalize(text: str) -> str:
@@ -427,6 +431,190 @@ def test_worktree_remove_untracked_recipe_warns_force_for_uncommitted_changes():
     sentence = _sentence_containing(region, "uncommitted")
     assert "force=true" in sentence
     assert re.search(r"\b(may|must|need)\b", sentence)
+
+
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q2 spillover, R3): worktree_create's own start_variants may
+# include a synthesised "default" entry (the v0.3.12 engine's
+# available_variants fallback-tier projection) that a subsequent
+# environment_list-sourced record does not necessarily carry the same way --
+# this create-vs-record divergence must be documented on three surfaces.
+# ---------------------------------------------------------------------------
+
+_R176_REQUIRED_TOKENS = ("start_variants", "environment_list", '"default"')
+_R176_ENGINE_TOKENS = ("engine", "upstream")
+_R176_PHRASING = re.compile(r"may include|can include|includes")
+
+
+def test_start_variants_create_vs_record_divergence_documented_on_three_surfaces():
+    """R3 driving test (ticket #176, Q2 spillover): the create-vs-record
+    `start_variants` divergence must be documented in all three of:
+    `worktree.py`'s `start_variants` bullet (inside the existing R5 region,
+    756-789), `AGENTS.md` (either the `worktree_create` or `environment_list`
+    section), and `skills/worktree/SKILL.md` (near its `start_variants`
+    mention around 583-591).
+
+    Expected RED reason: none of the three sources currently mentions this
+    divergence -- `environment_list` is required token, and none of the two
+    Markdown sources currently pairs `environment_list` with `start_variants`
+    in the same breath (the worktree.py region doesn't mention
+    `environment_list` at all, and neither AGENTS.md nor SKILL.md's
+    `start_variants` mentions pair it with `"default"` plus an
+    engine/upstream attribution and `may include`/`can include`/`includes`
+    phrasing).
+    """
+    worktree_doc = _normalize(_get_tool_docstring("worktree_create"))
+    ws_start = worktree_doc.index(_R5_REGION_START)
+    ws_end = worktree_doc.index(_R5_REGION_END)
+    worktree_region = worktree_doc[ws_start:ws_end]
+
+    agents_text = _normalize(AGENTS_MD.read_text(encoding="utf-8"))
+    skill_text = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+
+    # The worktree_region slice starts at the literal marker string
+    # "start_variants (always present, unlike warning)" (_R5_REGION_START),
+    # so a bare `"start_variants" in worktree_region` check would be
+    # tautologically true regardless of content -- the slice always begins
+    # with that substring. Instead, require a SECOND `start_variants`
+    # occurrence (the divergence note re-mentioning the key by name, beyond
+    # the marker itself) with `environment_list` nearby, proving the note
+    # genuinely links the two keys rather than the two tokens merely
+    # appearing somewhere, unrelated, in the same region.
+    second_start_variants_idx = worktree_region.find(
+        "start_variants", len(_R5_REGION_START)
+    )
+    assert second_start_variants_idx != -1, (
+        "worktree.py start_variants bullet (R5 region) must mention "
+        "start_variants a second time (beyond the region marker) as part "
+        "of the divergence note"
+    )
+    proximity_window = worktree_region[
+        max(0, second_start_variants_idx - 300) : second_start_variants_idx + 300
+    ]
+    assert "environment_list" in proximity_window, (
+        "worktree.py start_variants bullet (R5 region) must re-mention "
+        "start_variants near environment_list to link the two keys"
+    )
+
+    for label, text in (
+        ("worktree.py start_variants bullet (R5 region)", worktree_region),
+        ("AGENTS.md", agents_text),
+        ("skills/worktree/SKILL.md", skill_text),
+    ):
+        tokens = _R176_REQUIRED_TOKENS
+        if label == "worktree.py start_variants bullet (R5 region)":
+            # "start_variants" is excluded here: it is checked above via the
+            # proximity assertion instead of a bare membership check, since
+            # membership alone is tautological for this particular slice.
+            tokens = tuple(t for t in tokens if t != "start_variants")
+        for token in tokens:
+            assert token in text, f"{label} must mention {token!r}"
+        assert any(tok in text for tok in _R176_ENGINE_TOKENS), (
+            f"{label} must attribute the synthesised \"default\" entry to "
+            f"the engine/upstream"
+        )
+        assert _R176_PHRASING.search(text), (
+            f"{label} must use 'may include'/'can include'/'includes' phrasing"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q1, R4): the falsified "live upstream defect" narrative for
+# the Windows CTRL_BREAK guard is gone -- upstream PR #151 (v0.3.12) added
+# the engine's own group-leader guard, so this plugin's SIGBREAK handler is
+# now defence-in-depth, not the only mitigation.
+# ---------------------------------------------------------------------------
+
+_R176_SIGNAL_FORBIDDEN = (
+    "calls this on non-group-leader pids from two call sites",
+    "no check",
+    "no equivalent guard",
+    "is the fix",
+)
+
+
+def test_signal_guard_docstrings_describe_v0_3_12_engine_guard():
+    """R4 driving test #1 (ticket #176, Q1): `server._ignore_and_log` and
+    `server._install_signal_guards`'s docstrings must stop describing the
+    engine as having "no check"/"no equivalent guard" against non-group-
+    leader `CTRL_BREAK_EVENT` delivery -- upstream PR #151 (shipped in the
+    pinned v0.3.12) added exactly that guard. The docstrings must instead
+    describe this plugin's own SIGBREAK handler as a backstop/defence-in-
+    depth layered on top of the engine's own fix, while the untouched
+    `SIGINT` and `Tradeoff` paragraphs survive verbatim.
+
+    Expected RED reason: today's docstrings still contain the falsified
+    forbidden phrases (verified directly: `_ignore_and_log.__doc__` contains
+    "calls this on non-group-leader pids from two call sites") and mention
+    neither `v0.3.12` nor `_send_graceful_signal` nor any
+    backstop/defence-in-depth framing.
+    """
+    from worktree_plugin.server import _ignore_and_log, _install_signal_guards
+
+    ignore_doc = _normalize(_ignore_and_log.__doc__ or "")
+    install_doc = _normalize(_install_signal_guards.__doc__ or "")
+    combined = f"{ignore_doc} {install_doc}"
+
+    for forbidden in _R176_SIGNAL_FORBIDDEN:
+        assert forbidden not in combined, (
+            f"falsified upstream-defect phrase must be removed: {forbidden!r}"
+        )
+
+    assert "v0.3.12" in combined
+    assert "_send_graceful_signal" in combined
+
+    sentence = _sentence_containing(combined, "_send_graceful_signal")
+    assert re.search(r"refus\w+|reject\w+|declin\w+|skips?\b", sentence), sentence
+
+    assert re.search(r"backstop|defence-in-depth", combined)
+
+    # Untouched survivors (Q1(b): SIGBREAK guard logic/framing paragraphs
+    # stay byte-for-byte; only a lead-in sentence is added).
+    assert "sigint" in install_doc
+    assert "tradeoff" in install_doc
+
+
+def test_markdown_signal_narrative_is_not_falsified():
+    """R4 driving test #2 (ticket #176, Q1/Q3): `AGENTS.md` and
+    `skills/worktree/SKILL.md` must stop asserting the engine has "no
+    equivalent guard" and stop citing an "Upstream recommendation (not
+    implemented in this repo)" that upstream PR #151 (v0.3.12) has since
+    shipped. `AGENTS.md` must also still cite the thread-leak regression
+    test file by its literal path, and must no longer point readers at a
+    "thread-leak note above" that Q3's condensed-history rewrite removes.
+    `SKILL.md`'s "what this does and does not fix" region must gain the
+    v0.3.12/`_send_graceful_signal`/backstop framing while its two verbatim
+    survivor sentences stay intact.
+
+    Expected RED reason: `AGENTS.md` still contains both falsified phrases
+    verbatim today and does not mention `v0.3.12` anywhere; `SKILL.md`'s
+    region does not mention `v0.3.12`, `_send_graceful_signal`, or any
+    backstop/defence-in-depth framing.
+    """
+    agents_raw = AGENTS_MD.read_text(encoding="utf-8")
+    agents_norm = _normalize(agents_raw)
+
+    assert "no equivalent guard in the engine today" not in agents_norm
+    assert (
+        "upstream recommendation (not implemented in this repo)" not in agents_norm
+    )
+    assert "v0.3.12" in agents_norm
+    assert "see the thread-leak note above" not in agents_norm
+    assert "tests/test_thread_leak_regression.py" in agents_raw
+
+    skill_norm = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+    start = skill_norm.index("what this does and does not fix")
+    end = skill_norm.index("orphan worktree recovery")
+    region = skill_norm[start:end]
+
+    assert "v0.3.12" in region
+    assert "_send_graceful_signal" in region
+    assert re.search(r"backstop|defence-in-depth", region)
+    assert "it does not eliminate transport drops" in region
+    assert (
+        "fails during argument resolution before any signal code runs at all"
+        in region
+    )
 
 
 def test_worktree_remove_untracked_recipe_new_sentence_does_not_alter_branch_pin():
@@ -1013,3 +1201,226 @@ def test_skill_md_states_force_true_is_normal_teardown_not_emergency():
         "checkout needing force=True is expected/normal/routine, not an "
         "emergency override"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q3, #111 half): the daemon-thread-leak narrative in
+# tests/test_thread_leak_regression.py, pyproject.toml's timeout rationale
+# comment, tests/test_pytest_timeout_config.py's module docstring, and
+# AGENTS.md's chunk table all still describe the leak as a live, unbounded
+# defect measured against v0.3.11 -- falsified by upstream ticket #148
+# (shipped in the now-pinned v0.3.12), which introduces a persistent bounded
+# query worker (_persistent_query_worker/_handle_scan_lock, capped by
+# _handle_scan_max_live_workers) closing the residual per-scan leak. This
+# block's four driving tests gate that rewrite; mirrors this file's existing
+# _R176_SIGNAL_FORBIDDEN block's shape and reuses _normalize/
+# _sentence_containing.
+# ---------------------------------------------------------------------------
+
+
+def _module_docstring(path: Path) -> str:
+    """Return the raw (``ast.get_docstring``, default ``clean=True``) module
+    docstring of the Python source file at *path* -- preserves blank-line
+    paragraph breaks (unlike this file's whitespace-collapsing
+    ``_normalize``), which the History-confinement checks below need."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    doc = ast.get_docstring(tree)
+    assert doc, f"{path} has no module docstring"
+    return doc
+
+
+def test_thread_leak_tests_are_no_longer_xfail():
+    """Behavioural requirement 1 (plan): the leak tests must stop being
+    ``xfail`` once the v0.3.12 measurement plateaus. Scoped deliberately to
+    the marker/decorator usage (``@pytest.mark.xfail`` and the
+    ``_XFAIL_REASON`` constant), not a bare ``"xfail" not in source"`` --
+    a legitimately labelled historical mention of the word inside the
+    rewritten History paragraph must not be forbidden (the same pattern
+    already accepted in ``tests/test_signal_resilience.py``). The survivor
+    assertions prove the flip cannot be achieved by deleting or weakening
+    the tests themselves.
+
+    Expected RED reason: the file today contains
+    ``@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)`` (line 306), a
+    second ``@pytest.mark.xfail(`` decorator (line 473), and
+    ``_XFAIL_REASON = (`` (line 257) -- all verified present at plan/test
+    time.
+    """
+    source = THREAD_LEAK_TEST.read_text(encoding="utf-8")
+
+    assert "@pytest.mark.xfail" not in source
+    assert "_XFAIL_REASON" not in source
+
+    # Survivors: the flip must not be achieved by deleting or weakening the
+    # tests themselves.
+    assert "skipif(" in source
+    assert "timeout(300)" in source
+    assert "growth <= 2" in source
+
+
+_THREAD_LEAK_FORBIDDEN = (
+    "still xfail (never xpass",
+    "both xfail, matching v0.3.3's originally measured shape",
+    "today's leak is linear and unbounded from the very first call",
+)
+
+_THREAD_LEAK_REQUIRED_ANY = ("_persistent_query_worker", "_handle_scan_lock")
+
+# "v0.3.1" is deliberately checked with a "not followed by another digit"
+# guard (see `_history_token_pattern`) rather than plain substring
+# containment -- "v0.3.1" is itself a substring of "v0.3.10"/"v0.3.11"/
+# "v0.3.12", so a naive `"v0.3.1" not in block` check would misfire against
+# the v0.3.12 lead paragraph that every GREEN rewrite must contain.
+_THREAD_LEAK_HISTORY_TOKENS = (
+    "v0.3.1",
+    "v0.3.3",
+    "v0.3.10",
+    "v0.3.11",
+    "teardown.py:666",
+    "teardown.py:693",
+)
+
+_THREAD_LEAK_HISTORY_TICKET_LINKS = ("#114", "#159", "#169")
+
+
+def _history_token_pattern(token: str) -> "re.Pattern[str]":
+    return re.compile(re.escape(token) + r"(?!\d)")
+
+
+def test_thread_leak_module_docstring_describes_v0_3_12_state():
+    """Behavioural requirement 2 (plan): the module docstring must lead with
+    the v0.3.12/#148 state (citing the upstream ticket, the new bounded-
+    worker internals, and the re-measured ``growth_series=``) and confine
+    the v0.3.1..v0.3.11 narrative to a single labelled History block that
+    keeps its ticket links. Also repairs the #112 cross-reference paragraph
+    to cite upstream PR #151.
+
+    Expected RED reason: the docstring today contains every forbidden phrase
+    verbatim (the v0.3.11 doubled-rate paragraph, the v0.3.10 paragraph, and
+    the "Known limitation" paragraph) and zero occurrences of "v0.3.12"
+    (grep-verified: 0 hits repo-wide in this file) -- the first forbidden-
+    phrase assertion below fails immediately. Separately, "history" occurs
+    zero times in the docstring today (grep-verified), so the
+    exactly-one-History-block check would also fail (0 != 1) once reached.
+    """
+    raw_doc = _module_docstring(THREAD_LEAK_TEST)
+    norm = _normalize(raw_doc)
+
+    for forbidden in _THREAD_LEAK_FORBIDDEN:
+        assert forbidden not in norm, (
+            f"falsified upstream-defect phrase must be removed: {forbidden!r}"
+        )
+
+    assert "v0.3.12" in norm
+    assert "seretos/lib-python-worktree#148" in norm
+    assert any(tok in norm for tok in _THREAD_LEAK_REQUIRED_ANY), (
+        f"docstring must mention one of {_THREAD_LEAK_REQUIRED_ANY}"
+    )
+    assert "_handle_scan_max_live_workers" in norm
+    assert "teardown.py:732" in norm
+
+    v0312_idx = norm.index("v0.3.12")
+    assert v0312_idx < 800, f"v0.3.12 must lead the docstring (found at {v0312_idx})"
+    for older in ("v0.3.3", "v0.3.10", "v0.3.11"):
+        if older in norm:
+            assert v0312_idx < norm.index(older), (
+                f"v0.3.12 must precede {older!r} in the docstring"
+            )
+
+    # History-confinement: split the *raw* (blank-line-preserving) docstring
+    # into paragraphs -- _normalize collapses "\n\n" into a single space, so
+    # this check deliberately does not use it.
+    blocks = [b for b in raw_doc.split("\n\n") if b.strip()]
+    history_blocks = [b for b in blocks if "history" in b.lower()]
+    assert len(history_blocks) == 1, (
+        f"expected exactly one History block, found {len(history_blocks)}"
+    )
+    history_block = history_blocks[0]
+    assert len(history_block) <= 900, (
+        f"History block too long ({len(history_block)} chars)"
+    )
+
+    non_history_blocks = [b for b in blocks if b is not history_block]
+    for token in _THREAD_LEAK_HISTORY_TOKENS:
+        pattern = _history_token_pattern(token)
+        for block in non_history_blocks:
+            assert not pattern.search(block), (
+                f"{token!r} must be confined to the History block, found "
+                f"elsewhere: {block[:80]!r}..."
+            )
+
+    assert any(link in history_block for link in _THREAD_LEAK_HISTORY_TICKET_LINKS), (
+        "History block must keep at least one prior-bump ticket link "
+        f"({_THREAD_LEAK_HISTORY_TICKET_LINKS})"
+    )
+
+    growth_match = re.search(r"growth_series=\[([0-9,\s]*)\]", raw_doc)
+    assert growth_match is not None, (
+        "the v0.3.12 section must cite a freshly measured growth_series=[...]"
+    )
+    growth_values = [int(v) for v in growth_match.group(1).split(",") if v.strip()]
+    assert growth_values, "growth_series literal must not be empty"
+    assert max(growth_values) <= 2
+
+    send_sentence = _sentence_containing(norm, "_send_graceful_signal")
+    assert "#151" in send_sentence, (
+        "the sentence mentioning _send_graceful_signal must also cite #151"
+    )
+
+
+def test_timeout_rationale_is_not_falsified():
+    """Behavioural requirement 3 (plan): the pytest-timeout rationale stops
+    citing a live, untracked-down upstream leak. Checks two *scoped*
+    regions, not two whole files -- a whole-file check on pyproject.toml
+    would trivially pass because the v0.3.12 pin already sits on line 15,
+    which would make the test worthless against an untouched rationale
+    comment.
+
+    Expected RED reason: ``pyproject.toml``'s comment block (between
+    ``addopts = `` and ``timeout = 60``) contains "...useful diagnostics for
+    tracking down the upstream leak." and no "v0.3.12"/"#148" inside that
+    slice; ``tests/test_pytest_timeout_config.py``'s module docstring opens
+    with "The suite has a load-dependent daemon-thread leak" -- both
+    verified present verbatim at plan/test time.
+    """
+    pyproject_raw = PYPROJECT_TOML.read_text(encoding="utf-8")
+    start = pyproject_raw.index("addopts = ")
+    end = pyproject_raw.index("timeout = 60")
+    rationale_slice = pyproject_raw[start:end]
+
+    assert "tracking down the upstream leak" not in rationale_slice
+    assert "v0.3.12" in rationale_slice
+    assert "#148" in rationale_slice
+    assert "backstop" in rationale_slice or "defence-in-depth" in rationale_slice
+
+    # Survivors, checked against the whole file (unambiguous, not scope-
+    # sensitive the way the forbidden/required tokens above are).
+    assert "timeout = 60" in pyproject_raw
+    assert "#105" in pyproject_raw
+
+    timeout_doc = _normalize(_module_docstring(TIMEOUT_CONFIG_TEST))
+
+    assert "the suite has a load-dependent daemon-thread leak" not in timeout_doc
+    assert "v0.3.12" in timeout_doc
+    assert "#148" in timeout_doc
+    assert "backstop" in timeout_doc or "defence-in-depth" in timeout_doc
+    assert "#105" in timeout_doc
+
+
+def test_agents_md_suite_counts_carry_no_xfail_status():
+    """Behavioural requirement 4 (plan): ``AGENTS.md``'s chunk table must
+    carry no stale XFAIL/XPASS status once the markers are flipped --
+    scanned across the *entire* file (safe because ``AGENTS.md`` already
+    delegates all leak-test status to the module docstring elsewhere, so any
+    xfail/xpass token left in this file is by construction a re-divergence).
+    Also asserts the leak-test file citation survives, so the fix cannot be
+    achieved by deleting the table row that names it.
+
+    Expected RED reason: ``AGENTS.md:362`` reads "58 passed + 2 xfailed" and
+    ``:364`` reads "454 passed + 2 xfailed" (grep-verified: these are the
+    only two ``xfail``/``xpass`` hits in the whole file today).
+    """
+    agents_raw = AGENTS_MD.read_text(encoding="utf-8")
+
+    assert not re.search(r"x(?:fail|pass)", agents_raw, re.IGNORECASE)
+    assert "tests/test_thread_leak_regression.py" in agents_raw
