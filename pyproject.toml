@@ -35,9 +35,12 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
-# Ticket #105: bound every test at 60s so the load-dependent daemon-thread
-# leak in lib-python-worktree (upstream Seretos/lib-python-worktree#90) fails
-# loudly instead of hanging the suite silently. On Windows a timeout hit
-# aborts the whole session but dumps thread stacks first -- useful
-# diagnostics for tracking down the upstream leak.
+# Ticket #105: bound every test at 60s as a general anti-wedge backstop
+# (defence-in-depth), independent of any single defect. The daemon-thread
+# leak this comment used to justify the bound against (upstream
+# Seretos/lib-python-worktree#90, tracked here as agent-worktree#111) was
+# closed upstream by v0.3.12 (Seretos/lib-python-worktree#148, ticket #176);
+# the timeout remains configured regardless, since a per-test wedge could in
+# principle come from any cause. On Windows a timeout hit aborts the whole
+# session but dumps thread stacks first.
 timeout = 60

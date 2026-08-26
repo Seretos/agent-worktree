@@ -1,10 +1,12 @@
 """Regression tests for ticket #105.
 
-The suite has a load-dependent daemon-thread leak in ``lib-python-worktree``
-(upstream ``Seretos/lib-python-worktree#90``) that, on affected machines, can
-wedge a test indefinitely instead of failing. These tests guard the
-``pytest-timeout`` configuration that turns that hang into a loud, fast test
-failure instead of a silent one.
+These tests guard the ``pytest-timeout`` configuration that bounds every
+test at 60s as a general anti-wedge backstop (defence-in-depth). The
+daemon-thread leak this bound used to be justified against (upstream
+``Seretos/lib-python-worktree#90``, tracked here as ``agent-worktree#111``)
+was closed upstream by v0.3.12 (``Seretos/lib-python-worktree#148``, ticket
+#176); the timeout stays configured regardless, since a per-test wedge could
+in principle come from any cause, not only that one now-closed leak.
 """
 
 import importlib.metadata
