@@ -63,7 +63,8 @@ still produces a no-op — `environment_start` returns `{"status": "ready", "pid
 — but it is **not silent** and **not** indistinguishable from "no contract configured"
 (issue #87): the same response carries `contract_found: false`, `steps_run: 0`, and
 `no_op_reason: "contract_misplaced"` (vs `"no_contract"` for the genuinely-unconfigured
-case) — ticket #103's contract diagnostics. The engine (`lib-python-worktree`, upstream
+case) — ticket #103's contract diagnostics (all five `no_op_reason` values are listed
+under **no_op_reason values** in Troubleshooting, below). The engine (`lib-python-worktree`, upstream
 #100) additionally sets `shadowed_contract` on the response — `None`, or `{path,
 used_path, reason, message}` with `reason` either `"differs"` or `"unreadable"` —
 whenever a checkout-local copy exists that is not the file it read. It is transient
@@ -507,6 +508,21 @@ Removing an orphan this way never touches the state store (nothing was recorded 
 to remove) and never deletes its branch, even with `force=true`, since an orphan is
 never recorded as owning one.
 
+`no_op_reason` is `null` exactly when a `start:` step really
+was spawned for the role (`steps_run: 1`) — including the degraded case where the
+diagnostics re-read failed but the engine had already started the role; otherwise it
+is exactly one of the five values below and `steps_run` is `0`.
+
+**no_op_reason values**
+
+| Value | Means | What to do |
+|---|---|---|
+| `isolation_none` | Contract read OK, but declares `isolation: none`, under which the parser forbids a `start:` block at all. | Expected; switch to `isolation: full` if this role needs an environment. |
+| `no_start_steps` | Contract fine, but no `start:` step is declared — or the start recorded no pid for this `role`. | Declare a `start:` step for this `role`; check why it left no pid. |
+| `contract_misplaced` | Nothing at `repo_root`, but the linked checkout has its own copy. | Move it to `repo_root`; only that path is read. |
+| `no_contract` | Nothing at `repo_root` and no checkout-local copy either. | Author `.seretos/worktree-setup.yml` at `repo_root`. |
+| `contract_unreadable` | The file is there, but the diagnostics **re-read** of it raised `OSError`/`ContractError` (bad file permissions, or invalid YAML) and no pid is recorded for this `role`. | Check the file's permissions and fix its YAML syntax, then retry. Had the role actually started, `no_op_reason` would be `null` despite the failed re-read. |
+
 **Soft error codes.** `worktree_remove`, `environment_start`, and `environment_stop`
 all return an additive machine-readable `code` field alongside `error` on their soft
 (non-raising) failure paths, so callers can branch on `code` instead of parsing the
@@ -524,7 +540,9 @@ running under the given `role`).
    `no_op_reason: "contract_misplaced"` (vs `"no_contract"` for the genuinely-
    unconfigured case) — branch on that instead of inferring from `status`/`pids`. If
    instead the checkout-local copy was *edited* while a valid repo-root contract
-   started normally, look for `shadowed_contract` in the response.
+   started normally, look for `shadowed_contract` in the response. (All five
+   `no_op_reason` values are listed under **no_op_reason values** in
+   Troubleshooting, above.)
 2. **`isolation: none` forbids every block.** Adding `setup:`, `start:`, `stop:`,
    `teardown:`, or `ports:` under `isolation: none` raises `ContractValidationError` —
    switch to `isolation: full` first.

@@ -1304,13 +1304,21 @@ def test_skill_documents_full_no_op_reason_value_enum():
     rows = _table_rows(skill_text)
 
     missing_rows = []
+    matched_indices: dict[str, int] = {}
     for value in sorted(NO_OP_REASON_VALUES):
-        row = next(
-            (cells for cells in rows if value in _normalize(cells[0])), None
+        match = next(
+            (
+                (i, cells)
+                for i, cells in enumerate(rows)
+                if _normalize(cells[0]) == value
+            ),
+            None,
         )
-        if row is None:
+        if match is None:
             missing_rows.append(value)
             continue
+        row_index, row = match
+        matched_indices[value] = row_index
 
         remaining = " ".join(row[1:])
         assert len(remaining) >= 40, (
@@ -1323,37 +1331,52 @@ def test_skill_documents_full_no_op_reason_value_enum():
             f"must be substantive (>=15 chars), got {row[-1]!r}"
         )
 
+        # Strip the value literal itself out of the row's text before
+        # checking semantic tokens, so a bare literal-echo row (e.g. a row
+        # whose prose is just its own name) can't satisfy the assertion
+        # tautologically -- every token below must be independent prose.
         norm_row = _normalize(" | ".join(row))
+        prose = norm_row.replace(value, " ")
         if value == "isolation_none":
-            assert "isolation" in norm_row and "none" in norm_row, (
-                f"SKILL.md's isolation_none row must mention both "
-                f"'isolation' and 'none': {row!r}"
+            assert "isolation" in prose and "none" in prose and "start" in prose, (
+                f"SKILL.md's isolation_none row must mention 'isolation', "
+                f"'none', and the independent token 'start': {row!r}"
             )
         elif value == "no_start_steps":
-            assert "start" in norm_row and "role" in norm_row, (
-                f"SKILL.md's no_start_steps row must mention both 'start' "
-                f"and 'role': {row!r}"
+            assert "start" in prose and "role" in prose and "pid" in prose, (
+                f"SKILL.md's no_start_steps row must mention 'start', "
+                f"'role', and the independent token 'pid' (the second, "
+                f"previously-undocumented no-pid-recorded trigger): {row!r}"
             )
         elif value == "contract_misplaced":
-            assert "checkout" in norm_row and "repo_root" in norm_row, (
+            assert "checkout" in prose and "repo_root" in prose, (
                 f"SKILL.md's contract_misplaced row must mention both "
                 f"'checkout' and 'repo_root': {row!r}"
             )
         elif value == "no_contract":
-            assert "repo_root" in norm_row, (
-                f"SKILL.md's no_contract row must mention 'repo_root': "
-                f"{row!r}"
+            assert "repo_root" in prose and "checkout" in prose, (
+                f"SKILL.md's no_contract row must mention 'repo_root' and "
+                f"'checkout' (what distinguishes it from "
+                f"contract_misplaced): {row!r}"
             )
         elif value == "contract_unreadable":
-            assert "read" in norm_row or "parse" in norm_row, (
-                f"SKILL.md's contract_unreadable row must mention 'read' "
-                f"or 'parse': {row!r}"
+            assert "permission" in prose and (
+                "yaml" in prose or "parse" in prose
+            ), (
+                f"SKILL.md's contract_unreadable row must mention "
+                f"'permission' and either 'yaml' or 'parse' -- a bare "
+                f"'read'/'parse' echo of the value name is not enough: "
+                f"{row!r}"
             )
 
     assert missing_rows == [], (
         "SKILL.md must document every no_op_reason value as a Markdown "
         "table row (>=3 pipe-delimited cells, the value as the first "
         f"cell); missing a row for: {missing_rows!r}"
+    )
+    assert len(set(matched_indices.values())) == len(matched_indices), (
+        "SKILL.md's no_op_reason value rows must each be their own distinct "
+        f"table row (no crammed multi-value row): {matched_indices!r}"
     )
 
 
@@ -1375,17 +1398,36 @@ def test_skill_no_op_reason_values_are_colocated_in_one_reference_block():
     window_chars = 900
 
     found = False
+    found_idx = None
     for m in re.finditer(re.escape(heading), norm):
         idx = m.start()
         window = norm[max(0, idx - 100) : idx + window_chars]
         if all(value in window for value in NO_OP_REASON_VALUES):
             found = True
+            found_idx = idx
             break
 
     assert found, (
         "SKILL.md must have a single contiguous ~900-char block containing "
         "the heading 'no_op_reason values' together with all five "
         f"no_op_reason value tokens: {sorted(NO_OP_REASON_VALUES)!r}"
+    )
+
+    # Placement: the real reference block -- not either of the two
+    # cross-reference mentions elsewhere -- must sit inside
+    # ## Troubleshooting, before "Soft error codes." and before ## Pitfalls.
+    troubleshooting_idx = norm.find("## troubleshooting")
+    soft_error_idx = norm.find("soft error codes")
+    pitfalls_idx = norm.find("## pitfalls")
+    assert (
+        troubleshooting_idx != -1
+        and troubleshooting_idx < found_idx < soft_error_idx < pitfalls_idx
+    ), (
+        "SKILL.md's 'no_op_reason values' reference block must be placed "
+        "inside '## Troubleshooting', before 'Soft error codes.' and "
+        "before '## Pitfalls' -- got troubleshooting_idx="
+        f"{troubleshooting_idx!r}, block idx={found_idx!r}, "
+        f"soft_error_idx={soft_error_idx!r}, pitfalls_idx={pitfalls_idx!r}"
     )
 
 
@@ -1477,4 +1519,59 @@ def test_skill_keeps_existing_two_value_misplaced_contrast():
     )
     assert "no_contract" in pitfalls_section, (
         "SKILL.md's Pitfalls section must still mention 'no_contract'"
+    )
+
+
+def test_skill_documents_null_no_op_reason_means_real_start():
+    """Claim under protection (ticket #175): the sentence above the
+    'no_op_reason values' heading must state that `no_op_reason` is
+    `null`/`None` exactly when a real `start:` step was spawned for the
+    role (`steps_run: 1`) -- including the degraded case where the
+    diagnostics re-read failed but the role had already been started -- and
+    that `steps_run` is `0` otherwise.
+
+    RED (pre-fix): at HEAD there is no 'no_op_reason values' heading at all
+    (the same anchor Behaviour 2 relies on), so the preceding-text window
+    is empty and none of the required tokens/patterns can be found.
+    """
+    norm = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+    heading = "no_op_reason values"
+
+    # 'no_op_reason values' also occurs at the two cross-reference sites
+    # (Behaviour 3); the real reference-block heading is the occurrence
+    # whose forward window holds all five value tokens -- same test used by
+    # the colocation test above.
+    idx = None
+    for m in re.finditer(re.escape(heading), norm):
+        candidate = m.start()
+        window = norm[max(0, candidate - 100) : candidate + 900]
+        if all(value in window for value in NO_OP_REASON_VALUES):
+            idx = candidate
+            break
+    assert idx is not None, (
+        "SKILL.md must have a 'no_op_reason values' reference-block "
+        "heading (the occurrence whose forward window holds all five "
+        "no_op_reason value tokens)"
+    )
+
+    preceding = norm[max(0, idx - 600) : idx]
+
+    assert "null" in preceding or "none" in preceding, (
+        "the sentence above the no_op_reason values heading must name "
+        "null/None as the no-op-reason-absent case"
+    )
+    assert "steps_run" in preceding, (
+        "the sentence above the no_op_reason values heading must mention "
+        "steps_run"
+    )
+    assert re.search(r"steps_run\D{0,10}1\b", preceding), (
+        "the sentence must tie null/None to steps_run: 1 (a real spawn "
+        f"happened): {preceding!r}"
+    )
+    assert re.search(r"steps_run\D{0,10}0\b", preceding), (
+        f"the sentence must state steps_run is 0 otherwise: {preceding!r}"
+    )
+    assert "already" in preceding or "started" in preceding, (
+        "the sentence must name the degraded already-started "
+        f"re-read-failed case: {preceding!r}"
     )
