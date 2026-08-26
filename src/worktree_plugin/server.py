@@ -28,14 +28,21 @@ def _ignore_and_log(signum: int, frame) -> None:
 
     On Windows, ``GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)`` -- what
     ``os.kill(pid, signal.CTRL_BREAK_EVENT)`` maps to -- takes a *process
-    group id*, not an arbitrary target pid. The pinned lib-python-worktree
-    engine (see ``tests/test_signal_resilience.py``'s module docstring for
-    the full mechanism, with exact source line citations) calls this on
-    non-group-leader pids from two call sites, which can deliver a stray
-    ctrl-break back to this server's own console-attached process instead
-    of (or in addition to) the intended target. Swallowing it here rather
+    group id*, not an arbitrary target pid, so a stray ctrl-break can in
+    principle land on this server's own console-attached process instead
+    of (or in addition to) the intended target. As of the pinned v0.3.12,
+    the engine's own ``_send_graceful_signal`` (see
+    ``tests/test_signal_resilience.py``'s module docstring for the full
+    mechanism, with exact source line citations) refuses/skips issuing
+    ``CTRL_BREAK_EVENT`` at all unless the caller has confirmed
+    process-group leadership (upstream PR #151), which closes off the
+    non-group-leader call sites that used to make this stray-delivery
+    scenario possible from inside the engine. This handler remains
+    installed as a backstop / defence-in-depth layer: it swallows any
+    SIGBREAK that still reaches this process -- whether from some other
+    source entirely, or as a hedge against the engine's guard -- rather
     than letting the interpreter's default SIGBREAK disposition kill the
-    process is the fix.
+    process.
 
     Deliberately never uses ``print()``/writes to stdout: under the stdio
     MCP transport, stdout *is* the JSON-RPC channel, and any stray byte
@@ -59,6 +66,11 @@ def _ignore_and_log(signum: int, frame) -> None:
 def _install_signal_guards() -> None:
     """Install the SIGBREAK guard so a stray Windows CTRL_BREAK_EVENT aimed
     at a different process cannot kill this server (ticket #112).
+
+    As of the pinned v0.3.12, this guard is a backstop / defence-in-depth
+    layer on top of the engine's own ``_send_graceful_signal`` group-leader
+    check (upstream PR #151) rather than the only mitigation in play; see
+    ``_ignore_and_log``'s docstring above for the full picture.
 
     POSIX has no ``SIGBREAK`` -- this is a no-op there (and in any test
     environment where the attribute has been removed to simulate that).

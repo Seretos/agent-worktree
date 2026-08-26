@@ -429,6 +429,190 @@ def test_worktree_remove_untracked_recipe_warns_force_for_uncommitted_changes():
     assert re.search(r"\b(may|must|need)\b", sentence)
 
 
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q2 spillover, R3): worktree_create's own start_variants may
+# include a synthesised "default" entry (the v0.3.12 engine's
+# available_variants fallback-tier projection) that a subsequent
+# environment_list-sourced record does not necessarily carry the same way --
+# this create-vs-record divergence must be documented on three surfaces.
+# ---------------------------------------------------------------------------
+
+_R176_REQUIRED_TOKENS = ("start_variants", "environment_list", '"default"')
+_R176_ENGINE_TOKENS = ("engine", "upstream")
+_R176_PHRASING = re.compile(r"may include|can include|includes")
+
+
+def test_start_variants_create_vs_record_divergence_documented_on_three_surfaces():
+    """R3 driving test (ticket #176, Q2 spillover): the create-vs-record
+    `start_variants` divergence must be documented in all three of:
+    `worktree.py`'s `start_variants` bullet (inside the existing R5 region,
+    756-789), `AGENTS.md` (either the `worktree_create` or `environment_list`
+    section), and `skills/worktree/SKILL.md` (near its `start_variants`
+    mention around 583-591).
+
+    Expected RED reason: none of the three sources currently mentions this
+    divergence -- `environment_list` is required token, and none of the two
+    Markdown sources currently pairs `environment_list` with `start_variants`
+    in the same breath (the worktree.py region doesn't mention
+    `environment_list` at all, and neither AGENTS.md nor SKILL.md's
+    `start_variants` mentions pair it with `"default"` plus an
+    engine/upstream attribution and `may include`/`can include`/`includes`
+    phrasing).
+    """
+    worktree_doc = _normalize(_get_tool_docstring("worktree_create"))
+    ws_start = worktree_doc.index(_R5_REGION_START)
+    ws_end = worktree_doc.index(_R5_REGION_END)
+    worktree_region = worktree_doc[ws_start:ws_end]
+
+    agents_text = _normalize(AGENTS_MD.read_text(encoding="utf-8"))
+    skill_text = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+
+    # The worktree_region slice starts at the literal marker string
+    # "start_variants (always present, unlike warning)" (_R5_REGION_START),
+    # so a bare `"start_variants" in worktree_region` check would be
+    # tautologically true regardless of content -- the slice always begins
+    # with that substring. Instead, require a SECOND `start_variants`
+    # occurrence (the divergence note re-mentioning the key by name, beyond
+    # the marker itself) with `environment_list` nearby, proving the note
+    # genuinely links the two keys rather than the two tokens merely
+    # appearing somewhere, unrelated, in the same region.
+    second_start_variants_idx = worktree_region.find(
+        "start_variants", len(_R5_REGION_START)
+    )
+    assert second_start_variants_idx != -1, (
+        "worktree.py start_variants bullet (R5 region) must mention "
+        "start_variants a second time (beyond the region marker) as part "
+        "of the divergence note"
+    )
+    proximity_window = worktree_region[
+        max(0, second_start_variants_idx - 300) : second_start_variants_idx + 300
+    ]
+    assert "environment_list" in proximity_window, (
+        "worktree.py start_variants bullet (R5 region) must re-mention "
+        "start_variants near environment_list to link the two keys"
+    )
+
+    for label, text in (
+        ("worktree.py start_variants bullet (R5 region)", worktree_region),
+        ("AGENTS.md", agents_text),
+        ("skills/worktree/SKILL.md", skill_text),
+    ):
+        tokens = _R176_REQUIRED_TOKENS
+        if label == "worktree.py start_variants bullet (R5 region)":
+            # "start_variants" is excluded here: it is checked above via the
+            # proximity assertion instead of a bare membership check, since
+            # membership alone is tautological for this particular slice.
+            tokens = tuple(t for t in tokens if t != "start_variants")
+        for token in tokens:
+            assert token in text, f"{label} must mention {token!r}"
+        assert any(tok in text for tok in _R176_ENGINE_TOKENS), (
+            f"{label} must attribute the synthesised \"default\" entry to "
+            f"the engine/upstream"
+        )
+        assert _R176_PHRASING.search(text), (
+            f"{label} must use 'may include'/'can include'/'includes' phrasing"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #176 (Q1, R4): the falsified "live upstream defect" narrative for
+# the Windows CTRL_BREAK guard is gone -- upstream PR #151 (v0.3.12) added
+# the engine's own group-leader guard, so this plugin's SIGBREAK handler is
+# now defence-in-depth, not the only mitigation.
+# ---------------------------------------------------------------------------
+
+_R176_SIGNAL_FORBIDDEN = (
+    "calls this on non-group-leader pids from two call sites",
+    "no check",
+    "no equivalent guard",
+    "is the fix",
+)
+
+
+def test_signal_guard_docstrings_describe_v0_3_12_engine_guard():
+    """R4 driving test #1 (ticket #176, Q1): `server._ignore_and_log` and
+    `server._install_signal_guards`'s docstrings must stop describing the
+    engine as having "no check"/"no equivalent guard" against non-group-
+    leader `CTRL_BREAK_EVENT` delivery -- upstream PR #151 (shipped in the
+    pinned v0.3.12) added exactly that guard. The docstrings must instead
+    describe this plugin's own SIGBREAK handler as a backstop/defence-in-
+    depth layered on top of the engine's own fix, while the untouched
+    `SIGINT` and `Tradeoff` paragraphs survive verbatim.
+
+    Expected RED reason: today's docstrings still contain the falsified
+    forbidden phrases (verified directly: `_ignore_and_log.__doc__` contains
+    "calls this on non-group-leader pids from two call sites") and mention
+    neither `v0.3.12` nor `_send_graceful_signal` nor any
+    backstop/defence-in-depth framing.
+    """
+    from worktree_plugin.server import _ignore_and_log, _install_signal_guards
+
+    ignore_doc = _normalize(_ignore_and_log.__doc__ or "")
+    install_doc = _normalize(_install_signal_guards.__doc__ or "")
+    combined = f"{ignore_doc} {install_doc}"
+
+    for forbidden in _R176_SIGNAL_FORBIDDEN:
+        assert forbidden not in combined, (
+            f"falsified upstream-defect phrase must be removed: {forbidden!r}"
+        )
+
+    assert "v0.3.12" in combined
+    assert "_send_graceful_signal" in combined
+
+    sentence = _sentence_containing(combined, "_send_graceful_signal")
+    assert re.search(r"refus\w+|reject\w+|declin\w+|skips?\b", sentence), sentence
+
+    assert re.search(r"backstop|defence-in-depth", combined)
+
+    # Untouched survivors (Q1(b): SIGBREAK guard logic/framing paragraphs
+    # stay byte-for-byte; only a lead-in sentence is added).
+    assert "sigint" in install_doc
+    assert "tradeoff" in install_doc
+
+
+def test_markdown_signal_narrative_is_not_falsified():
+    """R4 driving test #2 (ticket #176, Q1/Q3): `AGENTS.md` and
+    `skills/worktree/SKILL.md` must stop asserting the engine has "no
+    equivalent guard" and stop citing an "Upstream recommendation (not
+    implemented in this repo)" that upstream PR #151 (v0.3.12) has since
+    shipped. `AGENTS.md` must also still cite the thread-leak regression
+    test file by its literal path, and must no longer point readers at a
+    "thread-leak note above" that Q3's condensed-history rewrite removes.
+    `SKILL.md`'s "what this does and does not fix" region must gain the
+    v0.3.12/`_send_graceful_signal`/backstop framing while its two verbatim
+    survivor sentences stay intact.
+
+    Expected RED reason: `AGENTS.md` still contains both falsified phrases
+    verbatim today and does not mention `v0.3.12` anywhere; `SKILL.md`'s
+    region does not mention `v0.3.12`, `_send_graceful_signal`, or any
+    backstop/defence-in-depth framing.
+    """
+    agents_raw = AGENTS_MD.read_text(encoding="utf-8")
+    agents_norm = _normalize(agents_raw)
+
+    assert "no equivalent guard in the engine today" not in agents_norm
+    assert (
+        "upstream recommendation (not implemented in this repo)" not in agents_norm
+    )
+    assert "v0.3.12" in agents_norm
+    assert "see the thread-leak note above" not in agents_norm
+    assert "tests/test_thread_leak_regression.py" in agents_raw
+
+    skill_norm = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+    start = skill_norm.index("what this does and does not fix")
+    end = skill_norm.index("orphan worktree recovery")
+    region = skill_norm[start:end]
+
+    assert "v0.3.12" in region
+    assert "_send_graceful_signal" in region
+    assert re.search(r"backstop|defence-in-depth", region)
+    assert "it does not eliminate transport drops" in region
+    assert (
+        "fails during argument resolution before any signal code runs at all"
+        in region
+    )
+
+
 def test_worktree_remove_untracked_recipe_new_sentence_does_not_alter_branch_pin():
     """R6 edge (a): anti-false-positive pin -- the pre-existing "never
     deletes its branch, even with force=true" sentence must survive intact

@@ -3,14 +3,14 @@ from importlib.metadata import version
 from pathlib import Path
 
 
-def test_lib_python_worktree_pinned_to_v0_3_11():
+def test_lib_python_worktree_pinned_to_v0_3_12():
     installed = version("lib-python-worktree")
-    assert installed == "0.3.11", (
-        f"expected lib-python-worktree==0.3.11, but installed version is {installed!r}. "
+    assert installed == "0.3.12", (
+        f"expected lib-python-worktree==0.3.12, but installed version is {installed!r}. "
         f"A stale .venv does not auto-resolve to a bumped git-URL pin -- "
         f"`pip install -e \".[test]\"` alone will not fix this. To repair, run: "
         f".venv/Scripts/python.exe -m pip install --force-reinstall --no-deps "
-        f'"lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.11"'
+        f'"lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.12"'
     )
 
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -18,7 +18,7 @@ def test_lib_python_worktree_pinned_to_v0_3_11():
         pyproject = tomllib.load(f)
     deps = pyproject["project"]["dependencies"]
     pin = next(dep for dep in deps if dep.startswith("lib-python-worktree"))
-    assert pin.endswith("@v0.3.11"), (
+    assert pin.endswith("@v0.3.12"), (
         f"expected pyproject.toml's lib-python-worktree dependency entry to "
-        f"end in '@v0.3.11', got {pin!r}"
+        f"end in '@v0.3.12', got {pin!r}"
     )

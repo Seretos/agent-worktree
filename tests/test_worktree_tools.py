@@ -3253,6 +3253,61 @@ def test_worktree_create_docstring_documents_start_variants(tmp_path: Path):
     assert re.search(r"empty list|\[\]", window)
 
 
+# ---- ticket #176 (Q2): _start_step_names delegates to the v0.3.12 engine's
+# available_variants, then projects away any synthesised "default" entry ----
+
+
+def test_start_step_names_delegates_to_engine_available_variants(
+    tmp_path: Path, temp_repo: Path
+):
+    """R2 driving test (ticket #176, Q2): `_start_step_names` must delegate
+    its computation to the v0.3.12 engine's `available_variants(contract.start)`
+    instead of recomputing `[s.name for s in contract.start if s.name]`
+    itself, then project away any synthesised `"default"` entry the engine
+    may append so the wrapper's None/[] sentinel contract (declared-names
+    only) is preserved.
+
+    Expected RED reason (tests phase, pre-pin-bump): this worktree is still
+    pinned to v0.3.11 (no `.venv` re-resolve has happened yet -- that is the
+    implement phase's job) and `worktree_plugin.tools.worktree` does not
+    import `available_variants` at all. Accessing
+    `worktree_module.available_variants` therefore raises `AttributeError`
+    before any assertion runs -- a correctly-RED failure for a test written
+    against the not-yet-implemented Q2 delegation. Confirmed directly:
+    `hasattr(lib_python_worktree, "available_variants")` is `False` against
+    the installed v0.3.11 distribution in this worktree's `.venv`.
+    """
+    from unittest.mock import patch
+
+    import worktree_plugin.tools.worktree as worktree_module
+
+    _write_contract(
+        temp_repo,
+        "version: 1\nisolation: partial\nstart:\n  - name: main\n    run: echo hi\n",
+    )
+    mgr, fns = _make_tool_fixtures(tmp_path)
+
+    real_available_variants = worktree_module.available_variants
+    calls = {"called": False}
+
+    def _wrapped(*args, **kwargs):
+        calls["called"] = True
+        return real_available_variants(*args, **kwargs)
+
+    with patch.object(worktree_module, "available_variants", _wrapped):
+        names = worktree_module._start_step_names(str(temp_repo))
+        result = fns["worktree_create"](repo_root=str(temp_repo), branch="feature/wt")
+
+    assert names == ["main"]
+    assert "error" not in result
+    assert result["start_variants"] == ["main"]
+    assert calls["called"], "available_variants must be called by _start_step_names"
+
+    doc = worktree_module._start_step_names.__doc__ or ""
+    assert "available_variants" in doc
+    assert "byte-for-byte mirror" not in doc
+
+
 # ---- WP #165 R4: additive `injected_env` response key (gap 2) ----
 #
 # `InMemoryStateStore` (used by every fixture in this module) wires a
