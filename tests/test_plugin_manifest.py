@@ -1240,3 +1240,241 @@ def test_test_workflow_pytest_job_has_headroom_for_windows():
         "Windows runtimes (floor) without becoming effectively unbounded "
         f"(ceiling); got {timeout_minutes}"
     )
+
+
+# ---- Ticket #175: SKILL.md missing 3 of 5 real no_op_reason values ----
+#
+# `_contract_diagnostics` in worktree.py assigns exactly five `no_op_reason`
+# literals: isolation_none, no_start_steps (two assignment sites),
+# contract_misplaced, no_contract, contract_unreadable. SKILL.md currently
+# only mentions contract_misplaced/no_contract (twice each, in the
+# "Critical:" block and in Pitfall 1); the other three are entirely absent.
+# This is documentation-only -- no production code changes in this ticket.
+
+NO_OP_REASON_VALUES = {
+    "isolation_none",
+    "no_start_steps",
+    "contract_misplaced",
+    "no_contract",
+    "contract_unreadable",
+}
+
+
+def _table_rows(text: str) -> list[list[str]]:
+    """Return every Markdown table row in ``text`` as a list of stripped
+    cell strings, for lines that look like a table row (start with ``|``
+    and split into >=3 cells once the leading/trailing empty strings
+    produced by the outer pipes are dropped). Used to find a dedicated
+    ``no_op_reason`` value-reference table without depending on exact
+    heading text or column widths."""
+    rows = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        parts = [p.strip() for p in stripped.split("|")]
+        if parts and parts[0] == "":
+            parts = parts[1:]
+        if parts and parts[-1] == "":
+            parts = parts[:-1]
+        if len(parts) >= 3:
+            rows.append(parts)
+    return rows
+
+
+def test_skill_documents_full_no_op_reason_value_enum():
+    """Driving test (ticket #175). SKILL.md must document all five real
+    no_op_reason values as substantive Markdown-table rows, not bare
+    token mentions.
+
+    RED (pre-fix): isolation_none, no_start_steps, contract_unreadable have
+    zero occurrences in SKILL.md at all, and none of the five values appear
+    as the first cell of any existing Markdown table row (the pre-fix
+    contract_misplaced/no_contract mentions are inline prose, not table
+    rows) -- so every value is reported missing below.
+    """
+    source_text = WORKTREE_PY.read_text(encoding="utf-8")
+    found_values = set(re.findall(r'no_op_reason = "(\w+)"', source_text))
+    assert found_values == NO_OP_REASON_VALUES, (
+        "expected worktree.py's _contract_diagnostics to assign exactly "
+        f"these 5 no_op_reason literals, got: {found_values!r}"
+    )
+
+    skill_text = SKILL_MD.read_text(encoding="utf-8")
+    rows = _table_rows(skill_text)
+
+    missing_rows = []
+    for value in sorted(NO_OP_REASON_VALUES):
+        row = next(
+            (cells for cells in rows if value in _normalize(cells[0])), None
+        )
+        if row is None:
+            missing_rows.append(value)
+            continue
+
+        remaining = " ".join(row[1:])
+        assert len(remaining) >= 40, (
+            f"SKILL.md's {value!r} table row must carry real documentation, "
+            f"not a bare token -- remaining cells only had "
+            f"{len(remaining)} chars: {row!r}"
+        )
+        assert len(row[-1]) >= 15, (
+            f"SKILL.md's {value!r} table row's 'what to do' (last) cell "
+            f"must be substantive (>=15 chars), got {row[-1]!r}"
+        )
+
+        norm_row = _normalize(" | ".join(row))
+        if value == "isolation_none":
+            assert "isolation" in norm_row and "none" in norm_row, (
+                f"SKILL.md's isolation_none row must mention both "
+                f"'isolation' and 'none': {row!r}"
+            )
+        elif value == "no_start_steps":
+            assert "start" in norm_row and "role" in norm_row, (
+                f"SKILL.md's no_start_steps row must mention both 'start' "
+                f"and 'role': {row!r}"
+            )
+        elif value == "contract_misplaced":
+            assert "checkout" in norm_row and "repo_root" in norm_row, (
+                f"SKILL.md's contract_misplaced row must mention both "
+                f"'checkout' and 'repo_root': {row!r}"
+            )
+        elif value == "no_contract":
+            assert "repo_root" in norm_row, (
+                f"SKILL.md's no_contract row must mention 'repo_root': "
+                f"{row!r}"
+            )
+        elif value == "contract_unreadable":
+            assert "read" in norm_row or "parse" in norm_row, (
+                f"SKILL.md's contract_unreadable row must mention 'read' "
+                f"or 'parse': {row!r}"
+            )
+
+    assert missing_rows == [], (
+        "SKILL.md must document every no_op_reason value as a Markdown "
+        "table row (>=3 pipe-delimited cells, the value as the first "
+        f"cell); missing a row for: {missing_rows!r}"
+    )
+
+
+def test_skill_no_op_reason_values_are_colocated_in_one_reference_block():
+    """Claim under protection (ticket #175): the full five-value
+    no_op_reason reference must live in a single dedicated block, not be
+    scattered across the document, so a caller can find every value in one
+    place.
+
+    RED (pre-fix): the anchor heading text 'no_op_reason values' occurs
+    zero times in SKILL.md today, so no window can be found at all.
+    """
+    norm = _normalize(SKILL_MD.read_text(encoding="utf-8"))
+    heading = "no_op_reason values"
+    # 900 chars is generous enough to span the heading, its leading
+    # sentence, and a 5-row value table, while still being narrow enough
+    # that two unrelated mentions elsewhere in the ~15k-char document can't
+    # coincidentally both fall inside it.
+    window_chars = 900
+
+    found = False
+    for m in re.finditer(re.escape(heading), norm):
+        idx = m.start()
+        window = norm[max(0, idx - 100) : idx + window_chars]
+        if all(value in window for value in NO_OP_REASON_VALUES):
+            found = True
+            break
+
+    assert found, (
+        "SKILL.md must have a single contiguous ~900-char block containing "
+        "the heading 'no_op_reason values' together with all five "
+        f"no_op_reason value tokens: {sorted(NO_OP_REASON_VALUES)!r}"
+    )
+
+
+def test_skill_two_value_sites_cross_reference_the_full_enum_block():
+    """Claim under protection (ticket #175): the two existing two-value
+    spots (the "Critical:" contract block before ## Troubleshooting, and
+    Pitfall 1) must each point readers at the new full five-value
+    reference block, without losing their existing contract_misplaced/
+    no_contract contrast.
+
+    RED (pre-fix): the anchor phrase 'no_op_reason values' occurs zero
+    times in SKILL.md today, so neither site's cross-reference can be
+    found.
+    """
+    raw = SKILL_MD.read_text(encoding="utf-8")
+
+    troubleshooting_idx = raw.find("## Troubleshooting")
+    pitfalls_idx = raw.find("## Pitfalls")
+    assert troubleshooting_idx != -1, (
+        "SKILL.md must have a '## Troubleshooting' heading"
+    )
+    assert pitfalls_idx != -1, "SKILL.md must have a '## Pitfalls' heading"
+
+    # Site A: the "Critical:" contract block, which sits before
+    # ## Troubleshooting.
+    before_troubleshooting = _normalize(raw[:troubleshooting_idx])
+    found_site_a = False
+    for m in re.finditer("contract_misplaced", before_troubleshooting):
+        idx = m.start()
+        window = before_troubleshooting[max(0, idx - 400) : idx + 400]
+        if "no_op_reason values" in window and "troubleshooting" in window:
+            found_site_a = True
+            break
+    assert found_site_a, (
+        "SKILL.md's pre-Troubleshooting 'Critical:' block must "
+        "cross-reference 'no_op_reason values' (mentioning "
+        "'Troubleshooting') within ~400 chars of its 'contract_misplaced' "
+        "mention"
+    )
+
+    # Site B: Pitfall 1 specifically, isolated from the rest of
+    # ## Pitfalls by slicing up to the next numbered item ("2. ").
+    pitfalls_raw = raw[pitfalls_idx:]
+    next_item_match = re.search(r"^2\. ", pitfalls_raw, flags=re.MULTILINE)
+    assert next_item_match, "SKILL.md's '## Pitfalls' section must have an item '2.'"
+    pitfall_1_norm = _normalize(pitfalls_raw[: next_item_match.start()])
+
+    assert "no_op_reason values" in pitfall_1_norm, (
+        "SKILL.md's Pitfall 1 must cross-reference 'no_op_reason values'"
+    )
+    assert "troubleshooting" in pitfall_1_norm, (
+        "SKILL.md's Pitfall 1 cross-reference must mention 'Troubleshooting'"
+    )
+    assert "contract_misplaced" in pitfall_1_norm, (
+        "SKILL.md's Pitfall 1 must still mention 'contract_misplaced' "
+        "alongside the new cross-reference"
+    )
+
+
+def test_skill_keeps_existing_two_value_misplaced_contrast():
+    """Guard/regression test (ticket #175, additive not replacement): the
+    pre-existing contract_misplaced-vs-no_contract contrast in both the
+    "Critical:" block and Pitfall 1 must survive the new full-enum
+    reference block being added alongside it.
+
+    RED (pre-fix): contract_misplaced occurs only 2 times today (the two
+    pre-existing sites); the >=3 bound (2 pre-existing + 1 new table row)
+    is not yet met.
+    """
+    raw = SKILL_MD.read_text(encoding="utf-8")
+    norm_full = _normalize(raw)
+
+    assert norm_full.count("contract_misplaced") >= 3, (
+        "SKILL.md must retain both pre-existing 'contract_misplaced' "
+        "mentions (Critical: block + Pitfall 1) and gain a third "
+        "occurrence from the new no_op_reason values reference table"
+    )
+
+    troubleshooting_idx = raw.find("## Troubleshooting")
+    pitfalls_idx = raw.find("## Pitfalls")
+    assert troubleshooting_idx != -1 and pitfalls_idx != -1
+
+    before_troubleshooting = _normalize(raw[:troubleshooting_idx])
+    pitfalls_section = _normalize(raw[pitfalls_idx:])
+
+    assert "no_contract" in before_troubleshooting, (
+        "SKILL.md's pre-Troubleshooting 'Critical:' block must still "
+        "mention 'no_contract'"
+    )
+    assert "no_contract" in pitfalls_section, (
+        "SKILL.md's Pitfalls section must still mention 'no_contract'"
+    )
