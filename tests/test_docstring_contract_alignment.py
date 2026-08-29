@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from importlib.metadata import version
 from pathlib import Path
 from typing import Tuple
 
@@ -1012,4 +1013,113 @@ def test_skill_md_states_force_true_is_normal_teardown_not_emergency():
         "SKILL.md must state, near some force=true mention, that a dirty "
         "checkout needing force=True is expected/normal/routine, not an "
         "emergency override"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #183 R2: environment_start's docstring states the measured
+# shadowed_contract behaviour (no "may"/"might" hedge), naming the pinned
+# engine version that was measured.
+# ---------------------------------------------------------------------------
+
+_HEDGE_PATTERN = re.compile(r"\bmay\b|\bmight\b|under some conditions")
+
+
+def test_environment_start_docstring_states_measured_shadowed_contract_behaviour():
+    """R2 driving test (ticket #183, fund 2): the sentences discussing
+    ``shadowed_contract`` in the misplaced-contract case must name the
+    engine version that was actually measured (read at test time via
+    ``importlib.metadata.version`` -- never a hardcoded literal, so a future
+    engine bump that isn't re-measured fails this test rather than silently
+    endorsing a stale claim) and must contain no hedge ("may"/"might"/"under
+    some conditions").
+
+    Two sentences are checked: the CAUTION paragraph's shadowed_contract
+    mention, and the shadowed_contract bullet's own tail sentence that ties
+    it to ``contract_misplaced`` (worktree.py lines ~1502-1503 and
+    ~1799-1803 respectively, per the plan).
+
+    Expected RED reason: today's CAUTION sentence reads "The engine may
+    additionally set ``shadowed_contract`` on the response in this case" --
+    hedge present, no version named anywhere in either sentence.
+
+    Strengthened per the test-critic's forwarded note: naming the version
+    and dropping the hedge is not, by itself, proof the docstring states the
+    *right* measured outcome -- a docstring that named v0.3.13 but claimed
+    e.g. "the field stays null" would satisfy the two checks above while
+    being wrong. So this also asserts the measured-outcome token
+    ("differs" -- R1's pinned ``reason``) appears in the same sentences.
+    """
+    installed = version("lib-python-worktree")
+    doc = _get_tool_docstring("environment_start")
+    doc = _normalize(doc)
+
+    caution_start = doc.index(
+        "caution: placing the contract only in a worktree checkout"
+    )
+    caution_end = doc.index("addressing the target", caution_start)
+    caution_region = doc[caution_start:caution_end]
+    caution_sentence = _sentence_containing(caution_region, "shadowed_contract")
+
+    bullet_start = doc.index("shadowed_contract (dict or none):")
+    bullet_end = doc.index("if the target is not found", bullet_start)
+    bullet_region = doc[bullet_start:bullet_end]
+    tail_sentence = _sentence_containing(bullet_region, "contract_misplaced")
+
+    combined = f"{caution_sentence} {tail_sentence}"
+    assert installed in combined, (
+        f"docstring must name the measured engine version {installed!r} in "
+        f"the shadowed_contract/contract_misplaced sentences; got: "
+        f"{combined!r}"
+    )
+    assert "differs" in combined, (
+        "docstring must state the measured outcome's reason ('differs'), "
+        f"not just name a version and drop the hedge; got: {combined!r}"
+    )
+
+    for label, sentence in (
+        ("CAUTION shadowed_contract sentence", caution_sentence),
+        ("shadowed_contract bullet tail sentence", tail_sentence),
+    ):
+        assert not _HEDGE_PATTERN.search(sentence), (
+            f"{label} must not hedge with 'may'/'might'/'under some "
+            f"conditions': {sentence!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ticket #183 R3: environment_list's scope="all" docstring discloses what it
+# reveals (checkout paths, real branch names, other projects'/sessions'
+# work), not only its extra subprocess cost.
+# ---------------------------------------------------------------------------
+
+
+def test_environment_list_scope_all_documents_disclosure_not_only_cost():
+    """R3 driving test (ticket #183, fund 1): the ``scope="all"`` region of
+    ``environment_list``'s docstring must name all three AC-enumerated
+    disclosure elements -- checkout paths, real branch names, and other
+    projects'/sessions' live work -- in addition to the pre-existing
+    subprocess-cost sentence.
+
+    Expected RED reason: today's block (worktree.py ~1278-1285) mentions
+    only the extra ``git worktree list --porcelain`` subprocess cost; none
+    of "checkout paths", "branch names", "other projects", or "other
+    sessions" occur in this region.
+    """
+    doc = _normalize(_get_tool_docstring("environment_list"))
+    start = doc.index("scope:")
+    end = doc.index("repos:")
+    region = doc[start:end]
+
+    assert "subprocess" in region, (
+        "region must still mention the extra git worktree list --porcelain "
+        "subprocess cost"
+    )
+    assert "checkout paths" in region, "region must name checkout paths"
+    assert "branch names" in region, "region must name real branch names"
+    assert "other projects" in region, (
+        "region must name other projects' disclosure"
+    )
+    assert "other sessions" in region, (
+        "region must name other sessions' disclosure"
     )
