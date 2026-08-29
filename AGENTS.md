@@ -267,10 +267,12 @@ hint there would also fire on ordinary typos.
 self-diagnosing (soft `{"code": "not_found"}`), the path form is not.
 
 **Structural constraint on any future recipe.** `yaml_store._record_to_dict`
-does not persist `stop_attempt`, `killed_pids`, `shadowed_contract` or
-`orphan_scan`, and `environment_list` rebuilds every entry from `state.yaml`.
-Those four keys are present in the output but always `null`/`[]` there. Never
-write a recipe that reads them back.
+does not persist `stop_attempt`, `killed_pids` or `shadowed_contract`, and
+`environment_list` rebuilds every entry from `state.yaml`. Those three keys
+are present in the output but always `null`/`[]` there. Never write a recipe
+that reads them back. (Ticket #181: `WorktreeRecord.orphan_scan`, formerly a
+fourth such key, was removed entirely by the pinned engine's v0.3.13 bump --
+a breaking upstream change.)
 
 ### Build provenance of the #116 sweep (verified 2026-08-19)
 
@@ -350,11 +352,25 @@ below, one after another, each as its own foreground `pytest` call.
 
 | Chunk | Files / selector | Tests | Measured (local Windows) |
 | --- | --- | --- | --- |
-| 1 | `tests/test_environment_tools.py` | 120 | 266 s |
-| 2 | `tests/test_worktree_tools.py` | 125 | 118 s |
-| 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 58 passed + 2 xfailed | 290 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 115 | 1 s |
-| **Total** | all 14 `tests/test_*.py` files | 418 passed + 2 xfailed | **675 s** |
+| 1 | `tests/test_environment_tools.py` | 125 | 29 s |
+| 2 | `tests/test_worktree_tools.py` | 129 | 13 s |
+| 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 62 | 16 s |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 144 | 7 s |
+| **Total** | all 14 `tests/test_*.py` files | 460 passed | **65 s** |
+
+**Ticket #181 re-measurement note.** The table above was re-measured after
+bumping the pinned `lib-python-worktree` engine to v0.3.13, which fixed the
+Windows `worktree_remove` hang (see "Running the suite" below and the
+thread-leak note further down). The prior table (pinned to v0.3.11/v0.3.12)
+read 58 passed plus two tests marked expected-to-fail for chunk 3, and 418
+passed plus those same two for the total / `675 s`, dominated by two
+tests in `tests/test_thread_leak_regression.py` that each paid a systemwide
+blocking-process handle scan per `worktree_remove` call and were marked
+expected-to-fail as a result. Every test in the suite passes outright now
+-- none carries that expected-to-fail marker. The per-chunk test counts
+also grew independently of this ticket (more tests landed across
+#171/#175/#181 itself) -- the counts above are not solely attributable to
+the pin bump.
 
 **Chunk 4 dependency note.** `tests/test_release_dispatch_payload.py` has a
 `requires_bash_and_jq`-gated "layer (b)" of 18 tests (of its 34 total) that
@@ -392,43 +408,57 @@ are unaffected.
 
 **Local vs. CI caution.** Do not assume local wall-clock numbers generalize
 to CI, in either direction. This repo's own CI runs of the same suite have
-been observed at 301 s, 315 s, 397 s, and 406 s — sometimes faster than the
-675 s summed-local figure above, sometimes not, because CI runners and a
-local Windows workstation have different CPU counts, disk speed, and
-antivirus/filesystem-filter overhead. The sibling `lib-python-worktree`
-project shows the same local/CI mismatch even more starkly: 245-508 s in CI
-versus 567 s measured locally. Treat both this table's numbers and any CI
-number as approximate, machine-dependent data points, not a portable
-benchmark.
+historically been observed at 301 s, 315 s, 397 s, and 406 s — those
+figures predate ticket #181's v0.3.13 bump and were dominated by the same
+per-`worktree_remove` handle-scan overhead the bump fixed, so they are not
+comparable to the 65 s summed-local figure above; CI runners and a local
+Windows workstation also have different CPU counts, disk speed, and
+antivirus/filesystem-filter overhead regardless. The sibling
+`lib-python-worktree` project shows the same local/CI mismatch even more
+starkly: 245-508 s in CI versus 567 s measured locally. Treat both this
+table's numbers and any CI number as approximate, machine-dependent data
+points, not a portable benchmark. Follow-up: once a fresh CI run lands on
+the v0.3.13 pin, replace the stale 301/315/397/406 s figures above with the
+re-measured numbers.
 
-After bumping the `lib-python-worktree` pin to v0.3.11 (new orphan-scan
-overhead), the `windows-latest` leg of the `pytest` job was observed
-cancelled twice at ~10m17s — a cancellation wall-clock forced by the (then)
-`timeout-minutes: 10` budget, not a completion time, so the true post-bump
-Windows duration is unknown but at least that long. `timeout-minutes` has
-been raised 10 → 20, sized from a ~2x-overhead hypothesis on the 406 s
-pre-bump worst case (~13.5 min) plus margin. The per-test `timeout=60`
-configured in `pyproject.toml` (plus explicit longer marks on the
-thread-leak tests) is what actually catches an individual wedged test; this
-job-level `timeout-minutes` is only the outer backstop for the whole run.
-Follow-up: once the Windows leg completes green in CI under the new budget,
-replace the "~10m17s cancellation" datum above with its real measured
-duration.
+**Ticket #181 update: the v0.3.11/v0.3.12 orphan-scan overhead is gone.**
+Bumping the `lib-python-worktree` pin to v0.3.11 had previously introduced
+a systemwide blocking-process handle scan on every `worktree_remove` call
+(paid twice per call, regardless of whether anything was actually blocking
+removal), which cancelled the `windows-latest` leg of the `pytest` job
+twice at ~10m17s under the then-`timeout-minutes: 10` budget. That budget
+was raised 10 → 20 as a hedge. Ticket #181's v0.3.13 bump removes the
+unconditional scan entirely (see the thread-leak note below and
+`tests/test_thread_leak_regression.py`): a local `worktree_remove` now
+completes in well under a second per call instead of paying the scan, and
+the whole local suite re-measured at 65 s total (table above), down from
+the pre-fix 675 s. The per-test `timeout=60` configured in `pyproject.toml`
+is what actually catches an individual wedged test; the job-level
+`timeout-minutes: 20` remains the outer backstop for the whole CI run, and
+is left at 20 rather than lowered back to 10 since this local measurement
+does not by itself establish a new safe CI ceiling. Follow-up: once a fresh
+Windows CI run completes green on the v0.3.13 pin, replace the "~10m17s
+cancellation" datum and the 301/315/397/406 s figures above with the real
+re-measured durations, and reconsider whether `timeout-minutes: 20` can
+come back down.
 
 **Slow-test clustering.** Durations were not flat within every chunk.
 Chunk 1 (`tests/test_environment_tools.py`) clusters ten
-`test_worktree_remove_*` tests at roughly 21-23 s each (real worktree
-create/teardown subprocess and git operations dominate); the rest of that
-file's 110 tests run in a combined ~4 s. Chunk 2
-(`tests/test_worktree_tools.py`) similarly clusters five `test_create_*`
-tests at roughly 21 s each, with the remaining 120 tests in well under a
-second combined. Chunk 3 is the most skewed: two tests in
-`tests/test_thread_leak_regression.py` alone
-(`test_create_remove_cycles_do_not_leak_threads` at ~171 s and
-`test_create_remove_cycles_with_kill_blocking_processes_do_not_leak_threads`
-at ~106 s — both XFAIL, see the thread-leak note above) account for ~277 s of
-that chunk's ~290 s total; the other five files in chunk 3 are fast. Chunk 4
-is flat and fast throughout, with no cluster.
+`test_worktree_remove_*` tests, each still real worktree create/teardown
+subprocess and git operations; chunk 2 (`tests/test_worktree_tools.py`)
+similarly clusters five `test_create_*` tests. Both clusters run
+substantially faster post-#181 than the ~21-23 s/test observed
+pre-v0.3.13, now that `worktree_remove` no longer pays the systemwide
+handle scan. Chunk 3's two tests in `tests/test_thread_leak_regression.py`
+(`test_create_remove_cycles_are_fast` and
+`test_create_remove_cycles_with_kill_blocking_processes_are_fast`) were
+previously the chunk's dominant cost at ~171 s and ~106 s respectively,
+both `xfail`-marked; ticket #181 rewrote both as plain wall-clock/spy
+assertions (no `xfail`, no `timeout` override) and measured them at
+~0.09 s and ~0.09 s per `worktree_remove` call respectively (8 and 5
+create/remove cycles each, ~1.6 s and ~1.0 s total), with the
+blocking-process scan spy recording zero calls on both. Chunk 4 is flat
+and fast throughout, with no cluster.
 
 ## Security
 

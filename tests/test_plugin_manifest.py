@@ -1575,3 +1575,31 @@ def test_skill_documents_null_no_op_reason_means_real_start():
         "the sentence must name the degraded already-started "
         f"re-read-failed case: {preceding!r}"
     )
+
+
+# ---- Ticket #181: guard against re-describing the fixed thread-leak tests
+# as xfail in AGENTS.md's suite documentation ----
+
+
+def test_agents_md_suite_counts_carry_no_xfail_status():
+    """Guard against a repeat of the #111/#159/#169/#176 pattern (ticket
+    #181): once tests/test_thread_leak_regression.py's tests no longer
+    xfail (the v0.3.13 pin actually fixes the Windows worktree_remove hang
+    instead of merely capping the thread-count symptom), AGENTS.md's suite
+    chunk table / totals and its thread-leak runtime note must not still
+    describe them as XFAIL/xfailed.
+
+    RED (pre-fix): AGENTS.md's chunk-3 and Total rows read "... + 2
+    xfailed" and the slow-test-clustering note reads "... both XFAIL ...".
+    """
+    text = AGENTS_MD.read_text(encoding="utf-8")
+    assert "xfailed" not in text.lower(), (
+        "AGENTS.md must not describe any tests/test_thread_leak_regression.py "
+        "result as xfailed -- ticket #181 removed the xfail marks once the "
+        "v0.3.13 pin fixed the underlying hang; the suite table and prose "
+        "must be re-measured to reflect plain passes"
+    )
+    assert "XFAIL" not in text, (
+        "AGENTS.md must not carry an XFAIL status note for the thread-leak "
+        "tests -- ticket #181 removed the xfail marks"
+    )

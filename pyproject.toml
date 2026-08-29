@@ -12,7 +12,7 @@ dependencies = [
   "mcp>=1.2,<2",
   "pydantic>=2.6",
   "PyYAML>=6.0",
-  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.11",
+  "lib-python-worktree @ git+https://github.com/Seretos/lib-python-worktree@v0.3.13",
   "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.1",
 ]
 
@@ -35,9 +35,14 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
-# Ticket #105: bound every test at 60s so the load-dependent daemon-thread
-# leak in lib-python-worktree (upstream Seretos/lib-python-worktree#90) fails
-# loudly instead of hanging the suite silently. On Windows a timeout hit
-# aborts the whole session but dumps thread stacks first -- useful
-# diagnostics for tracking down the upstream leak.
+# Ticket #105 (reframed by #181): bound every test at 60s so a wedged
+# worktree_remove (or any other unexpectedly hung test) fails loudly instead
+# of hanging the suite silently. This no longer guards against a
+# load-dependent daemon-thread leak -- that framing (upstream
+# Seretos/lib-python-worktree#90) was superseded once #181's v0.3.13 bump
+# fixed the actual user-visible symptom, the Windows worktree_remove hang
+# caused by an unconditional systemwide blocking-process handle scan (see
+# tests/test_thread_leak_regression.py). On Windows a timeout hit aborts the
+# whole session but dumps thread stacks first -- useful diagnostics for
+# tracking down any future wedge.
 timeout = 60

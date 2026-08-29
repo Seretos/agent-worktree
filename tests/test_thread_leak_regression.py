@@ -1,137 +1,30 @@
-"""Regression tests for ticket #111.
+"""Regression tests for the Windows worktree_remove hang.
 
-A black-box re-test sweep reported unbounded, linear daemon-thread growth
-(+~62 to +~148 threads per cycle, no plateau) across repeated
-``worktree_create`` -> ``worktree_remove`` cycles on Windows, despite prior
-fixes in #90/#106/#109. Ticket #114 bumped the pin to lib-python-worktree
-v0.3.3; these tests measure, in-process, whether that pin actually closed the
-leak by driving the same MCP tool callables the ticket reports against
-(``worktree_create``/``worktree_remove``), not the manager API directly.
-Growth is measured by thread *object identity* (``threading.enumerate()``
-``Thread`` objects -- not the OS-recycled ``Thread.ident`` integers --
-diffed against a post-warm-up baseline, after a short poll-until-stable
-settle), not by raw ``threading.active_count()`` -- so unrelated ambient
-thread activity in the host pytest process cannot be mistaken for the leak,
-and a baseline thread that exits mid-run can never have its recycled ident
-mistaken for a still-alive survivor. Newly-appeared, still-alive threads are
-further filtered to the known leak signature -- the ``_BoundedQueryWorker``
-worker threads, which surface under Python's default thread naming as
-``"Thread-N (_run)"`` -- so an unrelated persistent thread started by
-pytest/coverage/another plugin during a measured cycle cannot be mistaken
-for the leak either. The unfiltered "any newly-appeared thread" count is
-kept alongside the filtered leak-signature count in the diagnostics/
-assertion message so the two are never conflated; if the unfiltered count
-materially exceeds the filtered one (by more than the same plateau
-tolerance used for the growth assertion itself), that is flagged as a loud
-filter-drift warning and folded into the assertion, since it would
-otherwise mean the leak-signature filter has stopped matching (e.g. an
-upstream rename of the worker thread) while the underlying leak continues
-unnoticed -- exactly the false-green failure mode this divergence check
-exists to catch. Any measured cycle whose thread snapshot fails to settle
-within the poll window is named in the diagnostics and excluded from the
-value the growth assertion is computed over (a non-converged sample can
-look identical to a real leak without being one); if every measured cycle
-fails to settle, the test fails outright with a clear message rather than
-silently asserting over an empty set.
+Four prior rounds (agent-worktree #111, #159, #169, #176) measured daemon
+*thread count* across repeated ``worktree_create`` -> ``worktree_remove``
+cycles. That quantity plateaus under lib-python-worktree's process-wide
+``_MAX_WEDGED_HANDLE_WORKERS`` cap, so those tests eventually went green
+(behind ``xfail``, then not) without the actual user-visible symptom ever
+being fixed: every ``worktree_remove`` call on Windows unconditionally pays
+a systemwide handle scan
+(``lib_python_worktree.core.teardown._find_blocking_processes``, reached
+from both ``_phase_gate_a_blocking_preflight`` and ``_phase_orphan_scan``
+regardless of whether anything actually blocks removal), which can take
+many seconds -- observed, pre-fix, to exceed this project's 300s
+per-test timeout entirely.
 
-**Known limitation:** the baseline snapshot is taken *after* the 2 warm-up
-cycles, not before them, so any thread leaked during those first two
-create/remove calls is baked into the baseline and can never register as
-growth. The warm-up itself is deliberate and is being kept despite this:
-without it, one-time/lazy initialisation (e.g. a module-level thread pool
-spun up on first use) would be miscounted as leak growth on cycle 1,
-producing false positives on every run -- a worse failure mode than the
-blind spot it trades for. Today's leak is linear and unbounded from the
-very first call (see the empirical result below), so this blind spot does
-not hide it in practice; a hypothetical future fix that only closed an
-"early calls" leak path while leaving today's "leaks forever, linearly"
-path open would pass this guard silently. A pre-warm-up thread count is
-printed in the diagnostics purely for visibility into this blind spot; it
-does not gate the assertion.
-
-The leak mechanism, as originally read from a stale v0.3.1 install during
-planning: on Windows, ``WorktreeManager._teardown`` unconditionally calls
-``_find_blocking_processes``, whose Pass 1c calls ``_win_handle_holders``,
-which spins up a ``_BoundedQueryWorker`` backed by a daemon
-``threading.Thread`` for every scan. In that older build, the worker was
-never joined/shut down, so every remove leaked >=1 live thread
-unconditionally.
-
-**Post-#159 (lib-python-worktree v0.3.10, upstream #135) relocation:** the
-``~830``-line ``_teardown`` monolith was extracted into a standalone
-``lib_python_worktree.core.teardown`` module; the call site this test's
-mechanism depends on lived at ``teardown._phase_gate_a_blocking_preflight``
-(``teardown.py:666`` at v0.3.10; ``teardown.py:693`` verified against
-v0.3.11 -- the #140 orphan-scan feature added lines above it, shifting the
-def line again without changing its behaviour), which -- exactly like the
-pre-#135 ``WorktreeManager._teardown`` it replaces -- calls
-``process_lifecycle._find_blocking_processes`` unconditionally for every
-non-target-absent removal attempt on Windows (still gated only on
-``sys.platform == "win32" and not ctx.target_absent``, not on any blocking
-indicator). ``_find_blocking_processes``, ``_win_handle_holders``, and
-``_BoundedQueryWorker`` themselves are untouched by the #135 redesign or by
-the #140 v0.3.11 bump -- they still live in
-``lib_python_worktree.core.process_lifecycle`` -- so the leak mechanism is
-identical; only the caller's module/function name and line number changed.
-
-**Empirical result against the actually-installed v0.3.3** (see the xfail
-reason below, and ticket #111's change report for the full measured series):
-v0.3.3 substantially reduced -- but did not eliminate -- the leak. It added
-an explicit ``_MAX_WEDGED_HANDLE_WORKERS`` process-wide cap and
-unconditionally joins/shuts down each scan's *initial* worker via a
-``try/finally: worker.close()``. That closes the old unconditional leak, but
-a scan's initial worker is *always* created regardless of whether the cap is
-already full (a deliberate design choice -- see the "It is always shut down
-via the try/finally below" comment block in the installed
-``_win_handle_holders``), and if the query it runs genuinely wedges in
-``NtQueryObject`` (documented by Microsoft to hang indefinitely for some
-handle types, e.g. named pipes with no listener), that thread is never
-joined and never counted against the cap for *future* scans -- so a
-long-lived host process making many *sequential* ``worktree_remove`` calls
-still leaks roughly one thread per call, once the cap has filled. These
-tests are the empirical proof.
-
-**Re-confirmed against the actually-installed v0.3.10 (ticket #159,
-2026-08-23):** re-running both tests in this module after the #159 bump
-(the ``_teardown``/``teardown:`` redesign described above) reproduces the
-exact same defect at the exact same rate -- ``_MAX_WEDGED_HANDLE_WORKERS``
-and the always-create-an-initial-worker behaviour are unchanged in v0.3.10.
-Measured: ``growth_series=[1, 2, 3, 4, 5, 6]`` (default call site, +1
-leak-signature thread per cycle, no plateau) and ``growth_series=[1, 2, 3]``
-(``kill_blocking_processes=True`` call site, same +1/cycle rate) -- both
-XFAIL, matching v0.3.3's originally measured shape byte-for-byte.
-
-**Re-measured against the actually-installed v0.3.11 (ticket #169,
-2026-08-25):** both tests still XFAIL (never XPASS -- the pytest summary
-line was checked explicitly, not inferred from a green exit code) -- the
-defect is unchanged in kind, but the measured *rate* doubled:
-``growth_series=[2, 4, 6, 8, 10, 12]`` (default call site, +2
-leak-signature threads per cycle, no plateau; was +1/cycle at v0.3.10) and
-``growth_series=[2, 4, 6]`` (``kill_blocking_processes=True`` call site,
-same +2/cycle rate; was +1/cycle at v0.3.10). ``_MAX_WEDGED_HANDLE_WORKERS``
-and the always-create-an-initial-worker behaviour remain unchanged in
-v0.3.11 -- the doubled rate was not re-derived from a source diff (the
-#140 orphan-scan feature does not touch ``_win_handle_holders``); it is
-reported here purely as the newly-measured empirical shape, matching this
-module's existing "measure, don't guess" discipline. Both tests therefore
-stay ``xfail`` rather than flipping to plain assertions; see the updated
-``_XFAIL_REASON`` below for the full evidence this run added.
-
-**Cross-reference (ticket #112):** a *separate* investigation into an
-intermittent "Connection closed" symptom on Windows considered this ticket's
-thread leak as a candidate cause and **falsified** it -- see
-``tests/test_signal_resilience.py``'s module docstring for the full writeup.
-The real #112 mechanism is a Windows ``CTRL_BREAK_EVENT`` delivery ambiguity
-in the pinned engine's ``_send_graceful_signal``, entirely independent of
-``_win_handle_holders``/the handle-scan code path this file's tests exercise.
-``tests/test_signal_resilience.py::test_default_environment_stop_never_reaches_handle_scan``
-is the executable proof that a default (``kill_orphans=False``)
-``environment_stop`` call never reaches this file's leak-implicated code
-path at all.
+Ticket #181 bumps the pinned engine to v0.3.13 (upstream PR #155, "fix: end
+the Windows remove() hang chain by subtraction") and replaces the
+thread-count proxy with what a user actually feels: wall-clock duration of
+``worktree_remove``, plus a spy proving the systemwide scan is not reached
+at all when nothing holds the worktree. Thread count is kept only as a
+non-gating diagnostic. See ticket #179 for the fix-verification history and
+#111/#159/#169/#176 for the four rounds that measured the wrong quantity.
 """
 
 from __future__ import annotations
 
+import statistics
 import subprocess
 import sys
 import threading
@@ -145,78 +38,6 @@ from lib_python_worktree import InMemoryStateStore, ManagerConfig, WorktreeManag
 
 def _git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
-
-
-def _settle_thread_snapshot(
-    min_stable_checks: int = 2, poll_interval: float = 0.1, max_wait: float = 1.5
-) -> tuple[dict[threading.Thread, str], bool]:
-    """Poll live threads until two consecutive samples agree on the exact set
-    of ``Thread`` *objects* (or *max_wait* elapses), then return
-    ``({thread: name}, settled)`` for that sample.
-
-    ``threading.active_count()``/``threading.enumerate()`` counts every live
-    thread in the whole pytest process, including ambient ones unrelated to
-    the leak under test. Sampling by the ``Thread`` object itself (rather
-    than raw count, and rather than ``Thread.ident``) lets callers diff the
-    *set* of threads against a baseline, so unrelated ambient activity nets
-    out and only genuinely new, still-alive threads count as growth.
-    ``Thread.ident`` is an OS-recycled integer: if a baseline thread exits
-    during the measured window, the OS can hand its ident to a brand-new
-    leaked worker, which would then look "already in baseline" and be
-    silently excluded -- a false negative. Keying off the object itself
-    (callers hold a reference for the lifetime of the comparison, so it
-    can't be garbage-collected and its id() reused) sidesteps that
-    entirely, at no extra cost. The short poll-until-stable also avoids
-    miscounting a thread that is merely mid-teardown (e.g. between
-    create/remove returning and its worker thread actually exiting) as a
-    permanent survivor, without a flat unconditional sleep on every cycle.
-
-    The returned ``settled`` flag is False if two consecutive samples never
-    matched within *max_wait* -- i.e. the snapshot may still reflect
-    mid-teardown churn rather than a stable end state. Callers should
-    surface this (e.g. in diagnostics) rather than assert on it: a
-    non-converged sample looks identical to a real leak but isn't one.
-    """
-    deadline = time.monotonic() + max_wait
-    prev_threads: frozenset[threading.Thread] | None = None
-    consecutive = 0
-    snapshot: dict[threading.Thread, str] = {}
-    while True:
-        snapshot = {t: t.name for t in threading.enumerate()}
-        current = frozenset(snapshot)
-        if current == prev_threads:
-            consecutive += 1
-            if consecutive >= min_stable_checks:
-                return snapshot, True
-        else:
-            consecutive = 1
-        prev_threads = current
-        if time.monotonic() >= deadline:
-            return snapshot, False
-        time.sleep(poll_interval)
-
-
-_WORKER_THREAD_NAME_SUFFIX = "(_run)"
-
-
-def _is_leak_signature_thread(name: str) -> bool:
-    """True if *name* matches the known leaked-worker thread signature.
-
-    lib-python-worktree's ``_BoundedQueryWorker`` spins up unnamed
-    ``threading.Thread(target=self._run, daemon=True)`` instances. Python's
-    default thread naming appends the target callable's name in parentheses
-    when no explicit name is given, so these threads surface as e.g.
-    ``"Thread-7 (_run)"``. This is a deliberate name-based coupling to a
-    third-party internal, justified by the ticket #111 evidence that every
-    observed survivor matched this exact pattern -- it exists so that an
-    unrelated persistent thread started by pytest/coverage/another plugin
-    during a measured cycle is never mistaken for the leak. If upstream
-    ever renames or restructures the worker, this filter simply stops
-    matching; the unfiltered "any newly-appeared thread" count surfaced
-    alongside it (see the callers below) is what keeps that drift visible
-    instead of silently turning into a false "no leak" pass.
-    """
-    return name.endswith(_WORKER_THREAD_NAME_SUFFIX)
 
 
 def _make_tool_fixtures(tmp_path: Path):
@@ -254,45 +75,48 @@ def _make_repo_with_branches(repo: Path, branch_names: list[str]) -> None:
         _git("branch", name, cwd=repo)
 
 
-_XFAIL_REASON = (
-    "lib-python-worktree v0.3.3 substantially reduced but did not eliminate a "
-    "daemon-thread leak in _win_handle_holders(): _BoundedQueryWorker threads "
-    "that genuinely wedge inside NtQueryObject (documented to hang "
-    "indefinitely for certain handle types) are capped process-wide at "
-    "_MAX_WEDGED_HANDLE_WORKERS=8 for *replacement* workers created within a "
-    "single scan, but every scan -- i.e. every worktree_remove call on "
-    "Windows, since teardown._phase_gate_a_blocking_preflight (post-#159/"
-    "upstream-#135 relocation of the former manager._teardown monolith; "
-    "teardown.py:693, verified against v0.3.11) reaches "
-    "process_lifecycle._find_blocking_processes "
-    "Pass 1c unconditionally -- still always creates its own initial worker "
-    "regardless of whether the cap is already full, and that worker's thread "
-    "is never joined if it wedges. So once the cap fills, each subsequent "
-    "sequential scan leaks one more permanent thread the cap does not bound. "
-    "Measured empirically (agent-worktree#111, 2026-08-17): baseline+8 by the "
-    "end of the first scan (cap fill), then +1 thread per cycle for the "
-    "remaining measured cycles, linear with no plateau. Re-confirmed with "
-    "object-identity (Thread object, not the OS-recycled Thread.ident) "
-    "measurement, isolating the leak from ambient thread activity, and with "
-    "survivors additionally filtered to the known leak-signature thread name "
-    "('Thread-N (_run)'): the leak-signature-filtered and unfiltered counts "
-    "are identical, confirming every survivor is exactly a leaked "
-    "'Thread-N (_run)' worker thread, +1 newly-appeared survivor per "
-    "measured cycle, matching the raw-count figures above. Supersedes "
-    "upstream Seretos/lib-python-worktree#90; tracked here as "
-    "agent-worktree#111. Re-measured against the actually-installed v0.3.10 "
-    "(agent-worktree#159, 2026-08-23): identical defect, identical rate -- "
-    "growth_series=[1, 2, 3, 4, 5, 6] over 6 measured cycles (+1/cycle, no "
-    "plateau), still XFAIL. The #135 _teardown/teardown: redesign did not "
-    "touch _win_handle_holders/_BoundedQueryWorker/_MAX_WEDGED_HANDLE_WORKERS "
-    "at all -- only the caller's module/function name moved (teardown.py:666 "
-    "at v0.3.10; teardown.py:693 verified against v0.3.11). Re-measured "
-    "against the actually-installed v0.3.11 (agent-worktree#169, 2026-08-25): "
-    "still XFAIL (never XPASS), same defect, doubled rate -- "
-    "growth_series=[2, 4, 6, 8, 10, 12] over 6 measured cycles (+2/cycle, no "
-    "plateau; was +1/cycle at v0.3.10). Flip to a plain (non-xfail) test once "
-    "a fixed pin lands."
-)
+# Shared by both tests below rather than a per-test formula (see the
+# approved plan's "Mechanism balance" section). 15.0s is a quarter of the
+# project's inherited timeout=60 (pyproject.toml) -- the literal "well
+# under the 60s timeout" bound the ticket names, made measurable.
+_REMOVE_TOTAL_BUDGET_SEC = 15.0
+
+
+def _make_scan_spy(monkeypatch):
+    """Patch lib_python_worktree.core.teardown's own binding of
+    ``_find_blocking_processes`` with a counting wrapper that delegates to
+    the real function, and return a mutable one-item call counter dict.
+
+    ``teardown.py`` imports the function via
+    ``from .process_lifecycle import _find_blocking_processes`` -- a
+    ``from``-import binding. Patching
+    ``process_lifecycle._find_blocking_processes`` would not be visible to
+    any of ``teardown``'s call sites, which each call the name bound into
+    ``teardown``'s own module namespace. ``raising=True`` so an upstream
+    rename/relocation fails loudly instead of silently patching a stale,
+    no-longer-consulted attribute.
+    """
+    from lib_python_worktree.core import teardown as teardown_mod
+
+    real_find_blocking_processes = teardown_mod._find_blocking_processes
+    calls = {"count": 0}
+
+    def _counting_wrapper(*args, **kwargs):
+        calls["count"] += 1
+        return real_find_blocking_processes(*args, **kwargs)
+
+    # raising=True is intentional, not an oversight: if a future
+    # lib_python_worktree release renamed or removed this binding outright
+    # (rather than just gating it out of the unheld-worktree path), both
+    # tests below must fail loudly here with an AttributeError at patch
+    # time -- not silently install a vacuous spy that never gets called and
+    # let calls["count"] == 0 pass for the wrong reason.
+    monkeypatch.setattr(
+        "lib_python_worktree.core.teardown._find_blocking_processes",
+        _counting_wrapper,
+        raising=True,
+    )
+    return calls
 
 
 @pytest.mark.skipif(
@@ -302,163 +126,97 @@ _XFAIL_REASON = (
         "sys.platform == 'win32'-gated in lib_python_worktree.core.process_lifecycle"
     ),
 )
-@pytest.mark.timeout(300)
-@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
-def test_create_remove_cycles_do_not_leak_threads(tmp_path: Path, capsys):
-    """Repeated worktree_create -> worktree_remove cycles through the
-    registered MCP tool callables must not accumulate newly-appeared,
-    still-alive leak-signature threads (identified by Thread object,
-    relative to a post-warm-up baseline, then filtered to the known
-    ``_BoundedQueryWorker`` ``"(_run)"`` name signature) linearly; the
-    survivor count must plateau.
+def test_create_remove_cycles_are_fast(tmp_path: Path, capsys, monkeypatch):
+    """worktree_remove on an unheld worktree must return promptly and must
+    never reach the systemwide blocking-process handle scan.
 
-    Shape: 2 warm-up cycles (let any one-time thread-pool/module-level setup
-    settle -- see the module docstring's "Known limitation" note on the
-    baseline-after-warm-up blind spot this trades for) -> snapshot baseline
-    thread objects -> 6 measured cycles, each settled and diffed against the
-    baseline -> assert growth <= 2. A leaking engine abandons >=1 daemon
-    thread per remove() and never joins it, so growth over 6 cycles would be
-    >= 6 and this assertion would fail. Cycles whose snapshot never
-    converges within the poll window are excluded from the growth figure the
-    assertion uses (but still printed and named in ``unsettled_labels``),
-    and a materially higher unfiltered-vs-filtered growth is treated as a
-    filter-drift signal that fails the test even if the filtered growth
-    alone would look like a plateau.
+    Driving test for agent-worktree #179/#181. Prior rounds (#111/#159/
+    #169/#176) measured thread *count*, which plateaus under
+    lib-python-worktree's process-wide worker cap even while the scan
+    itself keeps running and costing seconds per call. This test asserts
+    wall-clock duration directly -- what a user actually feels -- plus a
+    spy proving the scan is never invoked at all for an unheld worktree; a
+    fast machine could otherwise pass a timing bound while still paying the
+    scan under the hood.
+
+    Shape: 2 warm-up cycles (let any one-time/lazy initialisation settle,
+    matching this module's historical shape) -> 6 measured cycles, each
+    timing only the ``worktree_remove`` call.
     """
+    calls = _make_scan_spy(monkeypatch)
+
     branch_names = [f"feature/leak-{i:02d}" for i in range(8)]
     repo = tmp_path / "src-repo"
     _make_repo_with_branches(repo, branch_names)
 
-    pre_warmup_thread_count = len(threading.enumerate())
-
     mgr, fns = _make_tool_fixtures(tmp_path)
 
-    series: list[dict[threading.Thread, str]] = []
-    unsettled_labels: list[str] = []
-
-    def _cycle(branch: str) -> tuple[dict[threading.Thread, str], bool]:
+    def _cycle(branch: str) -> float:
         create_result = fns["worktree_create"](repo_root=str(repo), branch=branch)
         assert "error" not in create_result, f"create failed: {create_result}"
-        remove_result = fns["worktree_remove"](
-            environment_id=create_result["id"]
-        )
+        remove_start = time.perf_counter()
+        remove_result = fns["worktree_remove"](environment_id=create_result["id"])
+        remove_duration = time.perf_counter() - remove_start
         assert "error" not in remove_result, f"remove failed: {remove_result}"
-        return _settle_thread_snapshot()
+        return remove_duration
 
-    # Warm-up: let any one-time setup (module import side effects, etc.)
-    # happen before establishing the baseline.
+    total_start = time.perf_counter()
     for i in range(2):
-        snapshot, settled = _cycle(branch_names[i])
-        series.append(snapshot)
-        if not settled:
-            unsettled_labels.append(f"warm-up cycle {i}")
+        _cycle(branch_names[i])
 
-    baseline, baseline_settled = _settle_thread_snapshot()
-    if not baseline_settled:
-        unsettled_labels.append("baseline")
-    baseline_threads = set(baseline)
-    series_measured: list[dict[threading.Thread, str]] = []
-    unfiltered_series: list[dict[threading.Thread, str]] = []
-    cycle_settled: list[bool] = []
-
+    remove_durations: list[float] = []
     for i in range(2, 8):
-        snapshot, settled = _cycle(branch_names[i])
-        cycle_settled.append(settled)
-        if not settled:
-            unsettled_labels.append(f"measured cycle {i - 2}")
-        new_threads = {
-            t: name for t, name in snapshot.items() if t not in baseline_threads
-        }
-        unfiltered_series.append(new_threads)
-        survivors = {
-            t: name for t, name in new_threads.items() if _is_leak_signature_thread(name)
-        }
-        series_measured.append(survivors)
+        remove_durations.append(_cycle(branch_names[i]))
+    total_duration = time.perf_counter() - total_start
 
-    growth_series = [len(s) for s in series_measured]
-    unfiltered_growth_series = [len(s) for s in unfiltered_series]
-    survivor_names = sorted({name for s in series_measured for name in s.values()})
-
-    # Non-converged cycles are excluded from the value the assertion is
-    # computed over -- a mid-teardown snapshot looks identical to a real
-    # leak but isn't one (see _settle_thread_snapshot's docstring) -- while
-    # still being fully visible in the diagnostics above and in
-    # unsettled_labels.
-    settled_growth_series = [
-        g for g, ok in zip(growth_series, cycle_settled) if ok
-    ]
-    settled_unfiltered_growth_series = [
-        g for g, ok in zip(unfiltered_growth_series, cycle_settled) if ok
-    ]
+    diagnostic_thread_count = len(threading.enumerate())
 
     with capsys.disabled():
         print(
-            f"\n[ticket #111] pre-warm-up thread count (diagnostic only, "
-            f"does not gate the assertion): {pre_warmup_thread_count}"
-        )
-        print(f"[ticket #111] warm-up thread counts: {[len(s) for s in series]}")
-        print(f"[ticket #111] baseline thread count after warm-up: {len(baseline_threads)}")
-        print(
-            f"[ticket #111] measured leak-signature survivor-count series "
-            f"(6 cycles): {growth_series}"
+            f"\n[ticket #181] per-cycle worktree_remove durations (s): "
+            f"{remove_durations}"
         )
         print(
-            f"[ticket #111] measured unfiltered (any new thread) count series "
-            f"(6 cycles): {unfiltered_growth_series}"
+            f"[ticket #181] total create+remove wall-clock, 8 cycles (s): "
+            f"{total_duration:.3f}"
         )
-        print(f"[ticket #111] survivor thread names: {survivor_names}")
-        print(f"[ticket #111] cycles that failed to settle: {unsettled_labels}")
-
-    if not settled_growth_series:
-        pytest.fail(
-            f"All {len(cycle_settled)} measured cycles failed to settle "
-            f"within the poll window (unsettled_labels={unsettled_labels}) "
-            "-- there is no converged sample left to compute a survivor-"
-            "growth figure from. This is a runner/timing problem (see "
-            "_settle_thread_snapshot's max_wait), not evidence either way "
-            "about the leak; a guard that vacuously passed on an empty set "
-            "here would be worse than no guard at all."
+        print(
+            f"[ticket #181] teardown._find_blocking_processes call count: "
+            f"{calls['count']}"
+        )
+        print(
+            f"[ticket #181] live thread count (diagnostic only, does not "
+            f"gate the assertion): {diagnostic_thread_count}"
         )
 
-    growth = max(settled_growth_series)
-    unfiltered_growth = max(settled_unfiltered_growth_series)
-    # If the unfiltered ("any newly-appeared thread") growth materially
-    # exceeds the leak-signature-filtered growth, the filter itself may have
-    # stopped matching (e.g. upstream renamed the worker thread) while the
-    # underlying leak continues -- which would otherwise let `growth <= 2`
-    # go green while threads are still piling up. The same plateau tolerance
-    # (2) used for the growth assertion is reused as the divergence
-    # threshold so a single incidental ambient thread doesn't trip this.
-    filter_drift = (unfiltered_growth - growth) > 2
+    slowest = max(remove_durations)
+    median_duration = statistics.median(remove_durations)
+    total_remove = sum(remove_durations)
 
-    with capsys.disabled():
-        print(f"[ticket #111] growth (leak-signature): {growth}")
-        print(f"[ticket #111] growth (unfiltered): {unfiltered_growth}")
-        if filter_drift:
-            print(
-                f"[ticket #111] *** FILTER-DRIFT WARNING ***: unfiltered "
-                f"growth ({unfiltered_growth}) exceeds leak-signature-"
-                f"filtered growth ({growth}) by more than the plateau "
-                f"tolerance -- the '{_WORKER_THREAD_NAME_SUFFIX}' name "
-                "filter in _is_leak_signature_thread may no longer match "
-                "the actual leaking worker thread (e.g. an upstream rename "
-                "of _BoundedQueryWorker), which would let a real, ongoing "
-                "leak pass this guard silently. Investigate before trusting "
-                "a green result here."
-            )
-
-    assert growth <= 2 and not filter_drift, (
-        f"{growth} newly-appeared, still-alive leak-signature thread(s) "
-        f"(name matches '{_WORKER_THREAD_NAME_SUFFIX}') accumulated over "
-        f"{len(settled_growth_series)} converged create/remove cycle(s) "
-        f"(of 6 measured) relative to baseline "
-        f"(per-cycle leak-signature survivor counts={growth_series}, "
-        f"per-cycle unfiltered new-thread counts={unfiltered_growth_series}, "
-        f"survivor thread names={survivor_names}, "
-        f"cycles that failed to settle={unsettled_labels}, "
-        f"filter_drift={filter_drift}) -- expected a plateau (growth <= 2) "
-        f"with no filter drift, not linear per-cycle growth or a "
-        f"filtered/unfiltered divergence"
+    assert slowest < 5.0, (
+        f"slowest worktree_remove took {slowest:.3f}s (bound 5.0s) -- "
+        f"per-cycle durations={remove_durations}"
+    )
+    assert median_duration < 2.0, (
+        f"median worktree_remove duration was {median_duration:.3f}s "
+        f"(bound 2.0s) -- per-cycle durations={remove_durations}"
+    )
+    assert total_remove < _REMOVE_TOTAL_BUDGET_SEC, (
+        f"{len(remove_durations)} removes took {total_remove:.3f}s total "
+        f"(bound {_REMOVE_TOTAL_BUDGET_SEC}s) -- per-cycle durations="
+        f"{remove_durations}"
+    )
+    assert total_duration < 30.0, (
+        f"the full 8-cycle create+remove run took {total_duration:.3f}s "
+        f"total (bound 30.0s, well under the project's inherited 60s "
+        f"per-test timeout) -- per-cycle remove durations={remove_durations}"
+    )
+    assert calls["count"] == 0, (
+        f"teardown._find_blocking_processes was called {calls['count']} "
+        f"time(s) across {len(remove_durations)} removes of an unheld "
+        f"worktree -- expected 0: the systemwide blocking-process scan "
+        f"must never run when nothing holds the worktree; per-cycle "
+        f"durations={remove_durations}"
     )
 
 
@@ -469,161 +227,130 @@ def test_create_remove_cycles_do_not_leak_threads(tmp_path: Path, capsys):
         "sys.platform == 'win32'-gated in lib_python_worktree.core.process_lifecycle"
     ),
 )
-@pytest.mark.timeout(300)
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        _XFAIL_REASON
-        + " This variant exercises the kill_blocking_processes=True call site "
-        "(manager.py's other _find_blocking_processes/_kill_blocking_processes "
-        "reach, ticket #44) and shows the same defect (measured growth=3 over "
-        "3 cycles here vs. the <=2 plateau bound). Re-measured against the "
-        "actually-installed v0.3.10 (agent-worktree#159, 2026-08-23): "
-        "identical defect at the identical rate, growth_series=[1, 2, 3] "
-        "over 3 measured cycles, still XFAIL. Re-measured against the "
-        "actually-installed v0.3.11 (agent-worktree#169, 2026-08-25): still "
-        "XFAIL (never XPASS), doubled rate, growth_series=[2, 4, 6] over 3 "
-        "measured cycles (+2/cycle; was +1/cycle at v0.3.10)."
-    ),
-)
-def test_create_remove_cycles_with_kill_blocking_processes_do_not_leak_threads(
-    tmp_path: Path, capsys
+def test_create_remove_cycles_with_kill_blocking_processes_are_fast(
+    tmp_path: Path, capsys, monkeypatch
 ):
-    """Same plateau requirement as test_create_remove_cycles_do_not_leak_threads,
-    but through the kill_blocking_processes=True call site (manager.py's other
-    _find_blocking_processes/_kill_blocking_processes reach, ticket #44).
+    """Same requirement as test_create_remove_cycles_are_fast, through the
+    kill_blocking_processes=True call site (ticket #44).
 
-    Smaller N (2 warm-up + 3 measured) since this path additionally exercises
-    _kill_blocking_processes, which itself calls _find_blocking_processes.
-    Same non-converged-cycle exclusion and filter-drift check as the other
-    test in this module -- see its docstring and the module docstring's
-    "Known limitation" note for the rationale.
+    Code read (see the approved plan): ctx.kill_blocking_processes is only
+    consulted after a blocker has already been found (teardown.py's Gate A
+    confirmation and the orphan-scan phase), so for an unheld worktree this
+    call site's code path is byte-for-byte identical to the default one --
+    there is no legitimate carve-out for a weaker spy bound here. Smaller N
+    (2 warm-up + 3 measured) matches this module's historical shape for
+    this call site.
     """
+    calls = _make_scan_spy(monkeypatch)
+
     branch_names = [f"feature/leak-kill-{i:02d}" for i in range(5)]
     repo = tmp_path / "src-repo"
     _make_repo_with_branches(repo, branch_names)
 
-    pre_warmup_thread_count = len(threading.enumerate())
-
     mgr, fns = _make_tool_fixtures(tmp_path)
 
-    series: list[dict[threading.Thread, str]] = []
-    unsettled_labels: list[str] = []
-
-    def _cycle(branch: str) -> tuple[dict[threading.Thread, str], bool]:
+    def _cycle(branch: str) -> float:
         create_result = fns["worktree_create"](repo_root=str(repo), branch=branch)
         assert "error" not in create_result, f"create failed: {create_result}"
+        remove_start = time.perf_counter()
         remove_result = fns["worktree_remove"](
             environment_id=create_result["id"],
             kill_blocking_processes=True,
         )
+        remove_duration = time.perf_counter() - remove_start
         assert "error" not in remove_result, f"remove failed: {remove_result}"
-        return _settle_thread_snapshot()
+        return remove_duration
 
+    total_start = time.perf_counter()
     for i in range(2):
-        snapshot, settled = _cycle(branch_names[i])
-        series.append(snapshot)
-        if not settled:
-            unsettled_labels.append(f"warm-up cycle {i}")
+        _cycle(branch_names[i])
 
-    baseline, baseline_settled = _settle_thread_snapshot()
-    if not baseline_settled:
-        unsettled_labels.append("baseline")
-    baseline_threads = set(baseline)
-    series_measured: list[dict[threading.Thread, str]] = []
-    unfiltered_series: list[dict[threading.Thread, str]] = []
-    cycle_settled: list[bool] = []
-
+    remove_durations: list[float] = []
     for i in range(2, 5):
-        snapshot, settled = _cycle(branch_names[i])
-        cycle_settled.append(settled)
-        if not settled:
-            unsettled_labels.append(f"measured cycle {i - 2}")
-        new_threads = {
-            t: name for t, name in snapshot.items() if t not in baseline_threads
-        }
-        unfiltered_series.append(new_threads)
-        survivors = {
-            t: name for t, name in new_threads.items() if _is_leak_signature_thread(name)
-        }
-        series_measured.append(survivors)
+        remove_durations.append(_cycle(branch_names[i]))
+    total_duration = time.perf_counter() - total_start
 
-    growth_series = [len(s) for s in series_measured]
-    unfiltered_growth_series = [len(s) for s in unfiltered_series]
-    survivor_names = sorted({name for s in series_measured for name in s.values()})
-
-    # See the other test's matching comment: non-converged cycles are
-    # excluded from the assertion's growth figure but stay fully visible in
-    # the diagnostics below and in unsettled_labels.
-    settled_growth_series = [
-        g for g, ok in zip(growth_series, cycle_settled) if ok
-    ]
-    settled_unfiltered_growth_series = [
-        g for g, ok in zip(unfiltered_growth_series, cycle_settled) if ok
-    ]
+    diagnostic_thread_count = len(threading.enumerate())
 
     with capsys.disabled():
         print(
-            f"\n[ticket #111] (kill_blocking_processes) pre-warm-up thread "
-            f"count (diagnostic only, does not gate the assertion): "
-            f"{pre_warmup_thread_count}"
-        )
-        print(f"[ticket #111] (kill_blocking_processes) warm-up thread counts: {[len(s) for s in series]}")
-        print(f"[ticket #111] (kill_blocking_processes) baseline thread count: {len(baseline_threads)}")
-        print(
-            f"[ticket #111] (kill_blocking_processes) measured leak-signature "
-            f"survivor-count series (3 cycles): {growth_series}"
+            f"\n[ticket #181] (kill_blocking_processes) per-cycle "
+            f"worktree_remove durations (s): {remove_durations}"
         )
         print(
-            f"[ticket #111] (kill_blocking_processes) measured unfiltered "
-            f"(any new thread) count series (3 cycles): {unfiltered_growth_series}"
+            f"[ticket #181] (kill_blocking_processes) total create+remove "
+            f"wall-clock, 5 cycles (s): {total_duration:.3f}"
         )
-        print(f"[ticket #111] (kill_blocking_processes) survivor thread names: {survivor_names}")
-        print(f"[ticket #111] (kill_blocking_processes) cycles that failed to settle: {unsettled_labels}")
-
-    if not settled_growth_series:
-        pytest.fail(
-            f"All {len(cycle_settled)} measured cycles failed to settle "
-            f"within the poll window (unsettled_labels={unsettled_labels}) "
-            "-- there is no converged sample left to compute a survivor-"
-            "growth figure from. This is a runner/timing problem (see "
-            "_settle_thread_snapshot's max_wait), not evidence either way "
-            "about the leak; a guard that vacuously passed on an empty set "
-            "here would be worse than no guard at all."
+        print(
+            f"[ticket #181] (kill_blocking_processes) "
+            f"teardown._find_blocking_processes call count: {calls['count']}"
+        )
+        print(
+            f"[ticket #181] (kill_blocking_processes) live thread count "
+            f"(diagnostic only, does not gate the assertion): "
+            f"{diagnostic_thread_count}"
         )
 
-    growth = max(settled_growth_series)
-    unfiltered_growth = max(settled_unfiltered_growth_series)
-    # Same divergence check and rationale as the other test in this module.
-    filter_drift = (unfiltered_growth - growth) > 2
+    slowest = max(remove_durations)
+    median_duration = statistics.median(remove_durations)
+    total_remove = sum(remove_durations)
 
-    with capsys.disabled():
-        print(f"[ticket #111] (kill_blocking_processes) growth (leak-signature): {growth}")
-        print(f"[ticket #111] (kill_blocking_processes) growth (unfiltered): {unfiltered_growth}")
-        if filter_drift:
-            print(
-                f"[ticket #111] (kill_blocking_processes) *** FILTER-DRIFT "
-                f"WARNING ***: unfiltered growth ({unfiltered_growth}) "
-                f"exceeds leak-signature-filtered growth ({growth}) by more "
-                f"than the plateau tolerance -- the "
-                f"'{_WORKER_THREAD_NAME_SUFFIX}' name filter in "
-                "_is_leak_signature_thread may no longer match the actual "
-                "leaking worker thread (e.g. an upstream rename of "
-                "_BoundedQueryWorker), which would let a real, ongoing leak "
-                "pass this guard silently. Investigate before trusting a "
-                "green result here."
-            )
+    assert slowest < 5.0, (
+        f"slowest worktree_remove(kill_blocking_processes=True) took "
+        f"{slowest:.3f}s (bound 5.0s) -- per-cycle durations="
+        f"{remove_durations}"
+    )
+    assert median_duration < 2.0, (
+        f"median worktree_remove(kill_blocking_processes=True) duration "
+        f"was {median_duration:.3f}s (bound 2.0s) -- per-cycle durations="
+        f"{remove_durations}"
+    )
+    assert total_remove < _REMOVE_TOTAL_BUDGET_SEC, (
+        f"{len(remove_durations)} removes took {total_remove:.3f}s total "
+        f"(bound {_REMOVE_TOTAL_BUDGET_SEC}s) -- per-cycle durations="
+        f"{remove_durations}"
+    )
+    assert total_duration < 20.0, (
+        f"the full 5-cycle create+remove(kill_blocking_processes=True) run "
+        f"took {total_duration:.3f}s total (bound 20.0s, well under the "
+        f"project's inherited 60s per-test timeout) -- per-cycle remove "
+        f"durations={remove_durations}"
+    )
+    assert calls["count"] == 0, (
+        f"teardown._find_blocking_processes was called {calls['count']} "
+        f"time(s) across {len(remove_durations)} "
+        f"removes(kill_blocking_processes=True) of an unheld worktree -- "
+        f"expected 0: kill_blocking_processes adds no scan for a worktree "
+        f"nothing is blocking (ctx.kill_blocking_processes is only "
+        f"consulted after a blocker is already found), so this must match "
+        f"the default call site's zero-call bound exactly; per-cycle "
+        f"durations={remove_durations}"
+    )
 
-    assert growth <= 2 and not filter_drift, (
-        f"{growth} newly-appeared, still-alive leak-signature thread(s) "
-        f"(name matches '{_WORKER_THREAD_NAME_SUFFIX}') accumulated over "
-        f"{len(settled_growth_series)} converged "
-        f"create/remove(kill_blocking_processes=True) cycle(s) (of 3 "
-        f"measured) relative to baseline "
-        f"(per-cycle leak-signature survivor counts={growth_series}, "
-        f"per-cycle unfiltered new-thread counts={unfiltered_growth_series}, "
-        f"survivor thread names={survivor_names}, "
-        f"cycles that failed to settle={unsettled_labels}, "
-        f"filter_drift={filter_drift}) -- expected a plateau (growth <= 2) "
-        f"with no filter drift"
+
+def test_thread_leak_tests_are_no_longer_xfail():
+    """Guard against a repeat of the #111/#159/#169/#176 pattern: keep an
+    ``xfail`` mark (or an inflated per-test timeout) in place and call the
+    hang "fixed" without it actually being fixed.
+
+    This module's own source must carry neither an xfail marker nor a
+    per-test timeout-override marker now that the upstream fix (ticket
+    #181) is proven. The needle strings are built by concatenation so this
+    guard's own assertions/messages can't accidentally match themselves.
+    """
+    source = Path(__file__).read_text(encoding="utf-8")
+    xfail_marker = "pytest" + ".mark.xfail"
+    timeout_override_marker = "pytest" + ".mark.timeout("
+
+    assert xfail_marker not in source, (
+        "tests/test_thread_leak_regression.py must not reintroduce an "
+        "xfail marker -- ticket #181 closes the #111/#159/#169/#176 "
+        "pattern of leaving the escape hatch in place and calling the hang "
+        "'fixed'"
+    )
+    assert timeout_override_marker not in source, (
+        "tests/test_thread_leak_regression.py must not override the "
+        "project-wide timeout=60 (pyproject.toml) with a per-test timeout "
+        "marker -- that would hide a real regression behind an inflated "
+        "ceiling instead of failing loudly within the shared 60s bound"
     )

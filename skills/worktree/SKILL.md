@@ -465,11 +465,13 @@ read-back tool.
    sense for a call that returned.
 
 **Fields that can never serve as read-back evidence.** `stop_attempt`,
-`killed_pids`, `shadowed_contract` and `orphan_scan` are transient: they are
+`killed_pids` and `shadowed_contract` are transient: they are
 never written to `state.yaml`, and `environment_list` rebuilds every entry
 from persisted state, so those keys are always `null`/`[]` there no matter
 what happened. Read them only from the response of the call that produced
-them.
+them. (Ticket #181: the pinned engine's v0.3.13 bump removed
+`WorktreeRecord.orphan_scan` entirely -- a breaking upstream change, not
+just a doc correction.)
 
 **What this does and does not fix.** The transport drop itself is outside this
 plugin's reach. The Windows `SIGBREAK` guard (ticket #112) addresses one
