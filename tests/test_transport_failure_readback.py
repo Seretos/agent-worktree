@@ -441,18 +441,29 @@ def test_environment_start_staleness_caveat_is_inside_the_heuristic_window():
 def test_environment_list_documents_transient_fields():
     """Driving test (RED before the docstring edit, GREEN after).
 
-    environment_list's docstring must name all four fields that are
+    environment_list's docstring must name all three fields that are
     structurally never persisted to state.yaml (stop_attempt, killed_pids,
-    shadowed_contract, orphan_scan -- the last added by the pinned engine's
-    v0.3.11 bump, ticket #169) together with a transience cue, and must
-    separately state that retrying environment_list itself is always safe."""
+    shadowed_contract) together with a transience cue, and must separately
+    state that retrying environment_list itself is always safe.
+
+    Ticket #181: the pinned engine's v0.3.13 bump removed
+    ``WorktreeRecord.orphan_scan`` entirely (it existed from the v0.3.11
+    bump, ticket #169, through v0.3.12) -- a breaking upstream change, so
+    the docstring must no longer name it, and this test asserts the
+    negative explicitly rather than just dropping it from the positive
+    list above."""
     doc = _normalize(_get_tool_docstring("environment_list"))
 
-    for field in ("stop_attempt", "killed_pids", "shadowed_contract", "orphan_scan"):
+    for field in ("stop_attempt", "killed_pids", "shadowed_contract"):
         assert field in doc, (
             f"environment_list's docstring must name {field!r} as a field "
             f"it never populates"
         )
+    assert "orphan_scan" not in doc, (
+        "environment_list's docstring must not mention orphan_scan -- "
+        "ticket #181's v0.3.13 bump removed WorktreeRecord.orphan_scan "
+        "entirely, so the field no longer exists to document"
+    )
     assert re.search(r"transient|never|not persisted", doc), (
         "environment_list's docstring must carry a transience cue "
         "(transient/never/not persisted) near the never-populated fields"
