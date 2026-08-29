@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+from importlib.metadata import version
 from pathlib import Path
 from typing import Iterator, Tuple
 from unittest.mock import patch
@@ -1644,6 +1645,76 @@ def test_environment_start_contract_only_in_checkout_reports_misplaced(
     assert result["contract_found"] is False
     assert result["no_op_reason"] == "contract_misplaced"
     assert result["steps_run"] == 0
+
+
+@pytest.mark.parametrize("root_contract_removed", [True, False])
+def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine(
+    tmp_path: Path, temp_repo: Path, root_contract_removed: bool
+):
+    """Ticket #183 fund 2 -- measurement, not assertion of a desired
+    outcome. The docstring (worktree.py CAUTION, lines ~1502-1503, and the
+    ``shadowed_contract`` bullet tail, lines ~1799-1803) currently claims
+    "the engine may additionally set ``shadowed_contract``" for the
+    #124/contract_misplaced repro. This test runs the REAL, unmocked
+    ``WorktreeManager.start()`` against the pinned v0.3.13 engine to observe
+    what it actually returns, under both readings of "misplaced": the
+    repo_root contract existed and was removed (True), and it never existed
+    at all (False).
+
+    First line self-guards the measurement: a drifted/stale venv must fail
+    here, loudly, rather than silently mismeasuring against some other
+    engine version.
+
+    Measured result (tests-phase, this run): BOTH parametrizations return an
+    IDENTICAL, populated ``shadowed_contract`` -- branch FIRES, not the NULL
+    branch the ticket's original E2E sweep reported. This is a real,
+    unmocked-engine measurement test: it came back GREEN on first run, which
+    is expected and correct per the plan's three anticipated outcomes, not a
+    bug. The assertions below are the permanent pin of that measured
+    outcome (``reason: "differs"``, `path`/`used_path` identifying the
+    checkout-local vs. repo_root contract respectively, and the message's
+    fixed wording) -- flipped from the tests-phase's placeholder assertion
+    (``shadowed_contract is not None``) atomically with the docstring
+    rewrite this measurement grounds (worktree.py CAUTION and bullet tail).
+    A future engine bump that changes this behaviour fails here.
+    """
+    assert version("lib-python-worktree") == "0.3.13"
+
+    if root_contract_removed:
+        _write_contract(
+            temp_repo, "version: 1\nisolation: full\nstart:\n  - run: echo root\n"
+        )
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    rec = mgr.create(str(temp_repo), "feature/wt")
+    if root_contract_removed:
+        (temp_repo / ".seretos" / "worktree-setup.yml").unlink()
+    # Divergent contract only in the checkout, not repo_root -- the #124
+    # repro, in both the "removed" and "never existed" readings.
+    _write_contract(
+        Path(rec.path), "version: 1\nisolation: full\nstart:\n  - run: echo hi\n"
+    )
+
+    result = fns["environment_start"](environment_id=rec.id)
+
+    assert result["no_op_reason"] == "contract_misplaced"
+    assert result["contract_found"] is False
+
+    # Permanent pin of the measured branch-FIRES outcome (both parametrizations
+    # produced an identical structure): the field IS populated for the
+    # #124 misplaced-contract repro, with reason "differs" -- never "unreadable"
+    # here, since both files are readable, merely different. Absolute temp
+    # paths are environment-dependent, so path/used_path are compared as
+    # Path objects against the known checkout/repo_root contract locations
+    # rather than as literal strings.
+    shadowed = result["shadowed_contract"]
+    assert shadowed is not None
+    assert shadowed["reason"] == "differs"
+    checkout_contract = str(Path(rec.path) / ".seretos" / "worktree-setup.yml")
+    repo_root_contract = str(temp_repo / ".seretos" / "worktree-setup.yml")
+    assert Path(shadowed["path"]) == Path(checkout_contract)
+    assert Path(shadowed["used_path"]) == Path(repo_root_contract)
+    assert "differs" in shadowed["message"]
+    assert "checkout-local copy is never read by start()" in shadowed["message"]
 
 
 def test_environment_start_primary_same_path_never_reports_misplaced(

@@ -1282,7 +1282,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
             ``"repo"`` (no second shape, no repo-grouping wrapper). The repo
             containing ``path`` is always listed first. Costs one extra
             ``git worktree list --porcelain`` subprocess call per
-            *additional* repo. Any unknown value raises ``ValueError``.
+            *additional* repo. **Discloses more than cost**: for every
+            additional repo, the result includes that repo's checkout
+            paths and real branch names -- including other projects' and
+            other sessions' live work on the same machine, whenever this
+            server has tracked an environment for them. Use ``repos=[...]``
+            below to narrow the fan-out to specific repos, or stay on
+            ``scope="repo"`` to see only the repo containing ``path``. Any
+            unknown value raises ``ValueError``.
         repos:
             Optional allow-list of repo roots or parent directories,
             **only valid when ``scope="all"``** -- passing it under
@@ -1498,9 +1505,10 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         ``no_op_reason: "contract_misplaced"`` (vs ``"no_contract"`` for the
         genuinely-unconfigured case). Callers should branch on ``no_op_reason``
         rather than inferring the cause from ``status``/``pids`` alone -- see
-        the "Contract diagnostics" block below for the full five-key set. The
-        engine may additionally set ``shadowed_contract`` on the response in
-        this case -- see the sixth diagnostic bullet below.
+        the "Contract diagnostics" block below for the full five-key set.
+        Measured on the pinned engine (``lib-python-worktree`` v0.3.13): this
+        case also sets ``shadowed_contract`` on the response, with
+        ``reason: "differs"`` -- see the sixth diagnostic bullet below.
 
         Addressing the target
         ----------------------
@@ -1796,11 +1804,12 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           contract exists and starts *normally* while the checkout-local
           copy was separately edited to differ (``no_op_reason`` is
           ``null`` there, and the five wrapper-derived keys above see
-          nothing wrong) -- but it fires just as readily alongside a
-          non-``null`` ``no_op_reason``, notably ``"contract_misplaced"``:
-          no file exists at ``repo_root``, the implicit fallback contract is
-          what gets compared, and a checkout-local copy that diverges from
-          that fallback still shadows it.
+          nothing wrong). Measured on the pinned engine (``lib-python-worktree``
+          v0.3.13), it also fires alongside a non-``null`` ``no_op_reason``,
+          notably ``"contract_misplaced"``: no file exists at ``repo_root``,
+          the implicit fallback contract is what gets compared, and a
+          checkout-local copy that diverges from that fallback still shadows
+          it.
 
         If the target is not found, returns ``{"error": "...", "code":
         "not_found"}`` instead of raising, so callers can treat not-found as
