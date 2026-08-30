@@ -1,42 +1,38 @@
-"""Driving tests for ticket #170: `changelog` in the marketplace dispatch
-payload.
+"""Driving tests for ticket #170 (`changelog` in the marketplace dispatch
+payload) and ticket #184 (real changelogs for the orphan-tag release flow).
 
 Both `.github/workflows/release.yml` (job `assemble`, step "Dispatch to
 agent-marketplace") and `.github/workflows/dispatch.yml` (job `dispatch`,
-same step name) currently POST a `client_payload` built by an unquoted bash
-heredoc that raw-splices `${NAME}`/`${DESC}` into a JSON literal. Ticket #170
-rebuilds both with `jq -n --arg ...`, adds a `changelog` key sourced from
-`gh api .../releases/generate-notes`, truncates it at 30000 chars, and warns
-+ omits it on fetch failure/empty/whitespace/`null` body -- without ever
-aborting the dispatch itself.
+same step name) POST a `client_payload` to the agent-marketplace repo.
+Ticket #170 rebuilt the payload with `jq -n --arg ...` and added a
+`changelog` key; ticket #184 moved all of that payload-building logic out of
+the workflow YAML entirely, into the shared
+`.github/scripts/marketplace-payload.sh` script (see
+tests/test_release_scripts.py for that script's own driving tests).
 
-This module has two independent layers (mirroring
-tests/test_wrapper_script_args.py's shape, plan step 5):
+This module now carries only the static, text-level guards on the two
+workflow YAML files -- no external tool dependency, so these run on every CI
+leg:
 
-  (a) Static guards that parse the two workflow YAML files and inspect the
-      "Dispatch to agent-marketplace" step's `run` string as *text*. No
-      external tool dependency -- these run on every CI leg.
-  (b) Tests that drive the *real* `bash` + `jq` interpreters against that
-      exact `run` text, with stub `gh`/`curl` scripts prepended to PATH and
-      a fixture `.claude-plugin/plugin.json` in a tmp_path. Skipped when
-      `bash` or `jq` is not on PATH.
+  - the "Dispatch to agent-marketplace" step's `run:` text contains no
+    heredoc, no raw `${{ ... }}` expression, and actually delegates to
+    `.github/scripts/marketplace-payload.sh`;
+  - both workflows' `run:` text for that step stays byte-identical (the
+    duplication ticket #170 introduced is still pinned by this guard, even
+    though the duplicated text itself is now a two-line delegation rather
+    than ~70 lines of inline jq);
+  - `dispatch.yml`'s workflow-level `permissions:` and its required `env:`
+    vars and sparse-checkout of `main`'s `.github/scripts`.
 
-Ticket #170 is a behavioural change (a new `changelog` key appears in a
-payload that previously never had one, sourced from a live API call with
-failure/truncation handling) so this module follows TDD: every assertion
-below is expected to fail against today's heredoc-based `run` text, for the
-reasons documented inline. Only after the workflow YAML is rewritten
-(implementation phase, not this dispatch) do these turn green.
+A "Layer (b)" of six `dispatch_harness`-based tests (~18 parametrized
+instances) used to live here, driving the real `bash`+`jq` interpreters
+against the step's old *inline* run: text with stub `gh`/`curl` scripts.
+Ticket #184 retired it -- see the retirement note at the end of this file
+for why, and where the equivalent (now more precise) coverage moved.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import stat
-import subprocess
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -155,52 +151,55 @@ def test_dispatch_step_run_text_confines_github_expressions_to_env(workflow):
     )
 
 
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_dispatch_step_run_text_declares_changelog_key(workflow):
-    """Driving test (plan behaviour 1, static half) -- the client_payload
-    literal/jq program must name a `changelog` key.
-
-    RED today: neither workflow's payload mentions "changelog" anywhere.
-    """
-    run_text = _dispatch_run_text(workflow)
-    assert "changelog" in run_text, (
-        f"{workflow.name}: {STEP_NAME!r} step's run text does not mention "
-        f"'changelog' anywhere -- ticket #170 requires a changelog key in "
-        f"client_payload, sourced from the release's generated notes"
-    )
-
-
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_dispatch_step_run_text_warns_on_fetch_failure(workflow):
-    """Driving test (plan behaviour 4, static half) -- a failed/empty/null
-    notes fetch must emit a `::warning::` annotation, never abort the step.
-
-    RED today: neither workflow's run text contains '::warning::'.
-    """
-    run_text = _dispatch_run_text(workflow)
-    assert "::warning::" in run_text, (
-        f"{workflow.name}: {STEP_NAME!r} step's run text does not emit "
-        f"'::warning::' anywhere -- ticket #170 requires warning and "
-        f"omitting the changelog key (not aborting the dispatch) when the "
-        f"notes fetch fails, is empty, whitespace-only, or literal 'null'"
-    )
+# ---------------------------------------------------------------------------
+# Ticket #184 retires the three checks that used to live here
+# (test_dispatch_step_run_text_declares_changelog_key,
+# test_dispatch_step_run_text_warns_on_fetch_failure,
+# test_dispatch_step_run_text_mentions_truncation_boundary): once the payload
+# is built by the shared `.github/scripts/marketplace-payload.sh` (see
+# test_dispatch_step_invokes_shared_marketplace_payload_script below), the
+# "changelog"/"::warning::"/"30000"/"truncat*" strings move out of the
+# workflow YAML's `run:` text entirely and into that script -- asserting
+# their presence *in run_text* would then assert something false about a
+# correct implementation. The equivalent, more precise coverage now lives in
+# tests/test_release_scripts.py's marketplace-payload.sh tests (R3):
+# test_marketplace_payload_hostile_changelog_round_trips_byte_for_byte,
+# test_marketplace_payload_empty_body_warns_and_omits_key,
+# test_marketplace_payload_truncates_above_30000_chars, and friends.
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_dispatch_step_run_text_mentions_truncation_boundary(workflow):
-    """Driving test (plan behaviour 3, static half) -- the ~30KB truncation
-    boundary must appear in the run text.
+def test_dispatch_step_invokes_shared_marketplace_payload_script(workflow):
+    """Driving test (ticket #184, R4) -- the payload-building logic must be
+    delegated to `.github/scripts/marketplace-payload.sh`, not stay inline
+    in the workflow `run:` text (which is how ticket #170 originally built
+    it, and how #184's own predecessor bug -- sourcing the changelog from
+    `releases/generate-notes` against the orphan tag -- got in).
 
-    RED today: neither workflow's run text mentions 30000/truncat* anywhere.
+    RED today: neither workflow's run text mentions
+    'marketplace-payload.sh' anywhere; both still carry the full inline jq
+    program (identifiable by its `def truncated_changelog:` function).
     """
     run_text = _dispatch_run_text(workflow)
-    assert "30000" in run_text, (
-        f"{workflow.name}: {STEP_NAME!r} step's run text does not mention "
-        f"the 30000-char truncation boundary from ticket #170"
+    assert "marketplace-payload.sh" in run_text, (
+        f"{workflow.name}: {STEP_NAME!r} step's run text does not invoke "
+        f"'marketplace-payload.sh' -- ticket #184 requires the payload-"
+        f"building logic to move into the shared "
+        f".github/scripts/marketplace-payload.sh script"
     )
-    assert "truncat" in run_text.lower(), (
-        f"{workflow.name}: {STEP_NAME!r} step's run text does not mention "
-        f"truncation anywhere"
+    assert "def truncated_changelog" not in run_text, (
+        f"{workflow.name}: {STEP_NAME!r} step's run text still contains the "
+        f"old inline jq truncation function -- this logic must move into "
+        f".github/scripts/marketplace-payload.sh, not stay duplicated in "
+        f"the workflow YAML"
+    )
+    assert "releases/generate-notes" not in run_text, (
+        f"{workflow.name}: {STEP_NAME!r} step's run text must never call "
+        f"releases/generate-notes against the orphan tag directly -- that "
+        f"reproduces the empty-notes bug ticket #184 fixes; the changelog "
+        f"must come from marketplace-payload.sh's `gh release view` call "
+        f"instead"
     )
 
 
@@ -226,311 +225,115 @@ def test_release_and_dispatch_run_text_are_byte_identical():
     )
 
 
-def test_dispatch_workflow_declares_contents_write_permission():
-    """Driving test (plan behaviour 5, plan step 2) -- dispatch.yml needs
-    `permissions: contents: write` at the workflow level so its `GH_TOKEN:
-    ${{ secrets.GITHUB_TOKEN }}` can authenticate the `gh api
-    .../generate-notes` call.
+def test_dispatch_workflow_declares_contents_read_permission():
+    """Driving test (ticket #184) -- dispatch.yml's `permissions:` must drop
+    from `contents: write` (ticket #170's requirement, when this workflow's
+    own `gh api .../generate-notes` call needed write-capable auth) to
+    `contents: read`: #184 removes that inline `generate-notes` call
+    entirely (see test_dispatch_step_invokes_shared_marketplace_payload_script
+    above) -- the only remaining `gh` calls (`gh release view` inside
+    marketplace-payload.sh, `gh api .../git/refs/...` reads) are read-only,
+    so `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` no longer needs write access.
 
-    RED today: dispatch.yml declares no top-level `permissions:` key at all.
+    RED today: dispatch.yml still declares 'contents: write'.
     """
     workflow = _load_workflow(DISPATCH_WORKFLOW)
     permissions = workflow.get("permissions")
     assert isinstance(permissions, dict), (
         "dispatch.yml must declare a workflow-level 'permissions:' mapping "
-        f"(ticket #170) -- found {permissions!r}"
+        f"(ticket #184) -- found {permissions!r}"
     )
-    assert permissions.get("contents") == "write", (
-        "dispatch.yml's workflow-level 'permissions:' must include "
-        f"'contents: write' (ticket #170) -- found {permissions!r}"
+    assert permissions.get("contents") == "read", (
+        "dispatch.yml's workflow-level 'permissions:' must be "
+        f"'contents: read' (ticket #184 -- no write-requiring call remains "
+        f"in this workflow) -- found {permissions!r}"
     )
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
 def test_dispatch_step_env_declares_required_vars(workflow):
-    """Driving test (plan behaviour 5, plan step 5) -- both steps' `env:`
-    must declare GH_TOKEN/REPO/TAG/VERSION (every `${{ ... }}` expression
-    confined to env, per plan step 5).
+    """Driving test (ticket #170 + #184) -- both steps' `env:` must declare
+    every var the shared `.github/scripts/marketplace-payload.sh` needs
+    (GH_TOKEN/REPO/TAG/VERSION from #170, plus PLUGIN_JSON/MAX_CHANGELOG_LEN
+    added by #184 now that those were previously computed/literal inline in
+    the workflow's own jq program -- see
+    tests/test_release_scripts.py::test_marketplace_payload_fails_loudly_when_required_env_var_missing
+    for the script-level half of this requirement).
 
-    RED today: neither workflow's step env declares GH_TOKEN or REPO.
+    RED today: neither workflow's step env declares PLUGIN_JSON or
+    MAX_CHANGELOG_LEN (both are still inline literals/lookups, not env
+    vars).
     """
     env = _dispatch_step_env(workflow)
-    required = {"GH_TOKEN", "REPO", "TAG", "VERSION"}
+    required = {"GH_TOKEN", "REPO", "TAG", "VERSION", "PLUGIN_JSON", "MAX_CHANGELOG_LEN"}
     missing = required - env.keys()
     assert not missing, (
         f"{workflow.name}: {STEP_NAME!r} step's env: mapping is missing "
-        f"{sorted(missing)} (ticket #170 requires GH_TOKEN, REPO, TAG, "
-        f"VERSION all declared in env: so the run: body never splices a "
-        f"'${{{{ ... }}}}' expression directly) -- found keys {sorted(env.keys())}"
+        f"{sorted(missing)} (ticket #184 requires GH_TOKEN, REPO, TAG, "
+        f"VERSION, PLUGIN_JSON, MAX_CHANGELOG_LEN all declared in env: so "
+        f"the shared marketplace-payload.sh script receives every value it "
+        f"needs and the run: body never splices a '${{{{ ... }}}}' expression "
+        f"directly) -- found keys {sorted(env.keys())}"
     )
 
 
-# ---------------------------------------------------------------------------
-# Layer (b) -- real bash + jq harness.
-# ---------------------------------------------------------------------------
+def test_dispatch_workflow_sparse_checks_out_main_scripts():
+    """Driving test (ticket #184, R4) -- dispatch.yml's only checkout is
+    `ref: release`, which carries no `.github/` tree at all, so it cannot
+    reach `.github/scripts/marketplace-payload.sh` on its own. #184 adds a
+    second `actions/checkout@v4` step: `ref: main`, sparse-checked-out to
+    just `.github/scripts`, landed at `path: .ci-scripts` (plan Approach
+    section, dispatch.yml bullet).
 
-
-def _resolve(tool: str) -> str | None:
-    return shutil.which(tool)
-
-
-BASH = _resolve("bash")
-JQ = _resolve("jq")
-
-# The stub gh/curl only need to exist on PATH; real gh/curl are never
-# invoked by the tests below (curl is real on this machine but the stub
-# shadows it via a PATH prefix, since the point is to intercept the POST,
-# not perform it).
-_SKIP_REASON = None
-if BASH is None:
-    _SKIP_REASON = "no bash on PATH -- skipping real bash+jq dispatch harness"
-elif JQ is None:
-    _SKIP_REASON = "no jq on PATH -- skipping real bash+jq dispatch harness"
-
-requires_bash_and_jq = pytest.mark.skipif(_SKIP_REASON is not None, reason=str(_SKIP_REASON))
-
-DEFAULT_NOTES_BODY = "Release notes for @octocat, see #123 for details."
-
-STUB_GH = """#!/usr/bin/env bash
-# Stub `gh` for tests -- handles only the one invocation shape this dispatch
-# step is expected to use: `gh api repos/.../releases/generate-notes -f
-# tag_name=... --jq '.body'`. Behaviour is controlled entirely by env vars so
-# the same stub script serves every failure-mode case.
-set -u
-if [ "${STUB_GH_FAIL:-0}" = "1" ]; then
-  echo "stub gh: simulated generate-notes failure" >&2
-  exit 1
-fi
-if [ -n "${STUB_GH_BODY_FILE:-}" ]; then
-  cat "${STUB_GH_BODY_FILE}"
-else
-  printf '%s' "${STUB_GH_BODY:-}"
-fi
-"""
-
-STUB_CURL = """#!/usr/bin/env bash
-# Stub `curl` for tests -- captures whatever stdin the dispatch step pipes
-# to it (the payload built by `jq -n ...`) instead of actually POSTing.
-set -u
-cat > "${STUB_CURL_OUTPUT_FILE:?STUB_CURL_OUTPUT_FILE not set}"
-exit 0
-"""
-
-
-def _make_executable(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8", newline="\n")
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-
-@pytest.fixture()
-def dispatch_harness(tmp_path):
-    """Prepare a tmp_path with a fixture plugin.json, stub gh/curl on PATH,
-    and a helper to execute a workflow's dispatch run: text against it."""
-    plugin_dir = tmp_path / ".claude-plugin"
-    plugin_dir.mkdir(parents=True)
-    (plugin_dir / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "agent-worktree",
-                "description": "MCP server for git worktree lifecycle management.",
-                "version": "0.0.0",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    bin_dir = tmp_path / "stub-bin"
-    bin_dir.mkdir()
-    _make_executable(bin_dir / "gh", STUB_GH)
-    _make_executable(bin_dir / "curl", STUB_CURL)
-
-    payload_path = tmp_path / "payload.json"
-
-    def run(workflow: Path, *, gh_fail=False, gh_body=None, gh_body_file=None, extra_env=None):
-        run_text = _dispatch_run_text(workflow)
-        script_path = tmp_path / "run.sh"
-        script_path.write_text(run_text, encoding="utf-8", newline="\n")
-
-        env = dict(os.environ)
-        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        env.update(
-            {
-                "GH_PAT": "stub-pat",
-                "GH_TOKEN": "stub-token",
-                "REPO": "Seretos/agent-worktree",
-                "VERSION": "1.2.3",
-                "NAME": "agent-worktree",
-                "TAG": "agent-worktree--v1.2.3",
-                "STUB_CURL_OUTPUT_FILE": str(payload_path),
-                "STUB_GH_FAIL": "1" if gh_fail else "0",
-            }
-        )
-        if gh_body is not None:
-            env["STUB_GH_BODY"] = gh_body
-        if gh_body_file is not None:
-            env["STUB_GH_BODY_FILE"] = str(gh_body_file)
-        if extra_env:
-            env.update(extra_env)
-
-        proc = subprocess.run(
-            [BASH, str(script_path)],
-            cwd=tmp_path,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return proc, payload_path
-
-    return run
-
-
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_payload_carries_changelog_verbatim_and_stays_within_key_limit(dispatch_harness, workflow):
-    """Driving test (plan behaviour 1, dynamic half).
-
-    - changelog carries the fetched notes verbatim (mentions/#123 untouched)
-    - client_payload has <=10 top-level keys
-    - the 9 pre-existing keys are unchanged in value
+    RED today: dispatch.yml has exactly one checkout step
+    ("Checkout release branch", ref: release) -- no second checkout of
+    main's .github/scripts exists.
     """
-    proc, payload_path = dispatch_harness(workflow, gh_body=DEFAULT_NOTES_BODY)
-    assert proc.returncode == 0, (
-        f"dispatch step exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    workflow = _load_workflow(DISPATCH_WORKFLOW)
+    checkout_steps = [
+        step
+        for job in workflow.get("jobs", {}).values()
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    main_scripts_checkouts = [
+        step
+        for step in checkout_steps
+        if (step.get("with") or {}).get("ref") == "main"
+        and ".github/scripts" in str((step.get("with") or {}).get("sparse-checkout", ""))
+    ]
+    assert main_scripts_checkouts, (
+        "dispatch.yml must have a second actions/checkout@v4 step with "
+        "ref: main and sparse-checkout: .github/scripts (ticket #184) -- "
+        f"found checkout steps: {checkout_steps}"
     )
-    assert payload_path.exists(), f"payload.json was never written\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    client_payload = payload["client_payload"]
-
-    assert len(client_payload) <= 10, (
-        f"client_payload has {len(client_payload)} top-level keys (max 10 "
-        f"per GitHub's repository_dispatch docs): {sorted(client_payload)}"
+    assert (main_scripts_checkouts[0].get("with") or {}).get("path") == ".ci-scripts", (
+        "dispatch.yml's main-scripts checkout must land at path: .ci-scripts "
+        f"(plan Approach section) -- found "
+        f"{(main_scripts_checkouts[0].get('with') or {}).get('path')!r}"
     )
-    assert client_payload.get("changelog") == DEFAULT_NOTES_BODY, (
-        f"changelog was not carried verbatim -- got {client_payload.get('changelog')!r}"
-    )
-    assert client_payload["name"] == "agent-worktree"
-    assert client_payload["version"] == "1.2.3"
-    assert client_payload["ref"] == "agent-worktree--v1.2.3"
-    assert client_payload["repo"] == "Seretos/agent-worktree"
-    assert client_payload["category"] == "mcp"
-    assert client_payload["tags"] == ["git", "environment"]
 
 
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_hostile_changelog_round_trips_exactly_through_json(dispatch_harness, workflow):
-    """Driving test (plan behaviour 2, dynamic half) -- every value must be
-    JSON-escaped via jq, never raw-spliced. A hostile changelog body
-    containing double quotes, backticks, `$()`, and real newlines must
-    round-trip exactly through json.loads (a raw heredoc splice would either
-    corrupt the payload or execute the `$()` as a shell command)."""
-    hostile = 'Notes with "quotes", `backticks`, $(rm -rf /tmp/should-not-run), and\nreal\nnewlines.'
-    proc, payload_path = dispatch_harness(workflow, gh_body=hostile)
-    assert proc.returncode == 0, (
-        f"dispatch step exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    assert payload["client_payload"]["changelog"] == hostile
 
-
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_oversized_changelog_is_truncated_at_30000_chars(dispatch_harness, workflow, tmp_path):
-    """Driving test (plan behaviour 3, dynamic half) -- an ~80000-char body
-    is truncated to the first 30000 chars plus a truncation suffix naming
-    the release URL."""
-    big_body_file = tmp_path / "big_body.txt"
-    big_body_file.write_text("x" * 80000, encoding="utf-8")
-
-    proc, payload_path = dispatch_harness(workflow, gh_body_file=big_body_file)
-    assert proc.returncode == 0, (
-        f"dispatch step exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    changelog = payload["client_payload"]["changelog"]
-
-    assert changelog.startswith("x" * 30000), "truncated body must keep the first 30000 chars verbatim"
-    assert len(changelog) > 30000, "truncated body must carry a suffix after the 30000-char cutoff"
-    assert "truncated" in changelog.lower()
-    expected_url = "https://github.com/Seretos/agent-worktree/releases/tag/agent-worktree--v1.2.3"
-    assert expected_url in changelog, f"truncation suffix must name the release URL, got: {changelog[-200:]!r}"
-
-
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_changelog_at_exactly_30000_chars_is_not_truncated(dispatch_harness, workflow, tmp_path):
-    """Additional coverage (plan behaviour 3 boundary case) -- a body of
-    exactly 30000 chars must pass through untouched, no suffix appended."""
-    boundary_body_file = tmp_path / "boundary_body.txt"
-    boundary_body_file.write_text("y" * 30000, encoding="utf-8")
-
-    proc, payload_path = dispatch_harness(workflow, gh_body_file=boundary_body_file)
-    assert proc.returncode == 0, (
-        f"dispatch step exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    changelog = payload["client_payload"]["changelog"]
-    assert changelog == "y" * 30000, "a body exactly at the 30000-char boundary must not be truncated"
-
-
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-def test_oversized_multibyte_changelog_stays_valid_utf8_json(dispatch_harness, workflow, tmp_path):
-    """Additional coverage (plan behaviour 3 edge case) -- truncation must be
-    Unicode-codepoint-safe: an oversized multi-byte body must still produce
-    valid UTF-8/JSON output, not a body cut mid-codepoint."""
-    multibyte_body_file = tmp_path / "multibyte_body.txt"
-    multibyte_body_file.write_text("é中\U0001f600" * 20000, encoding="utf-8")
-
-    proc, payload_path = dispatch_harness(workflow, gh_body_file=multibyte_body_file)
-    assert proc.returncode == 0, (
-        f"dispatch step exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
-    # json.loads itself proves the bytes are valid UTF-8/JSON; a mid-codepoint
-    # cut would raise UnicodeDecodeError or json.JSONDecodeError here.
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    changelog = payload["client_payload"]["changelog"]
-    assert len(changelog) >= 30000
-    assert "truncated" in changelog.lower()
-
-
-@requires_bash_and_jq
-@pytest.mark.parametrize("workflow", WORKFLOWS, ids=WORKFLOW_IDS)
-@pytest.mark.parametrize(
-    "case_name,gh_kwargs",
-    [
-        ("gh_api_fails", {"gh_fail": True}),
-        ("empty_body", {"gh_body": ""}),
-        ("whitespace_only_body", {"gh_body": "   \n\t  "}),
-        ("literal_null_body", {"gh_body": "null"}),
-    ],
-)
-def test_failed_or_empty_notes_fetch_warns_and_omits_changelog(dispatch_harness, workflow, case_name, gh_kwargs):
-    """Driving test (plan behaviour 4, dynamic half) -- a failed, empty,
-    whitespace-only, or literal-"null" notes fetch must each: exit 0, print
-    a ::warning:: naming the tag, still write a parseable payload.json with
-    the changelog key entirely absent, and leave the other keys intact. The
-    dispatch itself must still succeed."""
-    proc, payload_path = dispatch_harness(workflow, **gh_kwargs)
-    assert proc.returncode == 0, (
-        f"[{case_name}] dispatch step must exit 0 even when the notes fetch "
-        f"fails/is empty -- the dispatch itself must still succeed "
-        f"(exit {proc.returncode})\nstdout={proc.stdout}\nstderr={proc.stderr}"
-    )
-    assert "::warning::" in proc.stdout, (
-        f"[{case_name}] expected a ::warning:: annotation on stdout, got: {proc.stdout!r}"
-    )
-    assert "agent-worktree--v1.2.3" in proc.stdout, (
-        f"[{case_name}] ::warning:: must name the tag, got: {proc.stdout!r}"
-    )
-    assert payload_path.exists(), f"[{case_name}] payload.json was never written"
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    client_payload = payload["client_payload"]
-    assert "changelog" not in client_payload, (
-        f"[{case_name}] changelog key must be omitted entirely, got: {client_payload.get('changelog')!r}"
-    )
-    assert client_payload["name"] == "agent-worktree"
-    assert client_payload["ref"] == "agent-worktree--v1.2.3"
-    assert client_payload["repo"] == "Seretos/agent-worktree"
+# ---------------------------------------------------------------------------
+# Ticket #184 retires "Layer (b)" that used to live here: six
+# `dispatch_harness`-based tests (~18 parametrized instances) that drove the
+# real bash+jq interpreters against the "Dispatch to agent-marketplace"
+# step's *inline* run: text with stub gh/curl scripts. That run: text no
+# longer contains any payload-building logic at all (see
+# test_dispatch_step_invokes_shared_marketplace_payload_script above) --
+# it is now a two-line delegation to the shared
+# .github/scripts/marketplace-payload.sh, which needs a $SCRIPTS env var
+# only release.yml/dispatch.yml themselves supply (via $RUNNER_TEMP/
+# ci-scripts and .ci-scripts/.github/scripts respectively), so driving it
+# from a bare tmp_path here would test the harness's own plumbing, not this
+# repo's behaviour, and would break on every future change to that
+# plumbing without anything actually being wrong. The equivalent, more
+# precise coverage moved to tests/test_release_scripts.py's
+# marketplace-payload.sh tests (R3): hostile-changelog round-trip,
+# gh-release-view-failure-is-fatal, empty/whitespace/null-body warn+omit,
+# 30000-char truncation (boundary + custom MAX_CHANGELOG_LEN), and the
+# oversized multibyte-safety case (test_marketplace_payload_oversized_
+# multibyte_changelog_stays_valid_utf8_json), added there to close the one
+# gap this retirement would otherwise have left uncovered.
+# ---------------------------------------------------------------------------

@@ -39,20 +39,31 @@ jobs:
     outputs:
       plugin_name: ${{ steps.meta.outputs.plugin_name }}
       tag:         ${{ steps.meta.outputs.tag }}
+      prev_tag:    ${{ steps.preflight.outputs.prev_tag }}
     steps:
-      - name: Validate version is semver
-        shell: bash
-        run: |
-          V="${{ inputs.version }}"
-          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
-            exit 1
-          fi
-
+      # Checkout moved ahead of "Validate version is semver" (below) so that
+      # step can delegate to `.github/scripts/prev-release-tag.sh
+      # --check-version`, which needs the script to exist in the workspace.
+      # Checkout itself has no side effect (a read-only clone), so this
+      # keeps validation -- and every check after it -- ahead of every
+      # side-effecting step in the pipeline.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate version is semver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          # Strict semver grammar, shared with the `src/` marker-tag
+          # ordering logic (ticket #184) -- replaces the looser inline
+          # regex this step used to carry (it accepted leading zeros like
+          # "01.2.3", which prev-release-tag.sh's ordering does not).
+          if ! bash .github/scripts/prev-release-tag.sh --check-version "$V"; then
+            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE], no leading zeros, no build metadata)."
+            exit 1
+          fi
 
       - name: Fail if tag already exists
         shell: bash
@@ -65,6 +76,28 @@ jobs:
             echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
             exit 1
           fi
+
+      # Ticket #184: the orphan `release` branch/tag has no merge-base with
+      # any prior commit, so notes generated directly against it are always
+      # empty. The fix runs notes generation against a parallel lightweight
+      # `src/<TAG>` tag (pointing at this run's real commit on `main`,
+      # pushed unconditionally in the "Push orphan release branch..." step
+      # below) instead. That push is only safe when this run's HEAD really
+      # is `main`'s current tip (see check (a) below) -- otherwise the
+      # workflow-modification guard on a `GITHUB_TOKEN` push would reject
+      # it. All four pre-flight checks run here, before any side effect
+      # (stamping, building, pushing) happens.
+      - name: Pre-flight src/ marker tags
+        id: preflight
+        shell: bash
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          REPO:       ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          bash .github/scripts/preflight-src-tags.sh "$TAG"
 
       - name: Stamp version into pyproject.toml + plugin manifests
         shell: bash
@@ -246,13 +279,28 @@ jobs:
       - name: Push orphan release branch and capture commit
         id: rel
         shell: bash
+        env:
+          TAG: ${{ needs.stamp.outputs.tag }}
         run: |
           STAGE="${{ steps.stage.outputs.stage }}"
           ZIP="${{ steps.stage.outputs.asset }}"
 
-          # Stash staging + zip outside the worktree before `checkout --orphan`
-          # wipes everything.
+          # Capture main's tip *before* `checkout --orphan` moves HEAD --
+          # this is the commit the `src/<TAG>` marker tag points at, and the
+          # commit notes generation (in the next step) treats as the tip of
+          # real history for this release.
+          MAIN_SHA=$(git rev-parse HEAD)
+          echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
+
+          # Stash staging + zip + the scripts dir outside the worktree
+          # before `checkout --orphan` wipes everything -- `.github/scripts`
+          # is staged here for the later "Dispatch to agent-marketplace"
+          # step, which runs *after* the orphan checkout has replaced this
+          # job's working tree with the release branch's own (script-less)
+          # contents.
           TMP=$(mktemp -d)
+          mkdir -p "$RUNNER_TEMP/ci-scripts"
+          cp -a .github/scripts/. "$RUNNER_TEMP/ci-scripts/"
                     # .gitattributes MUST ship on the orphan release branch: Claude Code clones it,
           # and on a Windows machine with core.autocrlf=true (Git-for-Windows default)
           # a checkout without `* text=auto eol=lf` writes CRLF into the plugin cache —
@@ -267,6 +315,15 @@ jobs:
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Push the `src/<TAG>` marker unconditionally (no skip-if-exists
+          # guard -- the `stamp` job's pre-flight already proved it's
+          # absent) *before* the orphan push below. This push is only
+          # accepted by the workflow-modification guard on a GITHUB_TOKEN
+          # push because MAIN_SHA is main's own tip (proved by the
+          # pre-flight's check (a)), so its .github/workflows/ tree is the
+          # default branch's own tip tree.
+          git push origin "${MAIN_SHA}:refs/tags/src/${TAG}"
 
           git checkout --orphan release
           git rm -rf . > /dev/null 2>&1 || true
@@ -298,116 +355,66 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+          TAG:      ${{ needs.stamp.outputs.tag }}
+          PREV_TAG: ${{ needs.stamp.outputs.prev_tag }}
         run: |
-          TAG="${{ needs.stamp.outputs.tag }}"
+          set -euo pipefail
+
+          # The orphan `release` commit/tag has no merge-base with any prior
+          # commit (it's a parentless orphan by design -- the ticket that
+          # introduced it forbids changing that layout), so neither
+          # `gh release create --generate-notes` nor `--notes-start-tag`
+          # can work directly against it: both walk commit ancestry to find
+          # "everything since the last release", and an orphan commit has
+          # none. Instead, notes are generated against the parallel
+          # `src/<TAG>` marker tag (pushed onto `main`'s real history, in
+          # the previous step) and its predecessor `src/<PREV_TAG>` (empty
+          # on a first-ever release, in which case `previous_tag_name` is
+          # omitted entirely rather than passed empty) -- both of which DO
+          # have real ancestry on `main` -- and the resulting notes are then
+          # attached to the release created against the orphan commit via
+          # `--notes-file`.
+          NOTES_FILE=$(mktemp)
+          trap 'rm -f "$NOTES_FILE"' EXIT
+          gh api "repos/${REPO}/releases/generate-notes" \
+            -f tag_name="src/${TAG}" \
+            -f target_commitish="${{ steps.rel.outputs.main_sha }}" \
+            ${PREV_TAG:+-f previous_tag_name="src/${PREV_TAG}"} \
+            --jq '.body' > "$NOTES_FILE"
+
           gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --target "${{ steps.rel.outputs.sha }}" \
             --title "$TAG" \
-            --generate-notes \
+            --notes-file "$NOTES_FILE" \
             ${{ contains(inputs.version, '-') && '--prerelease' || '' }} \
             "${{ steps.rel.outputs.asset }}"
 
       # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
       # (Actions blocks this to prevent recursive loops). Call the marketplace
       # directly with a separate PAT.
+      #
+      # Payload building is delegated to the shared
+      # .github/scripts/marketplace-payload.sh (ticket #184) -- invoked via
+      # `bash <path>`, never relying on the exec bit, and via the
+      # $RUNNER_TEMP staging copy made before the orphan checkout wiped
+      # `.github/scripts` out of this job's working tree (see the "Push
+      # orphan release branch..." step above).
       - name: Dispatch to agent-marketplace
         shell: bash
         env:
-          GH_PAT:   ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO:     ${{ github.repository }}
-          VERSION:  ${{ inputs.version }}
-          TAG:      ${{ needs.stamp.outputs.tag }}
+          GH_PAT:             ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          GH_TOKEN:           ${{ secrets.GITHUB_TOKEN }}
+          REPO:               ${{ github.repository }}
+          VERSION:            ${{ inputs.version }}
+          TAG:                ${{ needs.stamp.outputs.tag }}
+          PLUGIN_JSON:        .claude-plugin/plugin.json
+          MAX_CHANGELOG_LEN:  "30000"
+          SCRIPTS:            ${{ runner.temp }}/ci-scripts
         run: |
-          # plugin.json is expected at `.claude-plugin/plugin.json` in the
-          # workspace by this point: release.yml's orphan-checkout step
-          # (above, in this same job) restores the release-branch contents
-          # here after wiping `stamped/`; dispatch.yml's checkout of `ref:
-          # release` (this workflow's only checkout) puts it there directly.
-          set -euo pipefail
-
-          NAME=$(jq -r '.name' .claude-plugin/plugin.json)
-          DESC=$(jq -r '.description' .claude-plugin/plugin.json)
-
-          RELEASE_URL="https://github.com/${REPO}/releases/tag/${TAG}"
-          ICON_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/assets/icon.png"
-          DESCRIPTION_URL="https://raw.githubusercontent.com/${REPO}/${TAG}/description.md"
-
-          # Fetch the release's generated notes for the changelog field. This
-          # call is explicitly guarded (never a bare `gh api ...` relying on
-          # `set -e` to abort the step) -- a failed fetch must warn and omit
-          # the changelog, never abort the dispatch itself.
-          HAVE_CHANGELOG=false
-          CHANGELOG=""
-          if ! RAW_CHANGELOG=$(gh api "repos/${REPO}/releases/generate-notes" -f tag_name="${TAG}" --jq '.body' 2>&1); then
-            echo "::warning::Failed to fetch generated release notes for tag ${TAG}; omitting changelog from the marketplace dispatch payload."
-          else
-            # Trim leading/trailing whitespace via jq's regex engine, not a
-            # bash extglob pattern -- `${VAR##+([[:space:]])}` is
-            # catastrophically slow (multi-second-plus) on changelog bodies
-            # in the tens of thousands of characters.
-            TRIMMED_CHANGELOG=$(printf '%s' "$RAW_CHANGELOG" | jq -Rsj 'gsub("^[[:space:]]+|[[:space:]]+$"; "")')
-            if [ -z "$TRIMMED_CHANGELOG" ] || [ "$TRIMMED_CHANGELOG" = "null" ]; then
-              echo "::warning::Generated release notes for tag ${TAG} are empty/null; omitting changelog from the marketplace dispatch payload."
-            else
-              HAVE_CHANGELOG=true
-              CHANGELOG="$RAW_CHANGELOG"
-            fi
-          fi
-
-          # The changelog body is read from a temp file via --rawfile, not
-          # passed as a --arg -- a large-enough release-notes body (tens of
-          # thousands of chars) as a literal argv value overflows the OS
-          # argument-list limit ("Argument list too long"), which --rawfile
-          # (reads the content from disk) never hits.
-          CHANGELOG_FILE=$(mktemp)
-          trap 'rm -f "$CHANGELOG_FILE"' EXIT
-          printf '%s' "$CHANGELOG" > "$CHANGELOG_FILE"
-
-          # GitHub's repository_dispatch client_payload allows at most 10
-          # top-level properties; changelog is the 10th (name, description,
-          # repo, category, version, ref, icon, description_url, tags = 9
-          # already present). Any future field must nest under an existing
-          # object rather than adding an 11th key.
-          jq -n -c \
-            --arg name "$NAME" \
-            --arg description "$DESC" \
-            --arg repo "$REPO" \
-            --arg version "$VERSION" \
-            --arg ref "$TAG" \
-            --arg icon "$ICON_URL" \
-            --arg description_url "$DESCRIPTION_URL" \
-            --rawfile changelog "$CHANGELOG_FILE" \
-            --argjson have_changelog "$HAVE_CHANGELOG" \
-            --argjson max_changelog_len 30000 \
-            --arg release_url "$RELEASE_URL" \
-            '
-            def truncated_changelog:
-              if (. | length) > $max_changelog_len then
-                .[0:$max_changelog_len] + "\n\n...truncated — see the full release notes: " + $release_url
-              else
-                .
-              end;
-            {
-              event_type: "plugin-release",
-              client_payload: (
-                {
-                  name: $name,
-                  description: $description,
-                  repo: $repo,
-                  category: "mcp",
-                  version: $version,
-                  ref: $ref,
-                  icon: $icon,
-                  description_url: $description_url,
-                  tags: ["git", "environment"]
-                }
-                + (if $have_changelog then { changelog: ($changelog | truncated_changelog) } else {} end)
-              )
-            }
-            ' | curl -fsSL -X POST \
-              -H "Authorization: Bearer $GH_PAT" \
-              -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
-              -d @-
+          bash "$SCRIPTS/marketplace-payload.sh" | curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            -d @-
