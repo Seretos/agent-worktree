@@ -1656,7 +1656,7 @@ def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine
     ``shadowed_contract`` bullet tail, lines ~1799-1803) currently claims
     "the engine may additionally set ``shadowed_contract``" for the
     #124/contract_misplaced repro. This test runs the REAL, unmocked
-    ``WorktreeManager.start()`` against the pinned v0.3.13 engine to observe
+    ``WorktreeManager.start()`` against the pinned v0.3.14 engine to observe
     what it actually returns, under both readings of "misplaced": the
     repo_root contract existed and was removed (True), and it never existed
     at all (False).
@@ -1678,7 +1678,7 @@ def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine
     rewrite this measurement grounds (worktree.py CAUTION and bullet tail).
     A future engine bump that changes this behaviour fails here.
     """
-    assert version("lib-python-worktree") == "0.3.13"
+    assert version("lib-python-worktree") == "0.3.14"
 
     if root_contract_removed:
         _write_contract(

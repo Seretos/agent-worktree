@@ -1506,7 +1506,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         genuinely-unconfigured case). Callers should branch on ``no_op_reason``
         rather than inferring the cause from ``status``/``pids`` alone -- see
         the "Contract diagnostics" block below for the full five-key set.
-        Measured on the pinned engine (``lib-python-worktree`` v0.3.13): this
+        Measured on the pinned engine (``lib-python-worktree`` v0.3.14): this
         case also sets ``shadowed_contract`` on the response, with
         ``reason: "differs"`` -- see the sixth diagnostic bullet below.
 
@@ -1805,7 +1805,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           copy was separately edited to differ (``no_op_reason`` is
           ``null`` there, and the five wrapper-derived keys above see
           nothing wrong). Measured on the pinned engine (``lib-python-worktree``
-          v0.3.13), it also fires alongside a non-``null`` ``no_op_reason``,
+          v0.3.14), it also fires alongside a non-``null`` ``no_op_reason``,
           notably ``"contract_misplaced"``: no file exists at ``repo_root``,
           the implicit fallback contract is what gets compared, and a
           checkout-local copy that diverges from that fallback still shadows
@@ -1844,9 +1844,17 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         the content and mtime of the file at ``start_log_paths[role]``.
 
         A blind retry is protected by ``{"error": "...", "code":
-        "already_running"}`` only while the previously started pid is
-        ALIVE. A start that landed and whose process then exited is not
-        protected: the blind retry starts a second process.
+        "already_running"}`` only while the previously started pid is ALIVE
+        **and its identity is confirmed** (pinned engine v0.3.14, upstream
+        ticket #157: ``_pid_status(pid, start_time) is True``). A start that
+        landed and whose process then exited is not protected: the blind
+        retry starts a second process. Nor is a live pid whose identity
+        cannot be confirmed -- alive but demonstrably a different process
+        (the OS recycled the pid), or alive with no verdict possible -- the
+        engine abandons it and restarts instead of blocking, logging a
+        warning naming the abandoned pid and role; this wrapper surfaces no
+        separate signal for that case, only the ordinary successful start
+        result.
         """
 
         try:
@@ -2118,6 +2126,20 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         so the OS refuses breakaway outright. On POSIX there is no Job
         Object mechanism at all -- containment there is the ppid tree plus
         the process group.
+
+        **Unconditional is w.r.t. ``kill_orphans`` only -- it is not
+        unconditional w.r.t. the tracked pid's identity** (pinned engine
+        v0.3.14, upstream ticket #157). Before any snapshot or signal, the
+        engine verifies the tracked pid via ``_pid_status``: a genuinely
+        dead tracked pid still gets the full tree/group snapshot and kill,
+        exactly as before this ticket. But a tracked pid that is *alive*
+        while its identity is *not* confirmed -- the OS recycled that pid
+        onto an unrelated process, or the verdict is unverifiable -- skips
+        the tree/group snapshot and every signal entirely; nothing is ever
+        touched at a pid that might belong to a stranger. The Windows Job
+        Object kill is unaffected by this gate (it is keyed by a UUID-based
+        job name, not the pid number, so it is immune to pid reuse by
+        construction and still runs regardless of the identity verdict).
 
         **``kill_orphans`` is a different scope, not a deeper one.** It is a
         **path-scoped**, not lineage-scoped, heuristic scan of the
