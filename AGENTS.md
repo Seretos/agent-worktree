@@ -343,6 +343,27 @@ lost. None of it has been confirmed, and none of it is acted on in this repo.
   it. Investigating it requires building the binary and sending real console
   control events to it.
 
+## Release: orphan `release` branch + `src/` marker tags
+
+`release.yml` publishes each version as a **parentless orphan commit** on the `release` branch/tag (`ref` = `agent-worktree--vX.Y.Z`) — the marketplace clones exactly that ref, with no build tooling or git history alongside it. That layout is deliberate and unchanged by ticket #184; what #184 fixed is that an orphan commit has no merge-base with any prior commit, so asking GitHub to generate release notes (or a `Full Changelog` compare link) *directly against the orphan tag* always came back empty — there is no ancestry to walk.
+
+**The fix: a parallel lightweight tag on `main` for every release.** Every successful `assemble` run pushes `src/<TAG>` (e.g. `src/agent-worktree--v0.1.17`) pointing at the exact commit on `main` the release was built from. `src/<TAG>` tags carry real ancestry, so notes generation runs against `src/<PREV_TAG>...src/<TAG>` instead of against the orphan tag directly — the compare view and changelog list exactly the PRs merged to `main` between the two releases. `--generate-notes`/`--notes-start-tag` still can't be pointed at the orphan tag itself; that's why the generation call targets the `src/*` tags and the result is attached to the orphan release afterward via `--notes-file`.
+
+**Dispatched-from-`main`'s-tip requirement, enforced in `stamp`.** Pushing `src/<TAG>` via the workflow's own `GITHUB_TOKEN` only succeeds because the run's `.github/workflows/` tree is provably the default branch's own tip tree — the workflow-modification guard rejects a `GITHUB_TOKEN` push whose tree differs from a trusted ref. That's only true when the run's `HEAD` really is `main`'s current tip at the moment it runs. `.github/scripts/preflight-src-tags.sh`, invoked from a new `stamp`-job step **before any side effect** (before stamping, building, or pushing anything), fails the whole run with a clear message if it isn't. Re-run `release.yml` from `main`'s current tip if this check fires.
+
+**Marker immutability.** `src/<TAG>` markers are never deleted or moved once pushed. The pre-flight also fails (before any side effect) if `src/<TAG>` already exists for the version being released — that means the version number is burned; the remedy is a new version number, never deleting the stale marker. Every existence check in `preflight-src-tags.sh` goes through `gh api`, never a local git ref, so the result never depends on how complete the checkout's own tag fetch happened to be.
+
+**One-time manual bootstrap.** The pre-flight also requires that the *previous* release already has its own `src/<PREV_TAG>` marker (since that release predates ticket #184, it doesn't). The current predecessor release is the one named in the `#116` build-provenance note above. Before the first post-#184 release, run once, using the head SHA from that release's successful Actions run:
+
+```
+git tag src/<that predecessor's tag> <head_sha>
+git push origin src/<that predecessor's tag>
+```
+
+Without this, the pre-flight hard-fails `stamp` on the very next release — that is the designed behaviour (an unmet precondition caught before any side effect), not a regression.
+
+*(This section deliberately avoids repeating the predecessor's literal version number here — the `#116` build-provenance note above is the single place that names it, alongside the caveat that the fix it discusses is unreleased/unverified in the field; repeating the bare version number here, without that caveat nearby, would let a naive text search latch onto this section's mention instead and miss it.)*
+
 ## Running the suite (agent sessions: read this before you run pytest)
 
 The full suite is slow enough on a local Windows checkout that a single
@@ -355,8 +376,23 @@ below, one after another, each as its own foreground `pytest` call.
 | 1 | `tests/test_environment_tools.py` | 125 | 29 s |
 | 2 | `tests/test_worktree_tools.py` | 129 | 13 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 62 | 16 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py` | 144 | 7 s |
-| **Total** | all 14 `tests/test_*.py` files | 460 passed | **65 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py`, `tests/test_release_scripts.py` | 168 | 14 s |
+| **Total** | all 15 `tests/test_*.py` files | 484 passed | **72 s** |
+
+**Ticket #184 note.** `tests/test_release_scripts.py` is new (driving tests
+for the `prev-release-tag.sh`/`preflight-src-tags.sh`/`marketplace-payload.sh`
+scripts added by #184, 43 tests) and joined chunk 4. Six
+`dispatch_harness`-based tests (~18 parametrized instances) that used to
+drive the real bash+jq interpreters against the "Dispatch to
+agent-marketplace" step's *inline* run: text were retired from
+`tests/test_release_dispatch_payload.py` in the same ticket -- that run:
+text no longer contains any payload-building logic to drive (it delegates to
+the new `marketplace-payload.sh` script), so the equivalent, more precise
+coverage lives in `tests/test_release_scripts.py` instead; net effect,
+`test_release_dispatch_payload.py` shrank from 34 to 13 tests, all now
+static YAML-text guards with no `bash`/`jq` dependency. The chunk 4 and
+Total figures above are re-measured post-#184, with every test in the suite
+green.
 
 **Ticket #181 re-measurement note.** The table above was re-measured after
 bumping the pinned `lib-python-worktree` engine to v0.3.13, which fixed the
@@ -372,14 +408,18 @@ also grew independently of this ticket (more tests landed across
 #171/#175/#181 itself) -- the counts above are not solely attributable to
 the pin bump.
 
-**Chunk 4 dependency note.** `tests/test_release_dispatch_payload.py` has a
-`requires_bash_and_jq`-gated "layer (b)" of 18 tests (of its 34 total) that
-drive the real `bash`+`jq` interpreters; they silently `skip` (not fail) when
-`bash` or `jq` is not on `PATH`, so a local run without `jq` reports 97
-passed/18 skipped for chunk 4 (16 passed/18 skipped for the file alone), not
-the 115-passed figure above. Both `windows-latest` and `ubuntu-22.04`
-GitHub-hosted runners ship `jq` preinstalled, so CI always runs the full 34;
-this caveat is local-dev only.
+**Chunk 4 dependency note.** As of ticket #184, `tests/test_release_dispatch_payload.py`
+is pure static YAML-text parsing -- no `bash`/`jq` dependency, no skip
+possible. The dependency moved to `tests/test_release_scripts.py`: 16 of its
+43 tests (`prev-release-tag.sh`'s R1 cases) are gated on a usable `bash`
+only (`requires_git_bash`); the remaining 27 (`preflight-src-tags.sh` and
+`marketplace-payload.sh`) are gated on both `bash` and `jq`
+(`requires_git_bash_and_jq`). Both marks silently `skip` (not fail) when the
+dependency is missing, so a local run without `jq` under-reports chunk 4's
+168-passed figure above. Both `windows-latest` and `ubuntu-22.04`
+GitHub-hosted runners ship `jq` preinstalled and Git-for-Windows ships its
+own `bash.exe` at the fixed path this module's `_resolve_git_bash` checks,
+so CI always runs the full 168; this caveat is local-dev only.
 
 The Total row is the **sum of the measured chunks**, **not a single**
 end-to-end measured run of the whole suite in one `pytest` invocation — the
@@ -457,8 +497,12 @@ both `xfail`-marked; ticket #181 rewrote both as plain wall-clock/spy
 assertions (no `xfail`, no `timeout` override) and measured them at
 ~0.09 s and ~0.09 s per `worktree_remove` call respectively (8 and 5
 create/remove cycles each, ~1.6 s and ~1.0 s total), with the
-blocking-process scan spy recording zero calls on both. Chunk 4 is flat
-and fast throughout, with no cluster.
+blocking-process scan spy recording zero calls on both. Chunk 4 was flat and
+fast throughout pre-#184; #184's `tests/test_release_scripts.py` added one
+real, if modest, cluster point: `test_marketplace_payload_oversized_multibyte_changelog_stays_valid_utf8_json`
+(a real `bash`+`jq` invocation over a ~180000-character multi-byte body) at
+~2.9 s, with `test_preflight_paginates_beyond_30_candidate_tags` a distant
+second at ~0.9 s; every other chunk-4 test stays well under half a second.
 
 ## Security
 
