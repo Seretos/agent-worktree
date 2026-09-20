@@ -14,8 +14,11 @@ name: release
 #               the orphan `release` branch, creates the GitHub Release,
 #               and dispatches to the marketplace.
 #
-# plugin.json uses an extensionless `command: ${CLAUDE_PLUGIN_ROOT}/bin/worktree`
-# — the host OS auto-resolves to `worktree.exe` on Windows and `worktree`
+# Two host manifests ship in one zip: `.claude-plugin/plugin.json` uses an
+# extensionless `command: ${CLAUDE_PLUGIN_ROOT}/bin/worktree`; `.codex-plugin/
+# plugin.json` points at the root `.mcp.json` (`command: ./bin/worktree`,
+# `cwd: "."`) because Codex does not expand placeholders. Either way the host
+# OS auto-resolves to `worktree.exe` on Windows and `worktree`
 # on Linux, so a single zip serves both platforms.
 
 on:
@@ -214,8 +217,10 @@ jobs:
 
           # Copy the install-ready, non-binary parts from the stamped tree.
           cp -a stamped/.claude-plugin "$STAGE/"
-          [ -d stamped/.codex-plugin ] && cp -a stamped/.codex-plugin "$STAGE/" || true
-          [ -f stamped/.mcp.json     ] && cp -a stamped/.mcp.json     "$STAGE/" || true
+          # Unconditional: `shell: bash` runs with -e, so a missing source
+          # fails the run instead of silently shipping a half-staged package.
+          cp -a stamped/.codex-plugin "$STAGE/"
+          cp -a stamped/.mcp.json     "$STAGE/"
           [ -f stamped/README.md       ] && cp -a stamped/README.md       "$STAGE/" || true
           [ -f stamped/LICENSE         ] && cp -a stamped/LICENSE         "$STAGE/" || true
           [ -f stamped/description.md  ] && cp -a stamped/description.md  "$STAGE/" || true

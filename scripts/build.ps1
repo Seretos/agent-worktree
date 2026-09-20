@@ -225,29 +225,56 @@ if ($IsWindows) {
     chmod +x "bin/$ExeName"
 }
 
-# 6. Smoke-test: MCP initialize handshake.
-Write-Step "Smoke-testing the binary (MCP initialize)"
-$initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"build-smoke","version":"1"}}}'
-$inFile = [System.IO.Path]::GetTempFileName()
-$outFile = [System.IO.Path]::GetTempFileName()
-$errFile = [System.IO.Path]::GetTempFileName()
-[System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n"))
-$proc = Start-Process -FilePath "bin/$ExeName" `
-    -RedirectStandardInput $inFile `
-    -RedirectStandardOutput $outFile `
-    -RedirectStandardError $errFile `
-    -NoNewWindow -PassThru
-if (-not $proc.WaitForExit(8000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
-$stdout = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile)
-$stderrText = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile)
-Remove-Item -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
-if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"') {
-    Write-Host "    handshake OK" -ForegroundColor Green
-} else {
-    Write-Host "    stdout: $stdout" -ForegroundColor Yellow
-    Write-Host "    stderr: $stderrText" -ForegroundColor Yellow
-    Fail "Handshake failed -- see output above."
+# 6. Smoke-test: MCP initialize handshake, driven by the shipped .mcp.json.
+# The declaration is taken LITERALLY (command/args/cwd, no placeholder
+# expansion) -- exactly what Codex does -- so a declaration that cannot spawn
+# fails the build. PowerShell resolves a relative -FilePath against the process
+# CWD (not -WorkingDirectory), hence Push-Location into the resolved cwd.
+function Invoke-McpHandshake {
+    param([Parameter(Mandatory)][string]$PluginRoot, [Parameter(Mandatory)][string]$Label)
+    $mcpJson = Join-Path $PluginRoot ".mcp.json"
+    if (-not (Test-Path $mcpJson)) { Fail "${Label}: $mcpJson not found." }
+    $decl = (Get-Content -Raw $mcpJson | ConvertFrom-Json).mcpServers.worktree
+    if (-not $decl) { Fail "${Label}: .mcp.json declares no 'worktree' server." }
+    $cmd = [string]$decl.command
+    $cmdArgs = @($decl.args | Where-Object { $null -ne $_ })
+    $cwd = if ($decl.cwd) { [string]$decl.cwd } else { "." }
+    $workDir = (Resolve-Path (Join-Path $PluginRoot $cwd)).Path
+    $initMsg = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"build-smoke","version":"1"}}}'
+    $inFile = [System.IO.Path]::GetTempFileName()
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllBytes($inFile, [System.Text.Encoding]::UTF8.GetBytes($initMsg + "`n"))
+    Push-Location $workDir
+    try {
+        $startArgs = @{
+            FilePath = $cmd
+            RedirectStandardInput = $inFile
+            RedirectStandardOutput = $outFile
+            RedirectStandardError = $errFile
+            NoNewWindow = $true
+            PassThru = $true
+        }
+        if ($cmdArgs.Count -gt 0) { $startArgs.ArgumentList = $cmdArgs }
+        $proc = Start-Process @startArgs
+        if (-not $proc.WaitForExit(8000)) { $proc.Kill(); Start-Sleep -Milliseconds 200 }
+    } finally {
+        Pop-Location
+    }
+    $stdout = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile)
+    $stderrText = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile)
+    Remove-Item -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
+    if ($stdout -match '"result"' -and $stdout -match '"protocolVersion"') {
+        Write-Host "    $Label OK" -ForegroundColor Green
+    } else {
+        Write-Host "    stdout: $stdout" -ForegroundColor Yellow
+        Write-Host "    stderr: $stderrText" -ForegroundColor Yellow
+        Fail "$Label failed -- see output above."
+    }
 }
+
+Write-Step "Smoke-testing the binary (MCP initialize via .mcp.json)"
+Invoke-McpHandshake -PluginRoot $root -Label "handshake"
 
 # 7. Optional: stage build/stage/agent-worktree/ for the assembly step in
 # release.yml. NOTE: -Package on its own emits a *partial* stage tree
@@ -259,13 +286,17 @@ if ($Package) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $root "build/stage")
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -Recurse -Force ".claude-plugin" $stage
+    Copy-Item -Recurse -Force ".codex-plugin" $stage
+    Copy-Item -Force ".mcp.json" $stage
     Copy-Item -Recurse -Force "bin" $stage
     if (Test-Path "skills") {
         Copy-Item -Recurse -Force "skills" $stage
     }
     Copy-Item -Force "README.md" $stage -ErrorAction SilentlyContinue
     Copy-Item -Force "LICENSE" $stage -ErrorAction SilentlyContinue
-    Write-Host "    build/stage/agent-worktree (this-OS payload only)"
+    Write-Host "    build/stage/agent-worktree (this-OS payload only): .claude-plugin, .codex-plugin, .mcp.json, bin/, skills/"
+    Write-Step "Smoke-testing the staged tree (MCP initialize via staged .mcp.json)"
+    Invoke-McpHandshake -PluginRoot $stage -Label "stage handshake"
 }
 
 Write-Step "Done."

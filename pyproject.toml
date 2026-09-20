@@ -16,6 +16,9 @@ dependencies = [
   "lib-python-config @ git+https://github.com/Seretos/lib-python-config@v0.1.2",
 ]
 
+[project.scripts]
+worktree = "worktree_plugin.server:main"
+
 [project.optional-dependencies]
 build = [
   "pyinstaller>=6.10",
