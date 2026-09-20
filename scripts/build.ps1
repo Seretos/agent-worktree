@@ -259,6 +259,12 @@ if ($Package) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $root "build/stage")
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -Recurse -Force ".claude-plugin" $stage
+    if (Test-Path ".codex-plugin") {
+        Copy-Item -Recurse -Force ".codex-plugin" $stage
+    }
+    if (Test-Path ".mcp.json") {
+        Copy-Item -Force ".mcp.json" $stage
+    }
     Copy-Item -Recurse -Force "bin" $stage
     if (Test-Path "skills") {
         Copy-Item -Recurse -Force "skills" $stage

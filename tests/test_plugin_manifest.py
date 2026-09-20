@@ -15,6 +15,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_JSON = REPO_ROOT / ".claude-plugin" / "plugin.json"
+CODEX_PLUGIN_JSON = REPO_ROOT / ".codex-plugin" / "plugin.json"
+MCP_JSON = REPO_ROOT / ".mcp.json"
 SKILL_MD = REPO_ROOT / "skills" / "worktree" / "SKILL.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 WORKTREE_PY = REPO_ROOT / "src" / "worktree_plugin" / "tools" / "worktree.py"
@@ -22,6 +24,7 @@ README_MD = REPO_ROOT / "README.md"
 SPEC_FILE = REPO_ROOT / "worktree.spec"
 TEST_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+BUILD_SCRIPT = REPO_ROOT / "scripts" / "build.ps1"
 
 
 def _read_frontmatter_and_body(text: str) -> tuple[dict, str]:
@@ -36,6 +39,36 @@ def test_plugin_json_registers_skills_dir():
     data = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
     assert data["skills"] == "./skills"
     assert SKILL_MD.exists()
+
+
+def test_codex_plugin_uses_relative_mcp_manifest():
+    data = json.loads(CODEX_PLUGIN_JSON.read_text(encoding="utf-8"))
+    assert data["mcpServers"] == "./.mcp.json"
+    assert MCP_JSON.exists()
+
+
+def test_codex_mcp_manifest_uses_plugin_relative_binary():
+    data = json.loads(MCP_JSON.read_text(encoding="utf-8"))
+    assert data == {
+        "mcpServers": {
+            "worktree": {
+                "command": "./bin/worktree",
+                "args": [],
+                "cwd": ".",
+            }
+        }
+    }
+    assert "${PLUGIN_ROOT}" not in MCP_JSON.read_text(encoding="utf-8")
+
+
+def test_release_and_local_package_include_codex_mcp_files():
+    release_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    build_text = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'cp -a stamped/.codex-plugin "$STAGE/"' in release_text
+    assert 'cp -a stamped/.mcp.json     "$STAGE/"' in release_text
+    assert 'Copy-Item -Recurse -Force ".codex-plugin" $stage' in build_text
+    assert 'Copy-Item -Force ".mcp.json" $stage' in build_text
 
 
 def test_skill_frontmatter_wellformed():
