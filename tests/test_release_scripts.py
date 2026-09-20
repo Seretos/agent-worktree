@@ -987,6 +987,25 @@ EXPECTED_ZIP_ENTRIES = {
 }
 EXEC_ENTRIES = {"bin/worktree", "bin/worktree.exe"}
 
+# Distinct bytes per shipped file, so a zero-byte placeholder or one binary
+# copied under both names is detected by comparing entry CONTENTS.
+SOURCE_CONTENTS = {
+    ".claude-plugin/plugin.json": b'{"claude": 1}',
+    ".codex-plugin/plugin.json": b'{"codex": 2}',
+    ".mcp.json": b'{"mcp": 3}',
+    "README.md": b"readme-bytes",
+    "description.md": b"desc-bytes",
+    "skills/worktree/SKILL.md": b"skill-bytes",
+    "assets/icon.png": b"png-bytes",
+}
+WINDOWS_BIN_BYTES = b"MZ-windows-binary-bytes"
+LINUX_BIN_BYTES = b"\x7fELF-linux-binary-bytes"
+EXPECTED_ZIP_CONTENTS = {
+    **SOURCE_CONTENTS,
+    "bin/worktree": LINUX_BIN_BYTES,
+    "bin/worktree.exe": WINDOWS_BIN_BYTES,
+}
+
 # Tracked top-level paths that deliberately do NOT ship.
 NOT_SHIPPED = {
     ".claude",
@@ -1010,22 +1029,13 @@ def _posix(p: Path) -> str:
 
 def _make_source_tree(root: Path) -> Path:
     src = root / "stamped"
-    files = {
-        ".claude-plugin/plugin.json": "{}",
-        ".codex-plugin/plugin.json": "{}",
-        ".mcp.json": "{}",
-        "README.md": "readme",
-        "description.md": "desc",
-        "skills/worktree/SKILL.md": "skill",
-        "assets/icon.png": "png",
-        # Files that must NOT ship.
-        "src/junk.py": "x",
-        "tests/test_x.py": "x",
-    }
+    files = dict(SOURCE_CONTENTS)
+    # Files that must NOT ship.
+    files.update({"src/junk.py": b"x", "tests/test_x.py": b"x"})
     for rel, content in files.items():
         f = src / rel
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content, encoding="utf-8")
+        f.write_bytes(content)
     return src
 
 
@@ -1033,8 +1043,8 @@ def _make_bins(root: Path, extra: dict[str, str] | None = None) -> Path:
     bins = root / "bins"
     (bins / "bin-windows").mkdir(parents=True)
     (bins / "bin-linux").mkdir(parents=True)
-    (bins / "bin-windows" / "worktree.exe").write_bytes(b"MZ")
-    (bins / "bin-linux" / "worktree").write_bytes(b"\x7fELF")
+    (bins / "bin-windows" / "worktree.exe").write_bytes(WINDOWS_BIN_BYTES)
+    (bins / "bin-linux" / "worktree").write_bytes(LINUX_BIN_BYTES)
     for rel, content in (extra or {}).items():
         (bins / rel).write_text(content, encoding="utf-8")
     return bins
@@ -1061,6 +1071,13 @@ def _zip_entries(zip_path: Path) -> dict[str, int]:
 
     with zipfile.ZipFile(zip_path) as zf:
         return {zi.filename: (zi.external_attr >> 16) & 0o777 for zi in zf.infolist()}
+
+
+def _zip_contents(zip_path: Path) -> dict[str, bytes]:
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        return {zi.filename: zf.read(zi) for zi in zf.infolist()}
 
 
 def _describe(proc) -> str:
@@ -1093,6 +1110,7 @@ def test_stage_release_zip_ships_every_allowlisted_path_and_exec_bits(tmp_path):
     assert proc.returncode == 0, _describe(proc)
     entries = _zip_entries(zip_path)
     assert set(entries) == EXPECTED_ZIP_ENTRIES
+    assert _zip_contents(zip_path) == EXPECTED_ZIP_CONTENTS
     for name, mode in entries.items():
         expected = 0o755 if name in EXEC_ENTRIES else 0o644
         assert mode == expected, f"{name}: {oct(mode)} != {oct(expected)}"
@@ -1121,7 +1139,6 @@ def test_mutated_allowlist_drops_a_shipped_path(tmp_path):
     if proc.returncode == 0:
         names = set(_zip_entries(zip_path))
         assert ".codex-plugin/plugin.json" not in names
-        assert names != EXPECTED_ZIP_ENTRIES
         assert EXPECTED_ZIP_ENTRIES - names == {".codex-plugin/plugin.json"}
     # A non-zero exit is an equally valid detection of the dropped path.
 
