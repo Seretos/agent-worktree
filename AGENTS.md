@@ -195,6 +195,12 @@ Any contract `stop:` steps defined in `.seretos/worktree-setup.yml` are executed
 
 ---
 
+## Host manifests (Claude Code and Codex)
+
+The release zip ships two host manifests over the same `bin/worktree` binary. `.claude-plugin/plugin.json` declares the server inline with `${CLAUDE_PLUGIN_ROOT}/bin/worktree`. `.codex-plugin/plugin.json` instead points at the root `.mcp.json` (`"mcpServers": "./.mcp.json"`, plus `"skills": "./skills"`), which declares `command: ./bin/worktree`, `args: []`, `cwd: "."`. Codex does not expand `${PLUGIN_ROOT}` in a plugin MCP's `command`/`args`, so its manifest carries no placeholder and relies on a relative `cwd` resolving against the installed plugin root.
+
+Two premises are **unverified** from this repo and are left to the post-release live test in Codex: (1) that Codex resolves the relative `cwd` against the plugin root (corroborated only by another shipped, working package using the same layout), and (2) that the extensionless `./bin/worktree` resolves to `worktree.exe` on Windows under Codex's launcher. The handshake test (`tests/test_plugin_manifest.py`) resolves the `.exe` explicitly, so it does not prove (2); `scripts/build.ps1` spawns the extensionless command literally against the real binary in the release matrix.
+
 ## Cross-platform binary note
 
 The plugin ships two binaries inside a single release zip:
@@ -373,11 +379,11 @@ below, one after another, each as its own foreground `pytest` call.
 
 | Chunk | Files / selector | Tests | Measured (local Windows) |
 | --- | --- | --- | --- |
-| 1 | `tests/test_environment_tools.py` | 125 | 29 s |
+| 1 | `tests/test_environment_tools.py` | 127 | 31 s |
 | 2 | `tests/test_worktree_tools.py` | 129 | 13 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 62 | 16 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py`, `tests/test_release_scripts.py` | 168 | 14 s |
-| **Total** | all 15 `tests/test_*.py` files | 484 passed | **72 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py`, `tests/test_release_scripts.py` | 177 | 15 s |
+| **Total** | all 15 `tests/test_*.py` files | 495 passed | **75 s** |
 
 **Ticket #184 note.** `tests/test_release_scripts.py` is new (driving tests
 for the `prev-release-tag.sh`/`preflight-src-tags.sh`/`marketplace-payload.sh`
@@ -416,10 +422,10 @@ only (`requires_git_bash`); the remaining 27 (`preflight-src-tags.sh` and
 `marketplace-payload.sh`) are gated on both `bash` and `jq`
 (`requires_git_bash_and_jq`). Both marks silently `skip` (not fail) when the
 dependency is missing, so a local run without `jq` under-reports chunk 4's
-168-passed figure above. Both `windows-latest` and `ubuntu-22.04`
+177-passed figure above. Both `windows-latest` and `ubuntu-22.04`
 GitHub-hosted runners ship `jq` preinstalled and Git-for-Windows ships its
 own `bash.exe` at the fixed path this module's `_resolve_git_bash` checks,
-so CI always runs the full 168; this caveat is local-dev only.
+so CI always runs the full 177; this caveat is local-dev only.
 
 The Total row is the **sum of the measured chunks**, **not a single**
 end-to-end measured run of the whole suite in one `pytest` invocation — the

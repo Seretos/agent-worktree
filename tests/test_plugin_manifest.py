@@ -1603,3 +1603,177 @@ def test_agents_md_suite_counts_carry_no_xfail_status():
         "AGENTS.md must not carry an XFAIL status note for the thread-leak "
         "tests -- ticket #181 removed the xfail marks"
     )
+
+
+# ---- Ticket #191: Codex layout (.codex-plugin -> ./.mcp.json) ----
+
+import queue  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import sysconfig  # noqa: E402
+import threading  # noqa: E402
+
+CODEX_PLUGIN_JSON = REPO_ROOT / ".codex-plugin" / "plugin.json"
+MCP_JSON = REPO_ROOT / ".mcp.json"
+_PLACEHOLDER = re.compile(r"\$\{[^}]*\}|\$[A-Z_]+")
+
+
+def test_codex_manifest_points_at_root_mcp_json():
+    """Helper: shape guard only; NOT behavioural evidence (Codex cannot run
+    here). Behavioural evidence is the staged handshake test below plus the
+    post-release live test.
+
+    Codex does not expand ``${PLUGIN_ROOT}`` in a plugin MCP command, so the
+    manifest must delegate to the root ``.mcp.json`` and declare its skills."""
+    raw = CODEX_PLUGIN_JSON.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    assert data["mcpServers"] == "./.mcp.json"
+    assert data["skills"] == "./skills"
+    assert not _PLACEHOLDER.search(raw), "Codex manifest must contain no ${...} placeholder"
+
+
+def test_hosts_declare_one_server_named_worktree_and_claude_manifest_unchanged():
+    claude = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
+    assert list(claude["mcpServers"]) == ["worktree"]
+    assert claude["mcpServers"]["worktree"]["command"] == "${CLAUDE_PLUGIN_ROOT}/bin/worktree"
+    assert claude["skills"] == "./skills"
+    assert MCP_JSON.exists(), ".mcp.json missing at repo root"
+    mcp = json.loads(MCP_JSON.read_text(encoding="utf-8"))
+    assert list(mcp["mcpServers"]) == ["worktree"]
+
+
+def test_mcp_json_is_placeholder_free_and_plugin_root_relative():
+    assert MCP_JSON.exists(), ".mcp.json missing at repo root"
+    raw = MCP_JSON.read_text(encoding="utf-8")
+    assert not _PLACEHOLDER.search(raw)
+    srv = json.loads(raw)["mcpServers"]["worktree"]
+    assert srv["command"] == "./bin/worktree"
+    assert srv["args"] == []
+    assert srv["cwd"] == "."
+
+
+def _rpc_session(cmd, cwd, requests, timeout=30.0):
+    """Spawn ``cmd``, send each request, and collect one reply per request that
+    carries an ``id``. Notifications are sent without waiting."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+    )
+    lines: "queue.Queue[str | None]" = queue.Queue()
+
+    def _pump():
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    replies = {}
+    try:
+        for req in requests:
+            proc.stdin.write(json.dumps(req) + "\n")
+            proc.stdin.flush()
+            if "id" not in req:
+                continue
+            while req["id"] not in replies:
+                line = lines.get(timeout=timeout)
+                assert line is not None, f"server exited before replying to {req['method']}"
+                if line.strip():
+                    msg = json.loads(line)
+                    if "id" in msg:
+                        replies[msg["id"]] = msg
+        return replies
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_shipped_mcp_json_command_handshakes_from_staged_tree(tmp_path):
+    """R1: take ``.mcp.json``'s command/args/cwd literally, over a staged plugin
+    tree, and complete initialize + tools/list + a real environment_list call."""
+    assert MCP_JSON.exists(), ".mcp.json missing at repo root"
+    srv = json.loads(MCP_JSON.read_text(encoding="utf-8"))["mcpServers"]["worktree"]
+
+    stage = tmp_path / "agent-worktree"
+    (stage / "bin").mkdir(parents=True)
+    shutil.copy2(MCP_JSON, stage / ".mcp.json")
+    shutil.copytree(REPO_ROOT / ".codex-plugin", stage / ".codex-plugin")
+    shutil.copytree(REPO_ROOT / ".claude-plugin", stage / ".claude-plugin")
+    shutil.copytree(REPO_ROOT / "skills", stage / "skills")
+
+    scripts = Path(sysconfig.get_path("scripts"))
+    exe = "worktree.exe" if sys.platform == "win32" else "worktree"
+    src = scripts / exe
+    # Fail (never skip): CI installs the console script via pip install -e ".[test]".
+    assert src.exists(), f"console script {src} missing; run `pip install -e \".[test]\"`"
+    shutil.copy2(src, stage / "bin" / exe)
+
+    cmd = [srv["command"], *srv["args"]]
+    cwd = (stage / srv["cwd"]).resolve()
+    # A relative command is resolved against the process cwd on POSIX; on
+    # Windows CreateProcess searches the parent dir, so resolve it against cwd
+    # the way build.ps1 does (Push-Location to cwd, then spawn).
+    if not Path(cmd[0]).is_absolute():
+        resolved = (cwd / cmd[0])
+        if not resolved.exists() and sys.platform == "win32":
+            resolved = resolved.with_suffix(".exe")
+        cmd[0] = str(resolved)
+
+    replies = _rpc_session(
+        cmd, cwd,
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": "environment_list", "arguments": {"path": str(REPO_ROOT)}}},
+        ],
+    )
+    assert "protocolVersion" in replies[1]["result"]
+    names = {t["name"] for t in replies[2]["result"]["tools"]}
+    assert "environment_list" in names
+    assert "error" not in replies[3], replies[3]
+    result = replies[3]["result"]
+    assert not result.get("isError", False), result
+    # An empty ``{"result": {}}`` must fail: require real content.
+    content = result.get("content")
+    structured = result.get("structuredContent")
+    assert content or structured, f"environment_list returned no content: {result}"
+    # FastMCP emits a ``list[dict]`` tool return as one text block PER item
+    # (and/or ``structuredContent`` shaped ``{"result": [...]}``), so parse
+    # each block on its own and flatten; never silently skip a non-JSON block.
+    records = []
+    if content:
+        for block in content:
+            assert isinstance(block, dict), f"unexpected content block: {block!r}"
+            try:
+                parsed = json.loads(block.get("text", ""))
+            except ValueError as exc:
+                raise AssertionError(
+                    f"environment_list content block is not JSON: {block!r}"
+                ) from exc
+            records.extend(parsed if isinstance(parsed, list) else [parsed])
+    else:
+        items = structured.get("result") if isinstance(structured, dict) else structured
+        records.extend(items if isinstance(items, list) else [items])
+    assert records, f"environment_list yielded no environment records: {result}"
+    for rec in records:
+        assert isinstance(rec, dict), f"environment record must be a dict: {rec!r}"
+        assert "path" in rec and "id" in rec, f"record lacks path/id: {rec!r}"
+
+
+def test_release_workflow_stages_codex_manifest_and_mcp_json_unconditionally():
+    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "stamped/.codex-plugin" in line or "stamped/.mcp.json" in line:
+            assert "|| true" not in line and "[ -f" not in line and "[ -d" not in line, line
+    assert "stamped/.mcp.json" in text
+    assert re.search(r"\.claude-plugin/plugin\.json\s+\.codex-plugin/plugin\.json", text)

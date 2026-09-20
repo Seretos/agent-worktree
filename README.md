@@ -89,6 +89,12 @@ Output: `bin/worktree` (Linux) or `bin/worktree.exe` (Windows), plus a
 is produced by `release.yml`'s matrix-then-assemble pipeline and merges
 both OS payloads into a single archive.
 
+## Host manifests (Claude Code and Codex)
+
+The release zip ships two host manifests over the same `bin/worktree` binary. `.claude-plugin/plugin.json` declares the server inline with `${CLAUDE_PLUGIN_ROOT}/bin/worktree`. `.codex-plugin/plugin.json` instead points at the root `.mcp.json` (`"mcpServers": "./.mcp.json"`, plus `"skills": "./skills"`), which declares `command: ./bin/worktree`, `args: []`, `cwd: "."`. Codex does not expand `${PLUGIN_ROOT}` in a plugin MCP's `command`/`args`, so its manifest carries no placeholder and relies on a relative `cwd` resolving against the installed plugin root.
+
+Two premises are **unverified** from this repo and are left to the post-release live test in Codex: (1) that Codex resolves the relative `cwd` against the plugin root (corroborated only by another shipped, working package using the same layout), and (2) that the extensionless `./bin/worktree` resolves to `worktree.exe` on Windows under Codex's launcher. The handshake test (`tests/test_plugin_manifest.py`) resolves the `.exe` explicitly, so it does not prove (2); `scripts/build.ps1` spawns the extensionless command literally against the real binary in the release matrix.
+
 ## Troubleshooting
 
 **Setup script fails on create**
