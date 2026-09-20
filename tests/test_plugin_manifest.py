@@ -1747,14 +1747,27 @@ def test_shipped_mcp_json_command_handshakes_from_staged_tree(tmp_path):
     content = result.get("content")
     structured = result.get("structuredContent")
     assert content or structured, f"environment_list returned no content: {result}"
+    # FastMCP emits a ``list[dict]`` tool return as one text block PER item
+    # (and/or ``structuredContent`` shaped ``{"result": [...]}``), so parse
+    # each block on its own and flatten; never silently skip a non-JSON block.
+    records = []
     if content:
-        text = "".join(c.get("text", "") for c in content if isinstance(c, dict))
-        try:
-            parsed = json.loads(text)
-        except ValueError:
-            parsed = None
-        if parsed is not None:
-            assert isinstance(parsed, list), f"environment_list must yield a list: {parsed!r}"
+        for block in content:
+            assert isinstance(block, dict), f"unexpected content block: {block!r}"
+            try:
+                parsed = json.loads(block.get("text", ""))
+            except ValueError as exc:
+                raise AssertionError(
+                    f"environment_list content block is not JSON: {block!r}"
+                ) from exc
+            records.extend(parsed if isinstance(parsed, list) else [parsed])
+    else:
+        items = structured.get("result") if isinstance(structured, dict) else structured
+        records.extend(items if isinstance(items, list) else [items])
+    assert records, f"environment_list yielded no environment records: {result}"
+    for rec in records:
+        assert isinstance(rec, dict), f"environment record must be a dict: {rec!r}"
+        assert "path" in rec and "id" in rec, f"record lacks path/id: {rec!r}"
 
 
 def test_release_workflow_stages_codex_manifest_and_mcp_json_unconditionally():
