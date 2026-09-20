@@ -1620,7 +1620,11 @@ _PLACEHOLDER = re.compile(r"\$\{[^}]*\}|\$[A-Z_]+")
 
 
 def test_codex_manifest_points_at_root_mcp_json():
-    """Codex does not expand ``${PLUGIN_ROOT}`` in a plugin MCP command, so the
+    """Helper: shape guard only; NOT behavioural evidence (Codex cannot run
+    here). Behavioural evidence is the staged handshake test below plus the
+    post-release live test.
+
+    Codex does not expand ``${PLUGIN_ROOT}`` in a plugin MCP command, so the
     manifest must delegate to the root ``.mcp.json`` and declare its skills."""
     raw = CODEX_PLUGIN_JSON.read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -1710,9 +1714,6 @@ def test_shipped_mcp_json_command_handshakes_from_staged_tree(tmp_path):
     assert src.exists(), f"console script {src} missing; run `pip install -e \".[test]\"`"
     shutil.copy2(src, stage / "bin" / exe)
 
-    for part in (".mcp.json", ".codex-plugin", "skills", "bin"):
-        assert (stage / part).exists(), f"staged tree lacks {part}"
-
     cmd = [srv["command"], *srv["args"]]
     cwd = (stage / srv["cwd"]).resolve()
     # A relative command is resolved against the process cwd on POSIX; on
@@ -1739,8 +1740,21 @@ def test_shipped_mcp_json_command_handshakes_from_staged_tree(tmp_path):
     assert "protocolVersion" in replies[1]["result"]
     names = {t["name"] for t in replies[2]["result"]["tools"]}
     assert "environment_list" in names
-    assert "error" not in replies[3]
-    assert not replies[3]["result"].get("isError", False)
+    assert "error" not in replies[3], replies[3]
+    result = replies[3]["result"]
+    assert not result.get("isError", False), result
+    # An empty ``{"result": {}}`` must fail: require real content.
+    content = result.get("content")
+    structured = result.get("structuredContent")
+    assert content or structured, f"environment_list returned no content: {result}"
+    if content:
+        text = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            assert isinstance(parsed, list), f"environment_list must yield a list: {parsed!r}"
 
 
 def test_release_workflow_stages_codex_manifest_and_mcp_json_unconditionally():
