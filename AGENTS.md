@@ -351,6 +351,23 @@ lost. None of it has been confirmed, and none of it is acted on in this repo.
 
 ## Release: orphan `release` branch + `src/` marker tags
 
+**PR-time coverage (ticket #195).** The non-publishing half of the release
+now runs on every pull request. The staging/zip logic lives in
+`.github/scripts/stage-release-zip.sh <source_tree> <bins_dir> <stage_dir> <zip_path>`
+(a `SHIP=( ... )` allowlist copied unconditionally, the two-binary guards,
+exec-bit stamping, and a self-verify pass over the zip it wrote, anchored on
+the binaries actually present under `bin/`). `release.yml`'s `assemble` step
+just calls it; `test.yml`'s `build` job (`windows-latest` + `ubuntu-22.04`,
+`./scripts/build.ps1 -Clean -Package` from a fresh checkout) and `package`
+job (downloads both binaries and runs the same script) execute the same two
+files with no `if:`/path filter. Publishing (orphan push, `src/` markers,
+GitHub Release, marketplace dispatch) stays `workflow_dispatch`-only.
+`tests/test_workflow_job_guards.py` enforces that every job invoking a repo
+file obtains the workspace and that every `release.yml` job is classified in
+`RELEASE_JOB_COVERAGE` (mirrored, publishing, or exempt). When adding a new
+top-level shipping path, add it to `SHIP` in the script; a tracked top-level
+path in neither `SHIP` nor the test's `NOT_SHIPPED` fails the suite.
+
 `release.yml` publishes each version as a **parentless orphan commit** on the `release` branch/tag (`ref` = `agent-worktree--vX.Y.Z`) — the marketplace clones exactly that ref, with no build tooling or git history alongside it. That layout is deliberate and unchanged by ticket #184; what #184 fixed is that an orphan commit has no merge-base with any prior commit, so asking GitHub to generate release notes (or a `Full Changelog` compare link) *directly against the orphan tag* always came back empty — there is no ancestry to walk.
 
 **The fix: a parallel lightweight tag on `main` for every release.** Every successful `assemble` run pushes `src/<TAG>` (e.g. `src/agent-worktree--v0.1.17`) pointing at the exact commit on `main` the release was built from. `src/<TAG>` tags carry real ancestry, so notes generation runs against `src/<PREV_TAG>...src/<TAG>` instead of against the orphan tag directly — the compare view and changelog list exactly the PRs merged to `main` between the two releases. `--generate-notes`/`--notes-start-tag` still can't be pointed at the orphan tag itself; that's why the generation call targets the `src/*` tags and the result is attached to the orphan release afterward via `--notes-file`.
@@ -382,8 +399,17 @@ below, one after another, each as its own foreground `pytest` call.
 | 1 | `tests/test_environment_tools.py` | 127 | 31 s |
 | 2 | `tests/test_worktree_tools.py` | 129 | 13 s |
 | 3 | `tests/test_setup_runner.py`, `tests/test_signal_resilience.py`, `tests/test_thread_leak_regression.py`, `tests/test_transport_failure_readback.py`, `tests/test_wrapper_script_args.py`, `tests/test_pytest_timeout_config.py` | 62 | 16 s |
-| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py`, `tests/test_release_scripts.py` | 177 | 15 s |
-| **Total** | all 15 `tests/test_*.py` files | 495 passed | **75 s** |
+| 4 | `tests/test_config.py`, `tests/test_contract.py`, `tests/test_docstring_contract_alignment.py`, `tests/test_plugin_manifest.py`, `tests/test_dependency_pin.py`, `tests/test_release_dispatch_payload.py`, `tests/test_release_scripts.py`, `tests/test_workflow_job_guards.py` | 202 | 17 s |
+| **Total** | all 16 `tests/test_*.py` files | 520 passed | **~75 s** |
+
+**Ticket #195 note.** `tests/test_workflow_job_guards.py` is new and joined
+chunk 4, and `tests/test_release_scripts.py` gained an R4 section driving the
+real `.github/scripts/stage-release-zip.sh` (bash only, no `jq`). Chunk 4 is
+re-measured at 202 tests (was 177) and the Total at 520 (was 495). On this
+Windows checkout `tests/test_signal_resilience.py::test_server_survives_ctrl_break_event`
+and `tests/test_plugin_manifest.py::test_shipped_mcp_json_command_handshakes_from_staged_tree`
+fail when the interpreter cannot import `worktree_plugin` (package not
+installed for that python) -- an environment precondition, unrelated to #195.
 
 **Ticket #184 note.** `tests/test_release_scripts.py` is new (driving tests
 for the `prev-release-tag.sh`/`preflight-src-tags.sh`/`marketplace-payload.sh`

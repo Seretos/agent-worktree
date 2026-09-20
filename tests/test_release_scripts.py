@@ -958,3 +958,269 @@ def test_marketplace_payload_fails_loudly_when_required_env_var_missing(payload_
         f"missing {missing_var} should cause a loud failure, got exit 0\n"
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
+
+
+# ===========================================================================
+# R4 (ticket #195) -- stage-release-zip.sh
+#
+# The staging/zip logic used to be inline YAML in release.yml's `assemble`
+# job, reachable only on workflow_dispatch. The script under test is
+# `stage-release-zip.sh <source_tree> <bins_dir> <stage_dir> <zip_path>`;
+# these tests run the REAL script through real bash. The expected shipped
+# set below is HARDCODED here, never parsed from the script, so mutating the
+# script's own SHIP list cannot move the expectation with it.
+# ===========================================================================
+
+STAGE_SCRIPT = SCRIPTS_DIR / "stage-release-zip.sh"
+
+# Every zip entry the synthetic source tree + binaries must produce.
+EXPECTED_ZIP_ENTRIES = {
+    ".claude-plugin/plugin.json",
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "README.md",
+    "description.md",
+    "skills/worktree/SKILL.md",
+    "assets/icon.png",
+    "bin/worktree",
+    "bin/worktree.exe",
+}
+EXEC_ENTRIES = {"bin/worktree", "bin/worktree.exe"}
+
+# Distinct bytes per shipped file, so a zero-byte placeholder or one binary
+# copied under both names is detected by comparing entry CONTENTS.
+SOURCE_CONTENTS = {
+    ".claude-plugin/plugin.json": b'{"claude": 1}',
+    ".codex-plugin/plugin.json": b'{"codex": 2}',
+    ".mcp.json": b'{"mcp": 3}',
+    "README.md": b"readme-bytes",
+    "description.md": b"desc-bytes",
+    "skills/worktree/SKILL.md": b"skill-bytes",
+    "assets/icon.png": b"png-bytes",
+}
+WINDOWS_BIN_BYTES = b"MZ-windows-binary-bytes"
+LINUX_BIN_BYTES = b"\x7fELF-linux-binary-bytes"
+EXPECTED_ZIP_CONTENTS = {
+    **SOURCE_CONTENTS,
+    "bin/worktree": LINUX_BIN_BYTES,
+    "bin/worktree.exe": WINDOWS_BIN_BYTES,
+}
+
+# Tracked top-level paths that deliberately do NOT ship.
+NOT_SHIPPED = {
+    ".claude",
+    ".gitattributes",
+    ".github",
+    ".gitignore",
+    ".serena",
+    "AGENTS.md",
+    "SECURITY.md",
+    "pyproject.toml",
+    "scripts",
+    "src",
+    "tests",
+    "worktree.spec",
+}
+
+
+def _posix(p: Path) -> str:
+    return p.as_posix()
+
+
+def _make_source_tree(root: Path) -> Path:
+    src = root / "stamped"
+    files = dict(SOURCE_CONTENTS)
+    # Files that must NOT ship.
+    files.update({"src/junk.py": b"x", "tests/test_x.py": b"x"})
+    for rel, content in files.items():
+        f = src / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(content)
+    return src
+
+
+def _make_bins(root: Path, extra: dict[str, str] | None = None) -> Path:
+    bins = root / "bins"
+    (bins / "bin-windows").mkdir(parents=True)
+    (bins / "bin-linux").mkdir(parents=True)
+    (bins / "bin-windows" / "worktree.exe").write_bytes(WINDOWS_BIN_BYTES)
+    (bins / "bin-linux" / "worktree").write_bytes(LINUX_BIN_BYTES)
+    for rel, content in (extra or {}).items():
+        (bins / rel).write_text(content, encoding="utf-8")
+    return bins
+
+
+def _run_stage(script: Path, root: Path, src: Path, bins: Path):
+    stage = root / "build" / "stage" / "agent-worktree"
+    zip_path = root / "dist" / "out.zip"
+    env = dict(os.environ)
+    env["PYTHON_BIN"] = _posix(Path(sys.executable))
+    proc = subprocess.run(
+        [GIT_BASH, _posix(script), _posix(src), _posix(bins), _posix(stage), _posix(zip_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    return proc, zip_path
+
+
+def _zip_entries(zip_path: Path) -> dict[str, int]:
+    """entry name -> unix permission bits from external_attr."""
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        return {zi.filename: (zi.external_attr >> 16) & 0o777 for zi in zf.infolist()}
+
+
+def _zip_contents(zip_path: Path) -> dict[str, bytes]:
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as zf:
+        return {zi.filename: zf.read(zi) for zi in zf.infolist()}
+
+
+def _describe(proc) -> str:
+    return f"rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+
+
+def _mutated_script(tmp_path: Path, transform) -> Path:
+    """Copy the REAL script into tmp_path, apply `transform(text)`, assert the
+    transform actually changed something (a no-op mutant would prove nothing)."""
+    assert STAGE_SCRIPT.is_file(), f"{STAGE_SCRIPT} does not exist"
+    original = STAGE_SCRIPT.read_text(encoding="utf-8")
+    mutated = transform(original)
+    assert mutated != original, "mutation did not change the script text"
+    out = tmp_path / "mutant-stage-release-zip.sh"
+    out.write_text(mutated, encoding="utf-8", newline="\n")
+    return out
+
+
+@requires_git_bash
+def test_stage_release_zip_ships_every_allowlisted_path_and_exec_bits(tmp_path):
+    """Driving test (R4/AC1 baseline): real script, synthetic tree -> zip with
+    exactly the hardcoded shipped set, 0o755 on both binaries, 0o644 elsewhere,
+    and nothing from non-shipped dirs.
+
+    RED today: the script does not exist (bash exits 127).
+    """
+    src = _make_source_tree(tmp_path)
+    bins = _make_bins(tmp_path)
+    proc, zip_path = _run_stage(STAGE_SCRIPT, tmp_path, src, bins)
+    assert proc.returncode == 0, _describe(proc)
+    entries = _zip_entries(zip_path)
+    assert set(entries) == EXPECTED_ZIP_ENTRIES
+    assert _zip_contents(zip_path) == EXPECTED_ZIP_CONTENTS
+    for name, mode in entries.items():
+        expected = 0o755 if name in EXEC_ENTRIES else 0o644
+        assert mode == expected, f"{name}: {oct(mode)} != {oct(expected)}"
+
+
+@requires_git_bash
+def test_mutated_allowlist_drops_a_shipped_path(tmp_path):
+    """Mutant (AC1): remove `.codex-plugin` from the script's SHIP list. The
+    dropped path must be observably gone from the real output, checked against
+    the HARDCODED expected set (not one derived from the mutated script)."""
+    import re
+
+    def drop(text: str) -> str:
+        m = re.search(r"^SHIP=\(.*?\)", text, re.S | re.M)
+        assert m, "no `SHIP=( ... )` list found in script"
+        block = m.group(0)
+        assert ".codex-plugin" in block
+        return text.replace(block, block.replace(".codex-plugin", ""), 1)
+
+    mutant = _mutated_script(tmp_path, drop)
+    work = tmp_path / "w"
+    work.mkdir()
+    src = _make_source_tree(work)
+    bins = _make_bins(work)
+    proc, zip_path = _run_stage(mutant, work, src, bins)
+    if proc.returncode == 0:
+        names = set(_zip_entries(zip_path))
+        assert ".codex-plugin/plugin.json" not in names
+        assert EXPECTED_ZIP_ENTRIES - names == {".codex-plugin/plugin.json"}
+    # A non-zero exit is an equally valid detection of the dropped path.
+
+
+@requires_git_bash
+def test_mutated_execs_loses_linux_exec_bit(tmp_path):
+    """Mutant (AC1): rename bin/worktree out of EXECS. The script's own verify
+    step must exit non-zero and name bin/worktree, because it checks the
+    binaries actually present under bin/, not just the EXECS list."""
+
+    def rename(text: str) -> str:
+        assert '"bin/worktree"' in text
+        return text.replace('"bin/worktree"', '"bin/worktree-linux"')
+
+    mutant = _mutated_script(tmp_path, rename)
+    work = tmp_path / "w"
+    work.mkdir()
+    src = _make_source_tree(work)
+    bins = _make_bins(work)
+    proc, _ = _run_stage(mutant, work, src, bins)
+    assert proc.returncode != 0, "mutant shipped a non-exec Linux binary\n" + _describe(proc)
+    assert "bin/worktree" in (proc.stdout + proc.stderr)
+
+
+@requires_git_bash
+def test_added_binary_not_in_execs_never_ships_without_exec_bit(tmp_path):
+    """Exec-bit verification is anchored on the binaries actually present in
+    the bins dir: an extra binary EXECS does not know about must either fail
+    the script or ship 0o755 -- never silently ship 0o644."""
+    assert STAGE_SCRIPT.is_file(), f"{STAGE_SCRIPT} does not exist"
+    src = _make_source_tree(tmp_path)
+    bins = _make_bins(tmp_path, extra={"bin-linux/worktree-arm64": "ELF"})
+    proc, zip_path = _run_stage(STAGE_SCRIPT, tmp_path, src, bins)
+    assert proc.returncode != 0 or zip_path.is_file(), _describe(proc)
+    if proc.returncode == 0:
+        entries = _zip_entries(zip_path)
+        assert "bin/worktree-arm64" in entries
+        assert entries["bin/worktree-arm64"] == 0o755, (
+            f"added binary shipped as {oct(entries['bin/worktree-arm64'])}"
+        )
+
+
+@requires_git_bash
+def test_stage_release_zip_fails_when_a_shipped_source_is_missing(tmp_path):
+    """The retired `[ -f X ] && cp || true` path: a moved ship file must fail
+    the run instead of silently shipping nothing."""
+    assert STAGE_SCRIPT.is_file(), f"{STAGE_SCRIPT} does not exist"
+    src = _make_source_tree(tmp_path)
+    (src / "README.md").unlink()
+    bins = _make_bins(tmp_path)
+    proc, _ = _run_stage(STAGE_SCRIPT, tmp_path, src, bins)
+    assert proc.returncode != 0, _describe(proc)
+    assert "README.md" in (proc.stdout + proc.stderr)
+
+
+@requires_git_bash
+@pytest.mark.parametrize("missing", ["bin-windows/worktree.exe", "bin-linux/worktree"])
+def test_stage_release_zip_fails_when_a_binary_is_missing(tmp_path, missing):
+    assert STAGE_SCRIPT.is_file(), f"{STAGE_SCRIPT} does not exist"
+    src = _make_source_tree(tmp_path)
+    bins = _make_bins(tmp_path)
+    (bins / missing).unlink()
+    proc, _ = _run_stage(STAGE_SCRIPT, tmp_path, src, bins)
+    assert proc.returncode != 0, _describe(proc)
+    assert "missing" in (proc.stdout + proc.stderr).lower()
+
+
+def test_ship_list_covers_every_tracked_top_level_path():
+    """SHIP (parsed from the script) plus the test's NOT_SHIPPED must cover
+    every tracked top-level path, so a new shipping directory cannot be
+    silently omitted."""
+    import re
+
+    assert STAGE_SCRIPT.is_file(), f"{STAGE_SCRIPT} does not exist"
+    m = re.search(r"^SHIP=\((.*?)\)", STAGE_SCRIPT.read_text(encoding="utf-8"), re.S | re.M)
+    assert m, "no `SHIP=( ... )` list found in script"
+    ship = set(m.group(1).split())
+    out = subprocess.run(
+        [GIT_REAL, "-C", str(REPO_ROOT), "ls-files"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    top = {p.split("/")[0] for p in out}
+    uncovered = top - ship - NOT_SHIPPED
+    assert not uncovered, f"top-level paths neither shipped nor exempt: {sorted(uncovered)}"
+    assert not (ship & NOT_SHIPPED)
