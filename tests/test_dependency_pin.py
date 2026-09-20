@@ -59,6 +59,8 @@ def test_load_plugin_config_discovers_seretos_worktree_yml_unpatched(
     assert version("lib-python-config") == PINS["lib-python-config"]
 
     monkeypatch.delenv("WORKTREE_CONFIG", raising=False)
+    # lib-python-config walks git project boundaries: mark tmp_path as a repo.
+    (tmp_path / ".git").mkdir()
     config_dir = tmp_path / ".seretos"
     config_dir.mkdir()
     (config_dir / "worktree.yml").write_text(
