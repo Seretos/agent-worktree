@@ -211,73 +211,13 @@ jobs:
       - name: Build merged staging tree
         id: stage
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           STAGE="build/stage/agent-worktree"
-          mkdir -p "$STAGE"
-
-          # Copy the install-ready, non-binary parts from the stamped tree.
-          cp -a stamped/.claude-plugin "$STAGE/"
-          # Unconditional: `shell: bash` runs with -e, so a missing source
-          # fails the run instead of silently shipping a half-staged package.
-          cp -a stamped/.codex-plugin "$STAGE/"
-          cp -a stamped/.mcp.json     "$STAGE/"
-          [ -f stamped/README.md       ] && cp -a stamped/README.md       "$STAGE/" || true
-          [ -f stamped/LICENSE         ] && cp -a stamped/LICENSE         "$STAGE/" || true
-          [ -f stamped/description.md  ] && cp -a stamped/description.md  "$STAGE/" || true
-          if [ -d stamped/skills ]; then
-            cp -a stamped/skills "$STAGE/"
-          fi
-          [ -d stamped/assets ] && cp -a stamped/assets "$STAGE/" || true
-
-          # Merge every per-OS bin payload. Both jobs upload to bins/bin-<os>/
-          # which contains a `worktree` or `worktree.exe`.
-          mkdir -p "$STAGE/bin"
-          shopt -s nullglob
-          for d in bins/bin-*/; do
-            echo "Merging $d -> $STAGE/bin/"
-            cp -a "$d"/* "$STAGE/bin/"
-          done
-
-          echo "=== merged bin/ ==="
-          ls -la "$STAGE/bin"
-
-          # Ensure both binaries got picked up.
-          if [ ! -f "$STAGE/bin/worktree.exe" ]; then
-            echo "::error::missing Windows binary in merged stage"; exit 1
-          fi
-          if [ ! -f "$STAGE/bin/worktree" ]; then
-            echo "::error::missing Linux binary in merged stage"; exit 1
-          fi
-          chmod +x "$STAGE/bin/worktree"
-
-          ZIP="dist/agent-worktree-${{ inputs.version }}.zip"
-          mkdir -p dist
-          # Use Python's zipfile so we can stamp Unix mode bits into the
-          # central directory — required so the Linux binary keeps its
-          # exec bit after `unzip` on Linux/macOS.
-          python3 - "$STAGE" "$ZIP" <<'PY'
-          import os, sys, time, zipfile
-          stage, zip_path = sys.argv[1], sys.argv[2]
-          EXECS = {"bin/worktree", "bin/worktree.exe"}
-          EXE_ATTR = (0o755 << 16) | 0x8000  # S_IFREG | 0755
-          REG_ATTR = (0o644 << 16) | 0x8000
-          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-              for dirpath, dirnames, filenames in os.walk(stage):
-                  dirnames.sort()
-                  for name in sorted(filenames):
-                      abs_path = os.path.join(dirpath, name)
-                      rel = os.path.relpath(abs_path, stage).replace(os.sep, "/")
-                      st = os.stat(abs_path)
-                      mtime = time.localtime(st.st_mtime)[:6]
-                      zi = zipfile.ZipInfo(filename=rel, date_time=mtime)
-                      zi.compress_type = zipfile.ZIP_DEFLATED
-                      zi.create_system = 3  # Unix
-                      zi.external_attr = EXE_ATTR if rel in EXECS else REG_ATTR
-                      with open(abs_path, "rb") as fh:
-                          zf.writestr(zi, fh.read())
-          print(f"wrote {zip_path} ({os.path.getsize(zip_path)} bytes)")
-          PY
-
+          ZIP="dist/agent-worktree-${VERSION}.zip"
+          # Shared with test.yml's `package` job (ticket #195).
+          bash .github/scripts/stage-release-zip.sh stamped bins "$STAGE" "$ZIP"
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
           echo "asset=$ZIP"   >> "$GITHUB_OUTPUT"
 

@@ -1771,9 +1771,14 @@ def test_shipped_mcp_json_command_handshakes_from_staged_tree(tmp_path):
 
 
 def test_release_workflow_stages_codex_manifest_and_mcp_json_unconditionally():
+    # Ticket #195: the staging logic moved from release.yml into
+    # stage-release-zip.sh; the workflow stamps both manifests and delegates.
     text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-    for line in text.splitlines():
-        if "stamped/.codex-plugin" in line or "stamped/.mcp.json" in line:
-            assert "|| true" not in line and "[ -f" not in line and "[ -d" not in line, line
-    assert "stamped/.mcp.json" in text
     assert re.search(r"\.claude-plugin/plugin\.json\s+\.codex-plugin/plugin\.json", text)
+    script = (REPO_ROOT / ".github" / "scripts" / "stage-release-zip.sh").read_text(encoding="utf-8")
+    m = re.search(r"^SHIP=\((.*?)\)", script, re.S | re.M)
+    assert m, "no SHIP=( ... ) list in stage-release-zip.sh"
+    ship = m.group(1).split()
+    assert ".codex-plugin" in ship and ".mcp.json" in ship
+    # Copied unconditionally: no silent-skip guard around the SHIP copy.
+    assert "|| true" not in script

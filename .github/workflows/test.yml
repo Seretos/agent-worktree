@@ -64,3 +64,63 @@ jobs:
       - name: Run pytest
         shell: bash
         run: python -m pytest
+
+  # ------------------------------------------------------------------
+  # Ticket #195: PR-side counterparts of release.yml's `build` and the
+  # non-publishing half of `assemble`. Unconditional on every PR (no `if:`,
+  # no path filter) so a broken build script, a dropped ship path or a
+  # binary that loses its exec bit fails the PR that introduces it instead
+  # of burning a release version. Publishing steps stay release-only.
+  # ------------------------------------------------------------------
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-22.04
+            target: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Build binary + stage payload (${{ matrix.target }})
+        shell: pwsh
+        run: ./scripts/build.ps1 -Clean -Package
+
+      - name: Upload OS-tagged bin payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: bin/
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all per-OS bins
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins/
+          merge-multiple: false
+
+      - name: Stage and verify release zip
+        shell: bash
+        run: bash .github/scripts/stage-release-zip.sh . bins build/stage/agent-worktree dist/pr-check.zip
