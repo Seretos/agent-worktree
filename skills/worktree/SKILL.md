@@ -228,7 +228,7 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 | Tool | Best for |
 |---|---|
-| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD) |
+| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD). Returns the worktree record: `id` is the handle you pass as `environment_id` to the later calls, `path` is the checkout directory you work in. **Not idempotent** — a branch that already has a tracked worktree raises instead of returning it (see "Identity and re-entry guarantees" below) |
 | `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. A dirty checkout needing `force=True` is the expected, routine teardown case, not an emergency override. Structurally refuses to delete a primary checkout, even with `force=True` |
 
 **Environment lifecycle** (the process running against any checkout, primary included):
@@ -285,6 +285,32 @@ replaced with `checkout_path`, with the full diagnostic reason preserved byte-fo
 > This deviation is intentional and documented here, in `AGENTS.md`, and in the tool
 > docstrings themselves — the ticket calls the id-only surface final, so the deviation
 > is called out explicitly rather than left silent.
+
+## Identity and re-entry guarantees
+
+**`worktree_create` is not idempotent.** A second call for a branch that already has a
+tracked worktree in the same repo does not return the existing record — it raises
+`ValueError`. The duplicate check runs before any git command that creates anything,
+so the failed call changes nothing. The error names the existing environment as
+`(existing_environment_id: "<id>", existing_path: "<path>")` on a best-effort basis
+only: when the existing record cannot be looked up, the bare engine text is raised
+with no id. So when you may be resuming work (a restart, a crash-retry, a second
+pass over the same branch), check before you create:
+
+1. `environment_list(path=<repo_root>)`.
+2. An entry with your `branch` and `tracked: true` exists → do not call
+   `worktree_create`; use that entry's `id` and `path`.
+3. An entry with your `branch` and `tracked: false` exists → it is an orphan; see
+   "Orphan worktree recovery" below.
+4. No entry for your branch → call `worktree_create` and take `id` and `path` from its
+   return value.
+
+**An `environment_id` is not stable across remove + re-create.** Removing a worktree
+and creating one again for the same branch yields a different id: the id's 8-hex
+suffix is random, even though its prefix looks derived from the repo and branch. An
+id you stored before a `worktree_remove` does not resolve to the new worktree. Never
+reuse a cached id after a remove; read the current one from the create call's return
+value or from `environment_list`.
 
 ## Lifecycle
 
@@ -368,8 +394,13 @@ The response's `killed_pids` field lists every terminated process (pid, name,
 cmdline, cmdline_raw). `cmdline` is agent-readable — a PowerShell/pwsh
 `-EncodedCommand` base64 blob is decoded to the actual script text — with the
 original, undecoded argv preserved in `cmdline_raw` (`None` when nothing was
-decoded). If the directory is still locked afterward, the tool raises an error —
-resolve the remaining lock at the OS level and retry.
+decoded).
+
+The recipe is bounded: when plain `worktree_remove` fails on a locked directory,
+retry it **once** with `kill_blocking_processes=True`. If that retry still raises
+because the directory is locked, do not keep re-sending the flag — find the process
+holding the directory at the OS level, close it, and then call `worktree_remove`
+again.
 
 **Compound blocking (ticket #120): one retry, not a guessing sequence.** If the
 directory lock AND uncommitted/untracked changes are BOTH blocking removal at
@@ -425,12 +456,9 @@ read-back tool.
    entry with your `branch` and `tracked: true`. Its `id` is what the lost
    response carried, and the id's 8-hex suffix is random, so read-back is the
    only way to recover it; `setup_status` says how the `setup:` steps ended. A
-   blind retry is non-destructive (the duplicate guard fires before any
-   worktree-creating git command — only a read-only `git rev-parse` for repo
-   classification has run at that point) and self-diagnosing: the raised
-   error carries `(existing_environment_id: "<id>", existing_path:
-   "<path>")` — best-effort only; if the landed record can't be looked up,
-   the bare engine text is raised instead, with no id invented.
+   blind retry changes nothing and raises the duplicate `ValueError`, whose
+   `existing_environment_id` token is best-effort only (see "Identity and
+   re-entry guarantees" above).
 2. **`worktree_remove`** — read back from the **repo root**, never from the removed
    checkout path. That path is gone if the removal landed, so passing it back
    raises `invalid checkout_path '<p>': checkout_path does not exist: ...` —
@@ -554,8 +582,10 @@ running under the given `role`).
    resources (ports, processes) directly at the OS level if reconciliation couldn't
    recover them.
 4. **Windows can lock a worktree directory via a foreign process's cwd.** If plain
-   `worktree_remove` fails, retry with `kill_blocking_processes=True` rather than
-   fighting the lock manually. This flag is not for a process you started yourself
+   `worktree_remove` fails, retry once with `kill_blocking_processes=True` before
+   touching the lock yourself; only if that retry still raises, find and close the
+   holding process at the OS level and call `worktree_remove` again (the recipe
+   under "Worktree directory locked by a foreign process" in Troubleshooting). This flag is not for a process you started yourself
    with `environment_start` — removal stops every tracked role first, before this
    flag's scan runs. If the directory lock and uncommitted changes are
    BOTH blocking removal, the error names both conditions and both required
@@ -596,3 +626,7 @@ running under the given `role`).
     holds generated files or uncommitted changes; `worktree_remove(force=True)`
     is the expected, routine way to tear it down — not a rescue flag reserved
     for crashes or corruption.
+11. **A cached `environment_id` does not survive a remove + re-create.** Re-creating
+    a worktree for the same branch gives it a new id with a new random suffix, so an
+    id stored before the `worktree_remove` no longer resolves. Re-read the id from
+    `environment_list` (see "Identity and re-entry guarantees" above).
