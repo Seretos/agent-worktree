@@ -9,7 +9,7 @@ from worktree_plugin.config import load_plugin_config
 # Pinned git-URL dependencies: distribution name -> expected version.
 PINS = {
     "lib-python-worktree": "0.3.14",
-    "lib-python-config": "0.1.2",
+    "lib-python-config": "0.1.3",
 }
 
 
@@ -39,7 +39,7 @@ def test_dependency_pinned(name):
 def test_load_plugin_config_env_override_unpatched_on_pinned_config_lib(
     tmp_path, monkeypatch
 ):
-    """Installed lib-python-config is v0.1.2 AND parses WORKTREE_CONFIG, unpatched."""
+    """Installed lib-python-config is v0.1.3 AND parses WORKTREE_CONFIG, unpatched."""
     assert version("lib-python-config") == PINS["lib-python-config"]
 
     cfg_file = tmp_path / "elsewhere" / "custom.yml"
@@ -54,7 +54,7 @@ def test_load_plugin_config_env_override_unpatched_on_pinned_config_lib(
 def test_load_plugin_config_discovers_seretos_worktree_yml_unpatched(
     tmp_path, monkeypatch
 ):
-    """Installed lib-python-config is v0.1.2 AND discovers .seretos/worktree.yml
+    """Installed lib-python-config is v0.1.3 AND discovers .seretos/worktree.yml
     from a working directory (no env override), unpatched."""
     assert version("lib-python-config") == PINS["lib-python-config"]
 
