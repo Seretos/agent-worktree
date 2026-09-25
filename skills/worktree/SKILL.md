@@ -228,14 +228,14 @@ Five MCP tools, all under the `worktree` server, split by lifecycle:
 
 | Tool | Best for |
 |---|---|
-| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD). Returns the worktree record: `id` is the handle you pass as `environment_id` to the later calls, `path` is the checkout directory you work in. **Not idempotent** — a branch that already has a tracked worktree raises instead of returning it (see "Identity and re-entry guarantees" below) |
+| `worktree_create` | Create a new worktree for a branch (runs `setup:` steps); copies `.seretos/` into the checkout as a convenience. `base` is optional — for a not-yet-existing `branch`, omitting it defaults to whatever branch is currently checked out at `repo_root` (still raises on a detached/unborn HEAD). Returns the worktree record: `id` is the handle you pass as `environment_id` to the later calls, `path` is the checkout directory you work in. The create response (and only it) also carries `start_variants`: the `name:`s of the contract's **named** `start:` steps. `[]` means the contract has no *named* start step — a lone unnamed step is still the implicit `"default"` variant and starts fine — and `null` means no readable contract; it is not a list of everything startable. **Not idempotent** — a branch that already has a tracked worktree raises instead of returning it (see "Identity and re-entry guarantees" below) |
 | `worktree_remove` | Run `teardown:` steps, then delete the worktree checkout; addressed by `environment_id` and/or `checkout_path` (see "Addressing an environment" below — `checkout_path` is the only way to remove an untracked/orphan checkout); supports `force` and `kill_blocking_processes`. A dirty checkout needing `force=True` is the expected, routine teardown case, not an emergency override. Structurally refuses to delete a primary checkout, even with `force=True` |
 
 **Environment lifecycle** (the process running against any checkout, primary included):
 
 | Tool | Best for |
 |---|---|
-| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status` (`"completed"` / `"failed"` / `"skipped"` / `"unknown"`, derived solely from the record's `setup_outcome`, never from `status`); `scope="all"` fans out across every tracked repo, optionally narrowed to specific repos or a parent directory with `repos=[...]` (a repo root is kept only if it resolves at or under one entry; only valid with `scope="all"`, else `ValueError`) |
+| `environment_list` | Enumerate the environments (primary + linked worktrees) for the repo containing a given path, including `setup_status` (`"completed"` / `"failed"` / `"skipped"` / `"unknown"`, derived solely from the record's `setup_outcome`, never from `status`); `scope="all"` fans out across every repo this server has ever tracked, optionally narrowed to specific repos or a parent directory with `repos=[...]` (a repo root is kept only if it resolves at or under one entry; only valid with `scope="all"`, else `ValueError`). An unnarrowed `scope="all"` returns other, unrequested repos' real checkout paths and branch names — other projects' and other sessions' live work on this machine, not just yours — so do not publish or paste its output unedited. Stay on the default `scope="repo"`, or narrow with `repos=[...]`, unless you actually need cross-repo data |
 | `environment_start` | Launch a named `start:` variant as a tracked, detached process, against any checkout |
 | `environment_stop` | Run `stop:` steps best-effort, then gracefully (and if needed forcibly) terminate the tracked process, against any checkout; accepts an optional `variant` to resolve the target `role` from `record.variants` instead of naming `role` directly (see "`role` vs `variant`" above) |
 
@@ -497,7 +497,11 @@ read-back tool.
 never written to `state.yaml`, and `environment_list` rebuilds every entry
 from persisted state, so those keys are always `null`/`[]` there no matter
 what happened. Read them only from the response of the call that produced
-them. (Ticket #181: the pinned engine's v0.3.13 bump removed
+them. `start_variants` is never read-back evidence either, for a different
+reason: it is not a record field at all — only `worktree_create`'s response
+computes it — so an `environment_list` entry never carries a populated
+value; read it from the create response or from the contract's `start:`
+list. (Ticket #181: the pinned engine's v0.3.13 bump removed
 `WorktreeRecord.orphan_scan` entirely -- a breaking upstream change, not
 just a doc correction.)
 
@@ -551,7 +555,7 @@ is exactly one of the five values below and `steps_run` is `0`.
 | `no_start_steps` | Contract fine, but no `start:` step is declared — or the start recorded no pid for this `role`. | Declare a `start:` step for this `role`; check why it left no pid. |
 | `contract_misplaced` | Nothing at `repo_root`, but the linked checkout has its own copy. | Move it to `repo_root`; only that path is read. |
 | `no_contract` | Nothing at `repo_root` and no checkout-local copy either. | Author `.seretos/worktree-setup.yml` at `repo_root`. |
-| `contract_unreadable` | The file is there, but the diagnostics **re-read** of it raised `OSError`/`ContractError` (bad file permissions, or invalid YAML) and no pid is recorded for this `role`. | Check the file's permissions and fix its YAML syntax, then retry. Had the role actually started, `no_op_reason` would be `null` despite the failed re-read. |
+| `contract_unreadable` | Rare race: the engine's own read at start succeeded, then the diagnostics **re-read** raised (file changed or lost read permission in between) and no pid is recorded for this `role`. A contract that is invalid YAML or unreadable at call time never gets here: `environment_start` raises a tool error (a YAML parse error naming the path) — no dict, no `no_op_reason`. | Check the file's permissions and contents, then retry. For a raised parse error, catch it, fix the file, retry. |
 
 **Soft error codes.** `worktree_remove`, `environment_start`, and `environment_stop`
 all return an additive machine-readable `code` field alongside `error` on their soft
@@ -570,7 +574,9 @@ running under the given `role`).
    `no_op_reason: "contract_misplaced"` (vs `"no_contract"` for the genuinely-
    unconfigured case) — branch on that instead of inferring from `status`/`pids`. If
    instead the checkout-local copy was *edited* while a valid repo-root contract
-   started normally, look for `shadowed_contract` in the response. (All five
+   started normally, look for `shadowed_contract` in the response. A repo-root
+   contract that fails to parse is different: `environment_start` raises
+   instead of returning a `no_op_reason`. (All five
    `no_op_reason` values are listed under **no_op_reason values** in
    Troubleshooting, above.)
 2. **`isolation: none` forbids every block.** Adding `setup:`, `start:`, `stop:`,
@@ -618,9 +624,10 @@ running under the given `role`).
    contract declares exactly one `start:` step total; the moment a second
    named step is added, a bare `environment_start()` call raises
    `ValueError` listing the available names instead of silently picking
-   one. Check `worktree_create`'s returned `start_variants` field (or this
-   contract's `start:` list) up front and pass `variant=<name>` explicitly
-   whenever more than one step exists.
+   one. Count the steps in the contract's `start:` list — that list is
+   authoritative — and pass `variant=<name>` explicitly whenever more than
+   one step exists. `worktree_create`'s `start_variants` lists only the
+   *named* steps, so `[]` does not mean "no start step".
 10. **A dirty checkout needing `force=True` at teardown is normal, not an
     emergency.** After `setup:`/`start:` steps run, the checkout typically
     holds generated files or uncommitted changes; `worktree_remove(force=True)`
