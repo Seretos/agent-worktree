@@ -1728,7 +1728,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           **verbatim** ``pids`` key -- never lower-cased, and
           case-preserving is *not* upper-casing either; casing is simply
           left untouched -- tracked at its origin as
-          ``Seretos/lib-python-worktree#111`` (the lower-casing bug it
+          ``seretos-agents/lib-python-worktree#111`` (the lower-casing bug it
           originally reported was fixed upstream in the pinned v0.3.7).
           Non-alphanumeric runs (``[^A-Za-z0-9]+``) collapse to a single
           ``-``, leading/trailing ``-`` are stripped, the result is

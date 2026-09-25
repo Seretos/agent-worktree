@@ -4,7 +4,7 @@ MCP server for git worktree lifecycle management. Create/list/remove worktrees w
 
 ## What it does
 
-A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Ships as a self-contained frozen binary — no Python needed on the host. Five MCP tools split along the two real lifecycles a checkout goes through: checkout lifecycle (`worktree_create`, `worktree_remove` — create/delete the directory) and environment lifecycle (`environment_list`, `environment_start`, `environment_stop` — the process running against any checkout, the primary/main clone included). See `AGENTS.md` for the full tool reference.
+A thin MCP wrapper around [`lib-python-worktree`](https://github.com/seretos-agents/lib-python-worktree). Ships as a self-contained frozen binary — no Python needed on the host. Five MCP tools split along the two real lifecycles a checkout goes through: checkout lifecycle (`worktree_create`, `worktree_remove` — create/delete the directory) and environment lifecycle (`environment_list`, `environment_start`, `environment_stop` — the process running against any checkout, the primary/main clone included). See `AGENTS.md` for the full tool reference.
 
 ## Quickstart
 
@@ -39,15 +39,15 @@ A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib
      - name: web
        run: stop-web.sh
    ```
-   For full contract documentation and working examples, see the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+   For full contract documentation and working examples, see the [lib-python-worktree README](https://github.com/seretos-agents/lib-python-worktree#readme).
 
 ## Quick install
 
 **Claude Code:**
 
 ```
-/plugin marketplace add Seretos/agent-marketplace
-/plugin install agent-worktree@agent-marketplace
+/plugin marketplace add seretos-agents/modular-software-factory
+/plugin install agent-worktree@modular-software-factory
 ```
 
 Self-contained binary (Windows `.exe` or Linux ELF) — no Python, no `pip install`, no dependencies. The release zip ships both binaries; the host OS auto-selects via the extensionless `command: bin/worktree` in `plugin.json`.
@@ -56,7 +56,7 @@ Self-contained binary (Windows `.exe` or Linux ELF) — no Python, no `pip insta
 
 ### From the GitHub Releases page
 
-1. Download `agent-worktree-<version>.zip` from [Releases](https://github.com/Seretos/agent-worktree/releases).
+1. Download `agent-worktree-<version>.zip` from [Releases](https://github.com/seretos-agents/agent-worktree/releases).
 2. Unpack to a stable folder (e.g. `C:\Users\<you>\.claude\plugins\agent-worktree\`).
 3. In Claude Code:
    ```
@@ -68,7 +68,7 @@ Self-contained binary (Windows `.exe` or Linux ELF) — no Python, no `pip insta
 The `release` branch always carries the latest install-ready files (no zip step):
 
 ```
-git clone --branch release --depth 1 https://github.com/Seretos/agent-worktree.git
+git clone --branch release --depth 1 https://github.com/seretos-agents/agent-worktree.git
 ```
 
 Then `/plugin install <cloned-path>` in Claude Code.
@@ -78,7 +78,7 @@ Then `/plugin install <cloned-path>` in Claude Code.
 Requires Python 3.11+ and PowerShell 7 (`pwsh`).
 
 ```bash
-git clone https://github.com/Seretos/agent-worktree.git
+git clone https://github.com/seretos-agents/agent-worktree.git
 cd agent-worktree
 python -m pip install -e ".[build]"
 pwsh -File scripts/build.ps1 -Clean -Package

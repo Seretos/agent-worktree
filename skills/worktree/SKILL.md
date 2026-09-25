@@ -157,7 +157,7 @@ exactly as before.
 the same, but sanitised: the filename is `start-<slug(role)>.log`, where
 the slug is **case-preserving** — never lower-cased, and case-preserving is
 not upper-casing either; casing is simply untouched — tracked at its
-origin as `Seretos/lib-python-worktree#111` (the lower-casing bug it
+origin as `seretos-agents/lib-python-worktree#111` (the lower-casing bug it
 originally reported was fixed upstream in the pinned v0.3.7). Non-alphanumeric
 runs collapse to `-`, leading/trailing `-` are stripped, the result is truncated
 to 40 characters (and re-stripped), and a role with no alphanumeric
