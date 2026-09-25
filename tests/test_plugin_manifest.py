@@ -535,16 +535,16 @@ def test_docs_document_start_log_path_role_casing():
 def test_upstream_issue_111_reference_is_fully_qualified():
     """Guard (ticket #130): every occurrence of '#111' in the four edited
     doc/docstring files must be immediately preceded by
-    'Seretos/lib-python-worktree', so it is never confused with this repo's
+    'seretos-agents/lib-python-worktree', so it is never confused with this repo's
     own closed #111 (a thread-leak ticket cited by
     tests/test_thread_leak_regression.py, deliberately excluded here)."""
-    bare_111 = re.compile(r"(?<!Seretos/lib-python-worktree)#111")
+    bare_111 = re.compile(r"(?<!seretos-agents/lib-python-worktree)#111")
     for path in (WORKTREE_PY, SKILL_MD, AGENTS_MD, README_MD):
         text = path.read_text(encoding="utf-8")
         match = bare_111.search(text)
         assert match is None, (
             f"{path.name} contains a bare '#111' not qualified with "
-            f"'Seretos/lib-python-worktree' near: "
+            f"'seretos-agents/lib-python-worktree' near: "
             f"{text[max(0, match.start() - 40) if match else 0:(match.end() + 40) if match else 0]!r}"
         )
 

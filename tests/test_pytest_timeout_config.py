@@ -1,7 +1,7 @@
 """Regression tests for ticket #105.
 
 The suite has a load-dependent daemon-thread leak in ``lib-python-worktree``
-(upstream ``Seretos/lib-python-worktree#90``) that, on affected machines, can
+(upstream ``seretos-agents/lib-python-worktree#90``) that, on affected machines, can
 wedge a test indefinitely instead of failing. These tests guard the
 ``pytest-timeout`` configuration that turns that hang into a loud, fast test
 failure instead of a silent one.

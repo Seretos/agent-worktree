@@ -22,7 +22,7 @@ def test_dependency_pinned(name):
         f"A stale .venv does not auto-resolve to a bumped git-URL pin -- "
         f"`pip install -e \".[test]\"` alone will not fix this. To repair, run: "
         f".venv/Scripts/python.exe -m pip install --force-reinstall --no-deps "
-        f'"{name} @ git+https://github.com/Seretos/{name}@v{expected}"'
+        f'"{name} @ git+https://github.com/seretos-agents/{name}@v{expected}"'
     )
 
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"

@@ -3151,7 +3151,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
     """Claim under protection (ticket #146, correcting #130/#128): start_log_path's
     filename is a *case-preserving* slug of role (never lower-cased), while
     pids/record.variants key on role verbatim -- fully-qualified as
-    Seretos/lib-python-worktree#111 so it is never confused with this repo's
+    seretos-agents/lib-python-worktree#111 so it is never confused with this repo's
     own closed #111 (thread-leak ticket). v0.3.7 fixed the upstream
     lower-casing bug that #111 originally reported; the residual caveat is
     the case-insensitive-filesystem interleaving, not lower-casing."""

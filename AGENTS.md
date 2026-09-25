@@ -1,6 +1,6 @@
 # agent-worktree
 
-A thin MCP wrapper around [`lib-python-worktree`](https://github.com/Seretos/lib-python-worktree). Use the tools below to manage git worktrees from any MCP client. Engine internals and contract schema are documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme) and are not duplicated here.
+A thin MCP wrapper around [`lib-python-worktree`](https://github.com/seretos-agents/lib-python-worktree). Use the tools below to manage git worktrees from any MCP client. Engine internals and contract schema are documented in the [lib-python-worktree README](https://github.com/seretos-agents/lib-python-worktree#readme) and are not duplicated here.
 
 ## Tool priority
 
@@ -95,7 +95,7 @@ Every environment is addressed by one or both of:
 
 These two parameters are independent and easy to conflate:
 
-- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would. `record.pids`/`record.variants` key on this **verbatim** `role` string, which is *nearly* how the start-log filename is derived (sanitised, but case-preserved) — see `start_log_path` below; the origin reference is `Seretos/lib-python-worktree#111` — not this repository's own already-closed issue of the same number, an unrelated thread-leak ticket.
+- **`role`** is the *tracking/addressing key* a process's pid is filed under (`record.pids[role]`). It defaults to `"main"` **regardless of which `variant` was requested** — starting `variant="gui"` with no explicit `role` still records its pid under `role="main"`, exactly like starting the default variant would. `record.pids`/`record.variants` key on this **verbatim** `role` string, which is *nearly* how the start-log filename is derived (sanitised, but case-preserved) — see `start_log_path` below; the origin reference is `seretos-agents/lib-python-worktree#111` — not this repository's own already-closed issue of the same number, an unrelated thread-leak ticket.
 - **`variant`** only selects *which* contract `start:` step is run (by its `name`). It has no effect on where the resulting pid is filed.
 
 Because the two are independent, two variants started concurrently against the same environment need two *distinct* `role`s — reusing the same (default) role on the second call returns/errors with an `already_running` condition, even though a different `variant` was requested. Whichever `variant` actually started a given `role` is remembered in `record.variants[role]`, so a later `environment_stop(variant=...)` call can resolve and stop that role without the caller separately tracking which role it used: with `role` omitted, `variant` alone resolves the role to stop (raising `ValueError` if the variant matches zero or more than one currently-running role, or if an explicitly-given `role` disagrees with what `variant` resolves to). Neither given stops `role="main"`, as before this parameter existed.
@@ -155,7 +155,7 @@ See "Addressing an environment" above for `environment_id`/`checkout_path`.
 - `backing` — `"primary"` for the main clone, `"worktree"` for a linked worktree.
 - `pids` — dict mapping role name to PID (e.g. `{"main": 12345}`).
 - `ports` — dict mapping port name to host port number; `{}` before port setup runs.
-- `start_log_path` — filesystem path to the captured startup log. **Casing caveat:** the filename is `start-<slug(role)>.log`, a **case-preserving** slug (never lower-cased) with non-alphanumeric runs collapsed to `-`, truncated to 40 chars, and falling back to `_` for a role with no alphanumeric characters — unlike `pids`/`record.variants`, which key on the verbatim `role`. Two roles differing only in case produce two distinct filenames, but on a case-insensitive filesystem (Windows, default macOS) those names collide and their append-mode output interleaves. This is an accepted, documented upstream limitation, tracked at its origin as `Seretos/lib-python-worktree#111` (the lower-casing bug it originally reported was fixed upstream in the pinned v0.3.7).
+- `start_log_path` — filesystem path to the captured startup log. **Casing caveat:** the filename is `start-<slug(role)>.log`, a **case-preserving** slug (never lower-cased) with non-alphanumeric runs collapsed to `-`, truncated to 40 chars, and falling back to `_` for a role with no alphanumeric characters — unlike `pids`/`record.variants`, which key on the verbatim `role`. Two roles differing only in case produce two distinct filenames, but on a case-insensitive filesystem (Windows, default macOS) those names collide and their append-mode output interleaves. This is an accepted, documented upstream limitation, tracked at its origin as `seretos-agents/lib-python-worktree#111` (the lower-casing bug it originally reported was fixed upstream in the pinned v0.3.7).
 - Contract diagnostics (ticket #103) — five additive keys computed by this wrapper: `contract_found`, `contract_path`, `contract_isolation`, `steps_run`, `no_op_reason`.
 - `shadowed_contract` — a **separate, engine-produced** diagnostic (`lib-python-worktree`, upstream #100), not derived by this wrapper: `None` or `{path, used_path, reason, message}` with `reason` ∈ `{"differs", "unreadable"}`. Transient — never written to `state.yaml`. `None` for a primary, for `checkout == repo_root`, and for the identical copy `worktree_create` writes.
 
@@ -212,7 +212,7 @@ No Python installation is required on the host. The plugin manifest uses the ext
 
 ## State store, contract schema, and architecture
 
-The server uses a persistent, disk-backed state store (`~/.agent-worktree/state.yaml`) that survives server restarts and is reconciled on startup. The contract schema (`.seretos/worktree-setup.yml`), the store layout, and the underlying engine are all documented in the [lib-python-worktree README](https://github.com/Seretos/lib-python-worktree#readme).
+The server uses a persistent, disk-backed state store (`~/.agent-worktree/state.yaml`) that survives server restarts and is reconciled on startup. The contract schema (`.seretos/worktree-setup.yml`), the store layout, and the underlying engine are all documented in the [lib-python-worktree README](https://github.com/seretos-agents/lib-python-worktree#readme).
 
 ## Signal handling on Windows
 
