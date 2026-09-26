@@ -3294,26 +3294,57 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     assert no_op_idx != -1
     no_op_window = norm[no_op_idx : no_op_idx + 2500]
 
-    assert "stop_incomplete" in no_op_window, (
-        "the no_process_recorded no-op path's documentation must now "
-        "name stop_incomplete as a reachable status (ticket #165), not "
-        "just 'left unchanged' or 'stopped'"
+    # test-critic round 3, finding tautology::F1: a bare `"<token>" in
+    # no_op_window`/`in norm` check is satisfied by mere keyword
+    # co-presence -- a docstring that named all five tokens while
+    # describing the OPPOSITE relationship (e.g. "status can never become
+    # stop_incomplete on this path", "killed_pids remains always empty")
+    # would pass every one of those checks just as easily. Each check
+    # below instead requires a distinctive multi-word phrase tying the
+    # token to the actual affirmative relationship the real docstring
+    # states, so a same-vocabulary-but-opposite-meaning rewrite fails it.
+    assert re.search(
+        r"stop_incomplete.{0,15}when the sweep could not verify", no_op_window
+    ), (
+        "the no_process_recorded no-op path's documentation must say "
+        "status freshly BECOMES stop_incomplete when the sweep could not "
+        "verify every other tracked role (ticket #165) -- not just "
+        "mention the word 'stop_incomplete' somewhere nearby"
     )
-    assert "killed_pids" in no_op_window, (
+    assert re.search(
+        r"killed_pids.{0,20}no longer unconditionally.{0,10}\[\]"
+        r".{0,120}populated when kill_orphans=true",
+        no_op_window,
+    ), (
         "the no-op path's documentation must say killed_pids is no "
-        "longer unconditionally empty there"
+        "longer unconditionally empty there AND explain it becomes "
+        "populated when kill_orphans=true and the sweep finds an orphan "
+        "-- not just mention the word 'killed_pids' somewhere nearby"
     )
-    assert "kill_orphans_may_help" in no_op_window, (
+    assert re.search(
+        r"kill_orphans_may_help.{0,40}instead of an unconditional false"
+        r".{0,80}true when kill_orphans=false",
+        no_op_window,
+    ), (
         "the no-op path's documentation must say kill_orphans_may_help "
-        "is no longer unconditionally False there"
+        "reflects the sweep's hint INSTEAD OF an unconditional False, "
+        "becoming True when kill_orphans=False and a live orphan was "
+        "found -- not just mention the word 'kill_orphans_may_help' "
+        "somewhere nearby"
     )
-    assert "concurrent_start_race" in norm, (
-        "environment_stop docstring must document the new "
-        "stop_detail.reason == 'concurrent_start_race' outcome (ticket #165)"
+    assert re.search(
+        r"detected and reported as.{0,40}concurrent_start_race", norm
+    ), (
+        "environment_stop docstring must say a racing environment_start "
+        "is DETECTED AND REPORTED AS stop_detail.reason == "
+        "'concurrent_start_race' (ticket #165) -- not just mention the "
+        "phrase 'concurrent_start_race' somewhere"
     )
-    assert "protect:incomplete" in norm, (
-        "environment_stop docstring must document the new "
-        "skipped_passes == ('protect:incomplete',) outcome (ticket #165)"
+    assert re.search(r"could not verify.{0,150}protect:incomplete", norm), (
+        "environment_stop docstring must tie protect:incomplete to the "
+        "sweep being unable to verify every other tracked role before "
+        "scanning (ticket #165) -- not just mention the phrase "
+        "'protect:incomplete' somewhere"
     )
 
 
