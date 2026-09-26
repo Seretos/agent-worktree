@@ -1366,6 +1366,9 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
             "    run: start-web.sh\n"
             "  - name: worker\n"
             "    run: start-worker.sh\n"
+            "ports:\n"
+            "  - name: web\n"
+            "  - name: db\n"
         ),
     )
 
@@ -1901,7 +1904,8 @@ def test_environment_start_surfaces_injected_env(tmp_path: Path):
     repo_root.mkdir()
     _write_contract(
         repo_root,
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: app\n  - name: db\n",
     )
 
     worktree_id = "wt-injected-env-12345678"
@@ -1986,7 +1990,8 @@ def test_environment_start_injected_env_ports_are_sorted(tmp_path: Path):
     repo_root.mkdir()
     _write_contract(
         repo_root,
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: zeta\n  - name: alpha\n",
     )
 
     worktree_id = "wt-sorted-12345678"
@@ -3437,7 +3442,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
         idx = m.start()
         window = norm[max(0, idx - 100) : idx + 900]
         if (
-            "seretos/lib-python-worktree#111" in window
+            "seretos-agents/lib-python-worktree#111" in window
             and ("lower" in window or "slug" in window)
             and "preserv" in window
             and "pids" in window

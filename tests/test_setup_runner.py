@@ -218,7 +218,8 @@ def test_setup_runner_injected_env_names_match_environment_start_response(
     seretos = repo_root / ".seretos"
     seretos.mkdir()
     (seretos / "worktree-setup.yml").write_text(
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: app\n  - name: db\n",
         encoding="utf-8",
     )
     record = WorktreeRecord(

@@ -1961,10 +1961,11 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         not-found condition. The engine takes its graceful no-op path
         instead -- any contract ``stop:`` steps still run best-effort and no
         signal is sent to any tracked pid -- and this tool returns a normal
-        environment record whose ``stop_attempt.outcome`` is always
+        environment record: ``status`` becomes ``"stopped"`` in the
+        ordinary case, and ``stop_attempt.outcome`` is always
         ``"no_process_recorded"``.
 
-        **Since engine v0.3.16 (ticket #165), this no-op path is no longer a
+        **Since engine v0.3.15 (ticket #165), this no-op path is no longer a
         pure early return.** A process leaked by a contract ``setup:`` step
         is never entered into any role's ``record.pids`` (``SetupRunner``
         runs inside ``create()``, before any role exists), so it used to be
@@ -1974,7 +1975,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         the same path-scoped orphan sweep documented under "``kill_orphans``:
         when it is actually necessary" below even in that case, protecting
         every OTHER tracked role's own pid/process-tree/Job Object from it.
-        Concretely, this changes three fields versus the pre-v0.3.16
+        Concretely, this changes three fields versus the pre-v0.3.15
         engine:
 
         - ``status``: ``"stopped"`` only if popping this role leaves
@@ -2198,7 +2199,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         - the sub-millisecond window between a child's ``Popen`` returning
           and its Job Object assignment landing.
 
-        Since engine v0.3.16 (ticket #165), these four gaps are reachable
+        Since engine v0.3.15 (ticket #165), these four gaps are reachable
         even when ``role`` itself has no live tracked pid at all -- never
         started, or its tracked pid had already exited before this call --
         not just when some other tracked pid is live to trigger the scan;
