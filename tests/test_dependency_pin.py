@@ -44,6 +44,17 @@ def test_dependency_pyproject_pin_string_pinned(name):
     inspects the string declared in pyproject.toml and proves nothing about
     what is actually installed or frozen -- that half of R1 is what the
     sibling test (and R4's CI build/package jobs) covers.
+
+    Scope, spelled out (test-critic round 2 finding tautology::F1, #208):
+    a git-tag pin is declarative config, not a resolvable version range, so
+    there is no "does it resolve" question this test -- or any unit-level
+    test -- can answer without a real network install. This assertion only
+    proves our own declared *intent* (the committed pyproject.toml text says
+    what we mean it to say); it does not and cannot prove that pip actually
+    resolves `@v{expected}` to a working install, or that a frozen build
+    embeds it. That resolution/build claim is exactly what R4's ci-evidence
+    (a fresh CI checkout resolving the new git tags, in the PR's build and
+    package jobs) is for -- not this test.
     """
     expected = PINS[name]
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
