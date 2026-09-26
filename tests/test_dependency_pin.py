@@ -1,5 +1,6 @@
+import json
 import tomllib
-from importlib.metadata import version
+from importlib.metadata import distribution, version
 from pathlib import Path
 
 import pytest
@@ -72,6 +73,58 @@ def test_dependency_pyproject_pin_string_pinned(name):
     assert pin == expected_pin, (
         f"expected pyproject.toml's {name} dependency entry to "
         f"equal {expected_pin!r}, got {pin!r}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(PINS))
+def test_dependency_installed_direct_url_matches_pin(name):
+    """pip's own PEP 610 record proves the pin was actually resolved by pip,
+    not just declared in our own committed config text.
+
+    Independent of both tests above (test-critic round 3 finding
+    tautology::F1, #208 -- the critic's stated objection is that
+    test_dependency_pyproject_pin_string_pinned "proves ... the declared
+    text, not any behaviour: whether the tag resolves, installs, or gets
+    embedded ... is out of its reach"). This test closes exactly that gap
+    at the unit level, without mocking or faking pip and without a network
+    call at test-run time: `direct_url.json` is the PEP 610 record pip
+    itself writes into a VCS-installed distribution's dist-info at install
+    time. `vcs_info.requested_revision` is the exact git ref *pip* resolved
+    against when it did the real clone+checkout -- it is not re-derived
+    from pyproject.toml, so a pyproject.toml edit with no matching
+    force-reinstall (or a reinstall from the wrong ref) fails HERE even if
+    someone hand-edited pyproject.toml to read correctly. `url` is the
+    exact remote pip cloned, so an org/repo typo that still happened to
+    land the right version tag is caught too. The network round-trip this
+    reads about already happened during the `pip install` that produced
+    this venv; this only reads pip's own record of it afterward.
+
+    This is still not R4's ci-evidence (a *fresh* CI checkout resolving the
+    tag from scratch) -- it is bounded to what pip recorded in this venv --
+    but it is a real, unmocked step up from bare string equality against
+    our own config file, and it is the cheapest such step available at
+    the test-code level.
+    """
+    expected = PINS[name]
+    raw = distribution(name).read_text("direct_url.json")
+    assert raw is not None, (
+        f"{name} has no direct_url.json in its installed dist-info -- was "
+        f"it installed from the pinned git+URL, or did it fall back to a "
+        f"plain PyPI/wheel install with no VCS record at all?"
+    )
+    direct_url = json.loads(raw)
+    assert direct_url.get("url") == f"https://github.com/seretos-agents/{name}", (
+        f"pip's own record of what it cloned for {name} does not match the "
+        f"pinned org/repo: {direct_url.get('url')!r}"
+    )
+    requested = direct_url.get("vcs_info", {}).get("requested_revision")
+    assert requested == f"v{expected}", (
+        f"pip resolved {name} against ref {requested!r}, not the pinned "
+        f"v{expected} -- the installed distribution was not actually "
+        f"installed from the pin declared in pyproject.toml. A stale "
+        f".venv does not auto-resolve to a bumped git-URL pin -- run: "
+        f".venv/Scripts/python.exe -m pip install --force-reinstall --no-deps "
+        f'"{name} @ git+https://github.com/seretos-agents/{name}@v{expected}"'
     )
 
 
