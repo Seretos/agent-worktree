@@ -1506,7 +1506,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         genuinely-unconfigured case). Callers should branch on ``no_op_reason``
         rather than inferring the cause from ``status``/``pids`` alone -- see
         the "Contract diagnostics" block below for the full five-key set.
-        Measured on the pinned engine (``lib-python-worktree`` v0.3.14): this
+        Measured on the pinned engine (``lib-python-worktree`` v0.3.16): this
         case also sets ``shadowed_contract`` on the response, with
         ``reason: "differs"`` -- see the sixth diagnostic bullet below.
 
@@ -1805,7 +1805,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           copy was separately edited to differ (``no_op_reason`` is
           ``null`` there, and the five wrapper-derived keys above see
           nothing wrong). Measured on the pinned engine (``lib-python-worktree``
-          v0.3.14), it also fires alongside a non-``null`` ``no_op_reason``,
+          v0.3.16), it also fires alongside a non-``null`` ``no_op_reason``,
           notably ``"contract_misplaced"``: no file exists at ``repo_root``,
           the implicit fallback contract is what gets compared, and a
           checkout-local copy that diverges from that fallback still shadows
@@ -1845,7 +1845,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
 
         A blind retry is protected by ``{"error": "...", "code":
         "already_running"}`` only while the previously started pid is ALIVE
-        **and its identity is confirmed** (pinned engine v0.3.14, upstream
+        **and its identity is confirmed** (since engine v0.3.14, upstream
         ticket #157: ``_pid_status(pid, start_time) is True``). A start that
         landed and whose process then exited is not protected: the blind
         retry starts a second process. Nor is a live pid whose identity
@@ -1960,14 +1960,49 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         its record, so stopping a role that was never started there is not a
         not-found condition. The engine takes its graceful no-op path
         instead -- any contract ``stop:`` steps still run best-effort and no
-        signal is sent -- and this tool returns a normal environment record
-        whose ``stop_attempt`` is always ``{"outcome": "no_process_recorded",
-        ...}``, but whose ``status`` depends on what else is tracked:
-        ``"stopped"`` only if popping this role leaves ``pids`` empty *and*
-        the record wasn't already ``"stop_incomplete"``/``"orphaned"`` (those
-        two are sticky and are never overwritten back to ``"stopped"`` by
-        this no-op path); otherwise ``status`` is left unchanged -- e.g.
-        still ``"running"`` when another role's process is still tracked.
+        signal is sent to any tracked pid -- and this tool returns a normal
+        environment record whose ``stop_attempt.outcome`` is always
+        ``"no_process_recorded"``.
+
+        **Since engine v0.3.16 (ticket #165), this no-op path is no longer a
+        pure early return.** A process leaked by a contract ``setup:`` step
+        is never entered into any role's ``record.pids`` (``SetupRunner``
+        runs inside ``create()``, before any role exists), so it used to be
+        permanently invisible whenever the role that would have tracked it
+        was never live to begin with -- never started at all, or its
+        tracked pid had already exited before this call. This path now runs
+        the same path-scoped orphan sweep documented under "``kill_orphans``:
+        when it is actually necessary" below even in that case, protecting
+        every OTHER tracked role's own pid/process-tree/Job Object from it.
+        Concretely, this changes three fields versus the pre-v0.3.16
+        engine:
+
+        - ``status``: ``"stopped"`` only if popping this role leaves
+          ``pids`` empty *and* the record wasn't already
+          ``"stop_incomplete"``/``"orphaned"`` (those two are sticky and are
+          never overwritten back to ``"stopped"`` by this no-op path) *and*
+          the sweep below found nothing amiss; otherwise ``status`` is left
+          unchanged (e.g. still ``"running"`` when another role's process is
+          still tracked) -- **or** freshly becomes ``"stop_incomplete"``
+          when the sweep could not verify every other tracked role's own
+          pid/process-tree/Job Object before scanning
+          (``stop_detail.skipped_passes == ("protect:incomplete",)``), or a
+          survivor remained after an actual kill.
+        - ``killed_pids``: no longer unconditionally ``[]`` on this path --
+          populated when ``kill_orphans=True`` and the sweep actually found
+          and killed such an orphan.
+        - ``stop_attempt.kill_orphans_may_help``: reflects the sweep's own
+          hint instead of an unconditional ``False`` -- ``True`` when
+          ``kill_orphans=False`` and a live orphan was found but not killed.
+
+        A concurrent ``environment_start`` call for this same role racing
+        the sweep is detected and reported as ``stop_detail.reason ==
+        "concurrent_start_race"`` (with ``kill_orphans_may_help`` forced
+        ``False``) instead of a stale verdict for a role that is, right
+        now, actually running again -- ``stop_attempt.outcome`` itself
+        still stays ``"no_process_recorded"`` regardless of any of the
+        above.
+
         Only the *primary* (no record until its first ``environment_start``)
         and a genuinely unknown ``environment_id``/``checkout_path`` yield
         the soft not-found dict.
@@ -2128,7 +2163,7 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
         the process group.
 
         **Unconditional is w.r.t. ``kill_orphans`` only -- it is not
-        unconditional w.r.t. the tracked pid's identity** (pinned engine
+        unconditional w.r.t. the tracked pid's identity** (since engine
         v0.3.14, upstream ticket #157). Before any snapshot or signal, the
         engine verifies the tracked pid via ``_pid_status``: a genuinely
         dead tracked pid still gets the full tree/group snapshot and kill,
@@ -2162,6 +2197,14 @@ def register(mcp: FastMCP, manager: WorktreeManager) -> None:
           only because it still runs with the worktree as its cwd;
         - the sub-millisecond window between a child's ``Popen`` returning
           and its Job Object assignment landing.
+
+        Since engine v0.3.16 (ticket #165), these four gaps are reachable
+        even when ``role`` itself has no live tracked pid at all -- never
+        started, or its tracked pid had already exited before this call --
+        not just when some other tracked pid is live to trigger the scan;
+        see the tracked-but-never-started no-op path above for the exact
+        field-level consequences (``status``, ``killed_pids``,
+        ``kill_orphans_may_help``).
 
         **When it will not help:** a ``stop_detail.reason ==
         "job_member_list_truncated"`` outcome -- ``TerminateJobObject``

@@ -3118,6 +3118,76 @@ def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Pa
     )
 
 
+def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_16(
+    tmp_path: Path,
+):
+    """Driving test (docs, ticket #208 R7): upstream ticket #165 (shipped
+    between the previously-pinned v0.3.14 and the newly-pinned v0.3.16 --
+    see `git log v0.3.14..v0.3.16` pasted into this package's change
+    report) changed real, caller-visible behaviour on the tracked-but-
+    never-started ("no_process_recorded") no-op path documented just above
+    this test in the source: that path used to be a pure early return, and
+    is now also subject to the same path-scoped orphan sweep `kill_orphans`
+    triggers elsewhere -- meaning `status` can newly become
+    "stop_incomplete", `killed_pids` can newly be non-empty, and
+    `stop_attempt.kill_orphans_may_help` can newly be `True`, all on a role
+    that was simply never started (or whose tracked pid had already
+    exited). A concurrent `environment_start` racing that sweep is also a
+    new, separately-reported case (`stop_detail.reason ==
+    "concurrent_start_race"`).
+
+    This is a documentation-accuracy requirement, not a wrapper-code
+    change: `environment_stop` is a thin pass-through
+    (`_record_to_dict(record)`) that never branches on these fields
+    itself, so the only artifact that can go stale is the docstring MCP
+    callers read as this tool's contract -- exactly the kind of claim this
+    repo's own docstring-content tests (e.g.
+    test_environment_stop_docstring_scopes_not_running_reachability, just
+    above) are written to pin.
+
+    RED (pre-fix): the docstring's "no_process_recorded" section claimed
+    `status` is only ever left unchanged or becomes "stopped" on this
+    no-op path (never "stop_incomplete"), said nothing about
+    `killed_pids`/`kill_orphans_may_help` there, and never mentioned
+    ticket #165, "concurrent_start_race", or "protect:incomplete" at all
+    -- so every assertion below failed against the pre-bump text.
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert "165" in norm and "v0.3.16" in norm, (
+        "environment_stop docstring must cite ticket #165 and the pinned "
+        "v0.3.16 engine for the no-op-path orphan sweep behaviour"
+    )
+
+    no_op_idx = norm.find("no_process_recorded")
+    assert no_op_idx != -1
+    no_op_window = norm[no_op_idx : no_op_idx + 2500]
+
+    assert "stop_incomplete" in no_op_window, (
+        "the no_process_recorded no-op path's documentation must now "
+        "name stop_incomplete as a reachable status (ticket #165), not "
+        "just 'left unchanged' or 'stopped'"
+    )
+    assert "killed_pids" in no_op_window, (
+        "the no-op path's documentation must say killed_pids is no "
+        "longer unconditionally empty there"
+    )
+    assert "kill_orphans_may_help" in no_op_window, (
+        "the no-op path's documentation must say kill_orphans_may_help "
+        "is no longer unconditionally False there"
+    )
+    assert "concurrent_start_race" in norm, (
+        "environment_stop docstring must document the new "
+        "stop_detail.reason == 'concurrent_start_race' outcome (ticket #165)"
+    )
+    assert "protect:incomplete" in norm, (
+        "environment_stop docstring must document the new "
+        "skipped_passes == ('protect:incomplete',) outcome (ticket #165)"
+    )
+
+
 def test_environment_start_docstring_consolidates_three_addressing_outcomes(
     tmp_path: Path,
 ):

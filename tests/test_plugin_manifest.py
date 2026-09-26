@@ -516,7 +516,7 @@ def test_docs_document_start_log_path_role_casing():
             idx = m.start()
             window = norm[max(0, idx - 500) : idx + 900]
             if (
-                "seretos/lib-python-worktree#111" in window
+                "seretos-agents/lib-python-worktree#111" in window
                 and ("lower" in window or "slug" in window)
                 and "preserv" in window
                 and "pids" in window
