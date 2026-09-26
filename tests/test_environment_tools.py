@@ -3121,26 +3121,39 @@ def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Pa
 def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     tmp_path: Path,
 ):
-    """Driving test (docs, ticket #208 R4) for the *content* half of this
-    requirement, plus a named consistency guard (NOT driving-test proof --
-    see below) for the *tag-attribution* half.
+    """Named consistency guard (NOT driving-test proof, for either half --
+    see below) for both the *content* half and the *tag-attribution* half
+    of this requirement.
 
-    Content half (genuine driving-test coverage, unaffected by the
-    test-critic round-2 findings below): upstream ticket #165 changed real,
-    caller-visible behaviour on the tracked-but-never-started
-    ("no_process_recorded") no-op path documented just above this test in
-    the source -- that path used to be a pure early return, and is now also
-    subject to the same path-scoped orphan sweep `kill_orphans` triggers
-    elsewhere, meaning `status` can newly become "stop_incomplete",
-    `killed_pids` can newly be non-empty, and
+    Content half (test-critic round 3 finding tautology::F3, #208 -- NOT
+    driving-test evidence, demoted from round 3's framing): upstream ticket
+    #165 changed real, caller-visible behaviour on the tracked-but-never-
+    started ("no_process_recorded") no-op path documented just above this
+    test in the source -- that path used to be a pure early return, and is
+    now also subject to the same path-scoped orphan sweep `kill_orphans`
+    triggers elsewhere, meaning `status` can newly become
+    "stop_incomplete", `killed_pids` can newly be non-empty, and
     `stop_attempt.kill_orphans_may_help` can newly be `True`, all on a role
     that was simply never started (or whose tracked pid had already
     exited). A concurrent `environment_start` racing that sweep is also a
     new, separately-reported case (`stop_detail.reason ==
-    "concurrent_start_race"`). The presence assertions on `no_op_window`
-    and `concurrent_start_race`/`protect:incomplete` below prove this
-    content is actually in the docstring -- that is a real claim about the
-    source text, independently falsifiable by reading it.
+    "concurrent_start_race"`). Round 3 tightened the presence checks on
+    `no_op_window` and `concurrent_start_race`/`protect:incomplete` below
+    from bare keyword-presence to phrase-anchored regexes, closing finding
+    tautology::F1 (a docstring naming every token while describing the
+    OPPOSITE relationship used to pass). Round 3's isolated test-critic
+    found that phrase-anchoring is still not proof: a cleverly-placed
+    negation just outside the matched span (e.g. "never becomes
+    stop_incomplete when the sweep could not verify every other tracked
+    role" would still satisfy `r"stop_incomplete.{0,15}when the sweep
+    could not verify"`) asserts the opposite of what the phrase anchor
+    intends, and no test that only inspects docstring text can rule that
+    out. So, like the tag-attribution half below, these assertions are a
+    **named consistency guard**: a meaningfully stronger regression guard
+    than the bare keyword check it replaced (round 3), but still text-vs-
+    text -- they prove the docstring's own wording is coherent and
+    resistant to trivial keyword gaming, never that the *engine* actually
+    behaves the way the docstring claims.
 
     Tag-attribution half (test-critic round 2 findings tautology::F1/F2,
     #208 -- NOT driving-test evidence): every assertion below that checks
@@ -3154,14 +3167,27 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     verify that claim; a docstring that wrongly said "v0.3.14" everywhere,
     consistently, would pass a same-shaped test just as easily.
 
-    The REAL proof that v0.3.15 is genuinely the introducing release is
-    substitute-execution evidence -- real `git log -S`/`git tag --contains`
-    output against the real upstream `lib-python-worktree` history --
-    pasted verbatim into the PR body's R4/R5 evidence section, never
-    encoded as a pytest assertion (there is no way to re-derive real
-    upstream git history inside a driving test without a network call at
-    test time, which this suite does not do anywhere else). That
-    investigation was re-run for this round, against a fresh clone of
+    The REAL proof for BOTH halves now lives outside this test, never
+    encoded as a pytest assertion.
+
+    For the content half: the developer's own source-code cross-reference,
+    done during the implement phase when the actual docstring is
+    written/fixed -- each no-op-path sentence checked against the real
+    behaviour in the installed engine's source (`.venv`'s
+    `lib_python_worktree` package, `core/manager.py`/
+    `core/process_lifecycle.py`: `_detect_concurrent_start_race`, the
+    no-op-path `_sweep_untracked_orphans` call site, and the
+    `protect:incomplete`/`concurrent_start_race` markers), with
+    which-sentence-maps-to-which-code-line pasted into the PR body's R4/R5
+    evidence section alongside the tag-attribution evidence below.
+
+    For the tag-attribution half: substitute-execution evidence -- real
+    `git log -S`/`git tag --contains` output against the real upstream
+    `lib-python-worktree` history -- pasted verbatim into the PR body's
+    R4/R5 evidence section (there is no way to re-derive real upstream git
+    history inside a driving test without a network call at test time,
+    which this suite does not do anywhere else). That investigation was
+    re-run for this round, against a fresh clone of
     https://github.com/seretos-agents/lib-python-worktree, and both
     independent anchors still agree:
 
@@ -3303,6 +3329,20 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     # below instead requires a distinctive multi-word phrase tying the
     # token to the actual affirmative relationship the real docstring
     # states, so a same-vocabulary-but-opposite-meaning rewrite fails it.
+    #
+    # NAMED CONSISTENCY GUARD, NOT DRIVING-TEST PROOF (test-critic round 3,
+    # finding tautology::F3): phrase-anchoring closes the F1 gaming vector
+    # above but does not close every gaming vector -- a negation placed just
+    # outside the matched span (e.g. "never becomes stop_incomplete when
+    # the sweep could not verify every other tracked role") still satisfies
+    # the same regex while asserting the opposite meaning. No test that
+    # only inspects docstring text can rule that out, so these assertions
+    # -- like the tag-attribution ones above -- prove only that the
+    # docstring's own wording is internally coherent and resistant to bare
+    # keyword gaming, never that the engine actually behaves this way. The
+    # real proof is the developer's source-code cross-reference against
+    # `.venv`'s `lib_python_worktree` package, pasted into the PR body's
+    # R4/R5 evidence section (see the docstring above).
     assert re.search(
         r"stop_incomplete.{0,15}when the sweep could not verify", no_op_window
     ), (
