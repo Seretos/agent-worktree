@@ -14,7 +14,17 @@ PINS = {
 
 
 @pytest.mark.parametrize("name", sorted(PINS))
-def test_dependency_pinned(name):
+def test_dependency_installed_version_pinned(name):
+    """The *actually-installed* package version matches PINS.
+
+    Independent of test_dependency_pyproject_pin_string_pinned below: this
+    reads real installed metadata via importlib.metadata.version, so a stale
+    .venv -- pyproject.toml correctly edited but no force-reinstall run --
+    fails HERE, regardless of what the pyproject.toml string says. A correct
+    pin string over a stale install cannot pass this test (test-critic round
+    1 finding tautology::F1, #208): this assertion does not consult
+    pyproject.toml at all.
+    """
     expected = PINS[name]
     installed = version(name)
     assert installed == expected, (
@@ -25,6 +35,17 @@ def test_dependency_pinned(name):
         f'"{name} @ git+https://github.com/seretos-agents/{name}@v{expected}"'
     )
 
+
+@pytest.mark.parametrize("name", sorted(PINS))
+def test_dependency_pyproject_pin_string_pinned(name):
+    """The declared pyproject.toml dependency entry matches PINS.
+
+    Independent of test_dependency_installed_version_pinned above: this only
+    inspects the string declared in pyproject.toml and proves nothing about
+    what is actually installed or frozen -- that half of R1 is what the
+    sibling test (and R4's CI build/package jobs) covers.
+    """
+    expected = PINS[name]
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as f:
         pyproject = tomllib.load(f)
