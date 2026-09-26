@@ -3118,23 +3118,45 @@ def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Pa
     )
 
 
-def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_16(
+def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     tmp_path: Path,
 ):
-    """Driving test (docs, ticket #208 R7): upstream ticket #165 (shipped
-    between the previously-pinned v0.3.14 and the newly-pinned v0.3.16 --
-    see `git log v0.3.14..v0.3.16` pasted into this package's change
-    report) changed real, caller-visible behaviour on the tracked-but-
-    never-started ("no_process_recorded") no-op path documented just above
-    this test in the source: that path used to be a pure early return, and
-    is now also subject to the same path-scoped orphan sweep `kill_orphans`
-    triggers elsewhere -- meaning `status` can newly become
-    "stop_incomplete", `killed_pids` can newly be non-empty, and
+    """Driving test (docs, ticket #208 R4): upstream ticket #165 changed
+    real, caller-visible behaviour on the tracked-but-never-started
+    ("no_process_recorded") no-op path documented just above this test in
+    the source: that path used to be a pure early return, and is now also
+    subject to the same path-scoped orphan sweep `kill_orphans` triggers
+    elsewhere -- meaning `status` can newly become "stop_incomplete",
+    `killed_pids` can newly be non-empty, and
     `stop_attempt.kill_orphans_may_help` can newly be `True`, all on a role
     that was simply never started (or whose tracked pid had already
     exited). A concurrent `environment_start` racing that sweep is also a
     new, separately-reported case (`stop_detail.reason ==
     "concurrent_start_race"`).
+
+    T165 -- the release that actually introduced this behaviour -- is
+    **v0.3.15, not v0.3.16** as an earlier draft of this docstring assumed.
+    Verified against the real upstream `lib-python-worktree` history per
+    this plan's step 1, using both of its independent anchors and finding
+    them in agreement (so the plan's manual-`git diff` fallback for a
+    disagreement never engages here):
+
+    - A165a (`_detect_concurrent_start_race`, `process_lifecycle.py`):
+      `git log -S"_detect_concurrent_start_race" --reverse` finds it first
+      introduced by commit `8602e84` ("fix: bound protected-pid computation
+      and detect concurrent start races (#165)"); `git tag --contains
+      8602e84 --sort=v:refname` names `v0.3.15` first.
+    - A165b (`_sweep_untracked_orphans`'s call site in `manager.py`'s no-op
+      path): `git log -S"_sweep_untracked_orphans" --reverse` on
+      `manager.py` finds it first introduced by commit `da0bdbb` ("fix:
+      reach orphan scan for stop() calls with no live tracked pid (#165)");
+      also first tagged in `v0.3.15`.
+    - T165 is the later of A165a and A165b, both `v0.3.15` -- so T165 =
+      v0.3.15. Corroboration: `git grep -c "Ticket #165"` /
+      `git grep -c "_detect_concurrent_start_race"` /
+      `git grep -c "_sweep_untracked_orphans"` are all 0 at `v0.3.14` and
+      identically non-zero at both `v0.3.15` and `v0.3.16` -- agreeing with
+      the pickaxe result and showing no disagreement to fall back on.
 
     This is a documentation-accuracy requirement, not a wrapper-code
     change: `environment_stop` is a thin pass-through
@@ -3145,20 +3167,64 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_16(
     test_environment_stop_docstring_scopes_not_running_reachability, just
     above) are written to pin.
 
-    RED (pre-fix): the docstring's "no_process_recorded" section claimed
-    `status` is only ever left unchanged or becomes "stopped" on this
-    no-op path (never "stop_incomplete"), said nothing about
-    `killed_pids`/`kill_orphans_may_help` there, and never mentioned
-    ticket #165, "concurrent_start_race", or "protect:incomplete" at all
-    -- so every assertion below failed against the pre-bump text.
+    Tag-attribution assertions below are deliberately scoped to text tied
+    to "ticket #165" (or the "pre-vX engine" comparison phrase, which this
+    docstring only ever uses for #165) rather than a blanket doc-wide
+    search for "since engine v0.3.14" -- this same docstring also carries
+    a legitimate, unrelated "since engine v0.3.14 ... upstream ticket
+    #157" claim (a different behaviour change, out of this ticket's range)
+    that a blanket search would misfire on regardless of whether the #165
+    attribution itself is correct.
+
+    RED (pre-fix, current WIP text): the docstring's "no_process_recorded"
+    section claimed `status` is only ever left unchanged or becomes
+    "stopped" on this no-op path (never "stop_incomplete"), said nothing
+    about `killed_pids`/`kill_orphans_may_help` there, and never mentioned
+    ticket #165, "concurrent_start_race", or "protect:incomplete" at all.
+    Separately -- and still RED even now that the WIP has added that
+    content -- every "since engine"/"pre-" claim tied to ticket #165 in the
+    WIP text names v0.3.16, not the verified v0.3.15.
     """
     mgr, fns, tools = _make_tool_fixtures(tmp_path)
     doc = fns["environment_stop"].__doc__ or ""
     norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
 
-    assert "165" in norm and "v0.3.16" in norm, (
-        "environment_stop docstring must cite ticket #165 and the pinned "
-        "v0.3.16 engine for the no-op-path orphan sweep behaviour"
+    assert "165" in norm and "v0.3.15" in norm, (
+        "environment_stop docstring must cite ticket #165 and the "
+        "verified-introducing v0.3.15 engine release for the no-op-path "
+        "orphan sweep behaviour"
+    )
+
+    since_165_tags = re.findall(
+        r"since engine (v0\.3\.\d+)[^.]{0,60}ticket #165", norm
+    )
+    assert since_165_tags, (
+        "expected at least one 'since engine vX ... ticket #165' claim"
+    )
+    assert all(tag == "v0.3.15" for tag in since_165_tags), (
+        f"#165 'since engine' attribution(s) {since_165_tags} must all "
+        "name v0.3.15, the verified introducing release -- not v0.3.16 "
+        "(the newly-pinned tag, which merely still contains the fix) nor "
+        "v0.3.14 (the previously-pinned tag, which predates it)"
+    )
+
+    pre_engine_tags = re.findall(r"pre-(v0\.3\.\d+) engine", norm)
+    assert pre_engine_tags, (
+        "expected a 'pre-vX engine' comparison for the #165 no-op-path "
+        "change"
+    )
+    assert all(tag == "v0.3.15" for tag in pre_engine_tags), (
+        f"#165 'pre-vX engine' comparison(s) {pre_engine_tags} must all "
+        "name v0.3.15"
+    )
+
+    assert "since engine v0.3.16" not in norm, (
+        "the #165 attribution must not still name v0.3.16 -- it merely "
+        "still contains the fix, it did not introduce it"
+    )
+    assert "pre-v0.3.16 engine" not in norm, (
+        "the #165 no-op-path comparison must not still say 'pre-v0.3.16 "
+        "engine' -- the behaviour changed a release earlier, at v0.3.15"
     )
 
     no_op_idx = norm.find("no_process_recorded")
