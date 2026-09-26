@@ -41,10 +41,14 @@ def test_dependency_installed_version_pinned(name):
 def test_dependency_pyproject_pin_string_pinned(name):
     """The declared pyproject.toml dependency entry matches PINS.
 
-    Independent of test_dependency_installed_version_pinned above: this only
-    inspects the string declared in pyproject.toml and proves nothing about
-    what is actually installed or frozen -- that half of R1 is what the
-    sibling test (and R4's CI build/package jobs) covers.
+    This is R2's text-consistency guard, not driving-test evidence of
+    resolution or install behaviour: it only inspects the string committed
+    to pyproject.toml and proves nothing about what is actually installed
+    or frozen. That is covered independently -- and is R1's actual
+    driving-test evidence -- by test_dependency_installed_version_pinned
+    and test_dependency_installed_direct_url_matches_pin above; for a fresh
+    checkout it is also covered by R5's ci-evidence (the PR's build and
+    package jobs resolving the new git tags from scratch).
 
     Scope, spelled out (test-critic round 2 finding tautology::F1, #208):
     a git-tag pin is declarative config, not a resolvable version range, so
@@ -53,7 +57,7 @@ def test_dependency_pyproject_pin_string_pinned(name):
     proves our own declared *intent* (the committed pyproject.toml text says
     what we mean it to say); it does not and cannot prove that pip actually
     resolves `@v{expected}` to a working install, or that a frozen build
-    embeds it. That resolution/build claim is exactly what R4's ci-evidence
+    embeds it. That resolution/build claim is exactly what R5's ci-evidence
     (a fresh CI checkout resolving the new git tags, in the PR's build and
     package jobs) is for -- not this test.
     """
@@ -99,7 +103,7 @@ def test_dependency_installed_direct_url_matches_pin(name):
     reads about already happened during the `pip install` that produced
     this venv; this only reads pip's own record of it afterward.
 
-    This is still not R4's ci-evidence (a *fresh* CI checkout resolving the
+    This is still not R5's ci-evidence (a *fresh* CI checkout resolving the
     tag from scratch) -- it is bounded to what pip recorded in this venv --
     but it is a real, unmocked step up from bare string equality against
     our own config file, and it is the cheapest such step available at
