@@ -3121,42 +3121,75 @@ def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Pa
 def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     tmp_path: Path,
 ):
-    """Driving test (docs, ticket #208 R4): upstream ticket #165 changed
-    real, caller-visible behaviour on the tracked-but-never-started
+    """Driving test (docs, ticket #208 R4) for the *content* half of this
+    requirement, plus a named consistency guard (NOT driving-test proof --
+    see below) for the *tag-attribution* half.
+
+    Content half (genuine driving-test coverage, unaffected by the
+    test-critic round-2 findings below): upstream ticket #165 changed real,
+    caller-visible behaviour on the tracked-but-never-started
     ("no_process_recorded") no-op path documented just above this test in
-    the source: that path used to be a pure early return, and is now also
+    the source -- that path used to be a pure early return, and is now also
     subject to the same path-scoped orphan sweep `kill_orphans` triggers
-    elsewhere -- meaning `status` can newly become "stop_incomplete",
+    elsewhere, meaning `status` can newly become "stop_incomplete",
     `killed_pids` can newly be non-empty, and
     `stop_attempt.kill_orphans_may_help` can newly be `True`, all on a role
     that was simply never started (or whose tracked pid had already
     exited). A concurrent `environment_start` racing that sweep is also a
     new, separately-reported case (`stop_detail.reason ==
-    "concurrent_start_race"`).
+    "concurrent_start_race"`). The presence assertions on `no_op_window`
+    and `concurrent_start_race`/`protect:incomplete` below prove this
+    content is actually in the docstring -- that is a real claim about the
+    source text, independently falsifiable by reading it.
 
-    T165 -- the release that actually introduced this behaviour -- is
-    **v0.3.15, not v0.3.16** as an earlier draft of this docstring assumed.
-    Verified against the real upstream `lib-python-worktree` history per
-    this plan's step 1, using both of its independent anchors and finding
-    them in agreement (so the plan's manual-`git diff` fallback for a
-    disagreement never engages here):
+    Tag-attribution half (test-critic round 2 findings tautology::F1/F2,
+    #208 -- NOT driving-test evidence): every assertion below that checks
+    for "v0.3.15" / rules out "v0.3.16" or "v0.3.14" is a **named
+    consistency guard**, exactly like R2's
+    `test_dependency_pyproject_pin_string_pinned` in `test_dependency_pin.py`
+    -- it only proves the docstring's *own* text is internally consistent
+    (names the tag this PR decided on, and no other candidate tag), never
+    that v0.3.15 is *actually* the release that introduced ticket #165's
+    behaviour. A hardcoded "v0.3.15" string here has no independent way to
+    verify that claim; a docstring that wrongly said "v0.3.14" everywhere,
+    consistently, would pass a same-shaped test just as easily.
+
+    The REAL proof that v0.3.15 is genuinely the introducing release is
+    substitute-execution evidence -- real `git log -S`/`git tag --contains`
+    output against the real upstream `lib-python-worktree` history --
+    pasted verbatim into the PR body's R4/R5 evidence section, never
+    encoded as a pytest assertion (there is no way to re-derive real
+    upstream git history inside a driving test without a network call at
+    test time, which this suite does not do anywhere else). That
+    investigation was re-run for this round, against a fresh clone of
+    https://github.com/seretos-agents/lib-python-worktree, and both
+    independent anchors still agree:
 
     - A165a (`_detect_concurrent_start_race`, `process_lifecycle.py`):
-      `git log -S"_detect_concurrent_start_race" --reverse` finds it first
-      introduced by commit `8602e84` ("fix: bound protected-pid computation
-      and detect concurrent start races (#165)"); `git tag --contains
-      8602e84 --sort=v:refname` names `v0.3.15` first.
+      `git log -S"_detect_concurrent_start_race" --reverse --format=%H --
+      src/lib_python_worktree` finds it first introduced by commit
+      `8602e84d13a38308cbaaceb6c1452a4eb6ebeb22` ("fix: bound protected-pid
+      computation and detect concurrent start races (#165)");
+      `git tag --contains 8602e84d1... --sort=v:refname` names `v0.3.15`
+      first (then `v0.3.16`).
     - A165b (`_sweep_untracked_orphans`'s call site in `manager.py`'s no-op
-      path): `git log -S"_sweep_untracked_orphans" --reverse` on
-      `manager.py` finds it first introduced by commit `da0bdbb` ("fix:
-      reach orphan scan for stop() calls with no live tracked pid (#165)");
-      also first tagged in `v0.3.15`.
+      path): `git log -S"_sweep_untracked_orphans" --reverse --format=%H --
+      src/lib_python_worktree/core/manager.py` finds it first introduced by
+      commit `da0bdbb93ae97dd8d1902566794aec2ccbf0d26d` ("fix: reach orphan
+      scan for stop() calls with no live tracked pid (#165)"); also first
+      tagged in `v0.3.15`.
     - T165 is the later of A165a and A165b, both `v0.3.15` -- so T165 =
-      v0.3.15. Corroboration: `git grep -c "Ticket #165"` /
-      `git grep -c "_detect_concurrent_start_race"` /
-      `git grep -c "_sweep_untracked_orphans"` are all 0 at `v0.3.14` and
-      identically non-zero at both `v0.3.15` and `v0.3.16` -- agreeing with
-      the pickaxe result and showing no disagreement to fall back on.
+      v0.3.15. Corroboration: `git grep -c "_detect_concurrent_start_race"`
+      / `git grep -c "_sweep_untracked_orphans"` / `git grep -c
+      "Ticket #165"` (each `-- src/lib_python_worktree`) are all 0 at
+      `v0.3.13` and `v0.3.14`, and identically non-zero (2/3/3) at both
+      `v0.3.15` and `v0.3.16` -- agreeing with the pickaxe result and
+      showing no disagreement to fall back on.
+    - `git log --oneline v0.3.14..v0.3.16` lists both #165 commits
+      (`da0bdbb`, `8602e84`) and the #166 commit (`7cd28fa`, "fix: prune
+      stale ports and heal primary backing label on listing (#166)") --
+      `git tag --contains 7cd28fae74d2b... --sort=v:refname` also names
+      `v0.3.15` first, so T166 = v0.3.15 too.
 
     This is a documentation-accuracy requirement, not a wrapper-code
     change: `environment_stop` is a thin pass-through
@@ -3174,7 +3207,13 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
     a legitimate, unrelated "since engine v0.3.14 ... upstream ticket
     #157" claim (a different behaviour change, out of this ticket's range)
     that a blanket search would misfire on regardless of whether the #165
-    attribution itself is correct.
+    attribution itself is correct. The v0.3.14-absence check (added this
+    round to close test-critic finding tautology::F2 -- the prior round
+    only ever ruled out v0.3.16, never v0.3.14, among the candidate wrong
+    tags) is window-scoped to the neighbourhood of a "since engine
+    v0.3.14"/"pre-v0.3.14 engine" match for exactly this reason: it must
+    tell "v0.3.14 wrongly attributed to #165" apart from "v0.3.14 correctly
+    attributed to #157", which a blanket `not in norm` cannot do.
 
     RED (pre-fix, current WIP text): the docstring's "no_process_recorded"
     section claimed `status` is only ever left unchanged or becomes
@@ -3226,6 +3265,30 @@ def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
         "the #165 no-op-path comparison must not still say 'pre-v0.3.16 "
         "engine' -- the behaviour changed a release earlier, at v0.3.15"
     )
+
+    # test-critic round 2, finding tautology::F2: the checks above only
+    # ever ruled out v0.3.16 among the candidate wrong tags -- v0.3.14 (the
+    # previously-pinned tag, which predates #165) was never checked at all.
+    # A blanket `"since engine v0.3.14" not in norm` would misfire on the
+    # legitimate, differently-ticketed #157 claim this same docstring
+    # carries elsewhere, so these are scoped to the neighbourhood of each
+    # match instead, checking specifically that it is not attributed to
+    # ticket #165.
+    for m in re.finditer(r"since engine v0\.3\.14\b", norm):
+        window = norm[max(0, m.start() - 120) : m.start() + 200]
+        assert "165" not in window, (
+            "found a 'since engine v0.3.14' claim in the neighbourhood of "
+            "ticket #165 -- v0.3.14 predates the #165 fix (verified via "
+            "git log -S/git tag --contains, see docstring above) and must "
+            "never be named as its introducing release"
+        )
+    for m in re.finditer(r"pre-v0\.3\.14 engine\b", norm):
+        window = norm[max(0, m.start() - 120) : m.start() + 200]
+        assert "165" not in window, (
+            "found a 'pre-v0.3.14 engine' comparison in the neighbourhood "
+            "of ticket #165 -- the #165 behaviour change is at v0.3.15, "
+            "not v0.3.14"
+        )
 
     no_op_idx = norm.find("no_process_recorded")
     assert no_op_idx != -1
