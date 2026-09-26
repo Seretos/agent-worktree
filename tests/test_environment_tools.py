@@ -1366,6 +1366,9 @@ def test_environment_start_contract_variant_and_env_injection_unchanged(
             "    run: start-web.sh\n"
             "  - name: worker\n"
             "    run: start-worker.sh\n"
+            "ports:\n"
+            "  - name: web\n"
+            "  - name: db\n"
         ),
     )
 
@@ -1656,7 +1659,7 @@ def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine
     ``shadowed_contract`` bullet tail, lines ~1799-1803) currently claims
     "the engine may additionally set ``shadowed_contract``" for the
     #124/contract_misplaced repro. This test runs the REAL, unmocked
-    ``WorktreeManager.start()`` against the pinned v0.3.14 engine to observe
+    ``WorktreeManager.start()`` against the pinned v0.3.16 engine to observe
     what it actually returns, under both readings of "misplaced": the
     repo_root contract existed and was removed (True), and it never existed
     at all (False).
@@ -1678,7 +1681,7 @@ def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine
     rewrite this measurement grounds (worktree.py CAUTION and bullet tail).
     A future engine bump that changes this behaviour fails here.
     """
-    assert version("lib-python-worktree") == "0.3.14"
+    assert version("lib-python-worktree") == "0.3.16"
 
     if root_contract_removed:
         _write_contract(
@@ -1901,7 +1904,8 @@ def test_environment_start_surfaces_injected_env(tmp_path: Path):
     repo_root.mkdir()
     _write_contract(
         repo_root,
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: app\n  - name: db\n",
     )
 
     worktree_id = "wt-injected-env-12345678"
@@ -1986,7 +1990,8 @@ def test_environment_start_injected_env_ports_are_sorted(tmp_path: Path):
     repo_root.mkdir()
     _write_contract(
         repo_root,
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: zeta\n  - name: alpha\n",
     )
 
     worktree_id = "wt-sorted-12345678"
@@ -3118,6 +3123,276 @@ def test_environment_stop_docstring_scopes_not_running_reachability(tmp_path: Pa
     )
 
 
+def test_environment_stop_docstring_documents_no_op_orphan_sweep_since_v0_3_15(
+    tmp_path: Path,
+):
+    """Named consistency guard (NOT driving-test proof, for either half --
+    see below) for both the *content* half and the *tag-attribution* half
+    of this requirement.
+
+    Content half (test-critic round 3 finding tautology::F3, #208 -- NOT
+    driving-test evidence, demoted from round 3's framing): upstream ticket
+    #165 changed real, caller-visible behaviour on the tracked-but-never-
+    started ("no_process_recorded") no-op path documented just above this
+    test in the source -- that path used to be a pure early return, and is
+    now also subject to the same path-scoped orphan sweep `kill_orphans`
+    triggers elsewhere, meaning `status` can newly become
+    "stop_incomplete", `killed_pids` can newly be non-empty, and
+    `stop_attempt.kill_orphans_may_help` can newly be `True`, all on a role
+    that was simply never started (or whose tracked pid had already
+    exited). A concurrent `environment_start` racing that sweep is also a
+    new, separately-reported case (`stop_detail.reason ==
+    "concurrent_start_race"`). Round 3 tightened the presence checks on
+    `no_op_window` and `concurrent_start_race`/`protect:incomplete` below
+    from bare keyword-presence to phrase-anchored regexes, closing finding
+    tautology::F1 (a docstring naming every token while describing the
+    OPPOSITE relationship used to pass). Round 3's isolated test-critic
+    found that phrase-anchoring is still not proof: a cleverly-placed
+    negation just outside the matched span (e.g. "never becomes
+    stop_incomplete when the sweep could not verify every other tracked
+    role" would still satisfy `r"stop_incomplete.{0,15}when the sweep
+    could not verify"`) asserts the opposite of what the phrase anchor
+    intends, and no test that only inspects docstring text can rule that
+    out. So, like the tag-attribution half below, these assertions are a
+    **named consistency guard**: a meaningfully stronger regression guard
+    than the bare keyword check it replaced (round 3), but still text-vs-
+    text -- they prove the docstring's own wording is coherent and
+    resistant to trivial keyword gaming, never that the *engine* actually
+    behaves the way the docstring claims.
+
+    Tag-attribution half (test-critic round 2 findings tautology::F1/F2,
+    #208 -- NOT driving-test evidence): every assertion below that checks
+    for "v0.3.15" / rules out "v0.3.16" or "v0.3.14" is a **named
+    consistency guard**, exactly like R2's
+    `test_dependency_pyproject_pin_string_pinned` in `test_dependency_pin.py`
+    -- it only proves the docstring's *own* text is internally consistent
+    (names the tag this PR decided on, and no other candidate tag), never
+    that v0.3.15 is *actually* the release that introduced ticket #165's
+    behaviour. A hardcoded "v0.3.15" string here has no independent way to
+    verify that claim; a docstring that wrongly said "v0.3.14" everywhere,
+    consistently, would pass a same-shaped test just as easily.
+
+    The REAL proof for BOTH halves now lives outside this test, never
+    encoded as a pytest assertion.
+
+    For the content half: the developer's own source-code cross-reference,
+    done during the implement phase when the actual docstring is
+    written/fixed -- each no-op-path sentence checked against the real
+    behaviour in the installed engine's source (`.venv`'s
+    `lib_python_worktree` package, `core/manager.py`/
+    `core/process_lifecycle.py`: `_detect_concurrent_start_race`, the
+    no-op-path `_sweep_untracked_orphans` call site, and the
+    `protect:incomplete`/`concurrent_start_race` markers), with
+    which-sentence-maps-to-which-code-line pasted into the PR body's R4/R5
+    evidence section alongside the tag-attribution evidence below.
+
+    For the tag-attribution half: substitute-execution evidence -- real
+    `git log -S`/`git tag --contains` output against the real upstream
+    `lib-python-worktree` history -- pasted verbatim into the PR body's
+    R4/R5 evidence section (there is no way to re-derive real upstream git
+    history inside a driving test without a network call at test time,
+    which this suite does not do anywhere else). That investigation was
+    re-run for this round, against a fresh clone of
+    https://github.com/seretos-agents/lib-python-worktree, and both
+    independent anchors still agree:
+
+    - A165a (`_detect_concurrent_start_race`, `process_lifecycle.py`):
+      `git log -S"_detect_concurrent_start_race" --reverse --format=%H --
+      src/lib_python_worktree` finds it first introduced by commit
+      `8602e84d13a38308cbaaceb6c1452a4eb6ebeb22` ("fix: bound protected-pid
+      computation and detect concurrent start races (#165)");
+      `git tag --contains 8602e84d1... --sort=v:refname` names `v0.3.15`
+      first (then `v0.3.16`).
+    - A165b (`_sweep_untracked_orphans`'s call site in `manager.py`'s no-op
+      path): `git log -S"_sweep_untracked_orphans" --reverse --format=%H --
+      src/lib_python_worktree/core/manager.py` finds it first introduced by
+      commit `da0bdbb93ae97dd8d1902566794aec2ccbf0d26d` ("fix: reach orphan
+      scan for stop() calls with no live tracked pid (#165)"); also first
+      tagged in `v0.3.15`.
+    - T165 is the later of A165a and A165b, both `v0.3.15` -- so T165 =
+      v0.3.15. Corroboration: `git grep -c "_detect_concurrent_start_race"`
+      / `git grep -c "_sweep_untracked_orphans"` / `git grep -c
+      "Ticket #165"` (each `-- src/lib_python_worktree`) are all 0 at
+      `v0.3.13` and `v0.3.14`, and identically non-zero (2/3/3) at both
+      `v0.3.15` and `v0.3.16` -- agreeing with the pickaxe result and
+      showing no disagreement to fall back on.
+    - `git log --oneline v0.3.14..v0.3.16` lists both #165 commits
+      (`da0bdbb`, `8602e84`) and the #166 commit (`7cd28fa`, "fix: prune
+      stale ports and heal primary backing label on listing (#166)") --
+      `git tag --contains 7cd28fae74d2b... --sort=v:refname` also names
+      `v0.3.15` first, so T166 = v0.3.15 too.
+
+    This is a documentation-accuracy requirement, not a wrapper-code
+    change: `environment_stop` is a thin pass-through
+    (`_record_to_dict(record)`) that never branches on these fields
+    itself, so the only artifact that can go stale is the docstring MCP
+    callers read as this tool's contract -- exactly the kind of claim this
+    repo's own docstring-content tests (e.g.
+    test_environment_stop_docstring_scopes_not_running_reachability, just
+    above) are written to pin.
+
+    Tag-attribution assertions below are deliberately scoped to text tied
+    to "ticket #165" (or the "pre-vX engine" comparison phrase, which this
+    docstring only ever uses for #165) rather than a blanket doc-wide
+    search for "since engine v0.3.14" -- this same docstring also carries
+    a legitimate, unrelated "since engine v0.3.14 ... upstream ticket
+    #157" claim (a different behaviour change, out of this ticket's range)
+    that a blanket search would misfire on regardless of whether the #165
+    attribution itself is correct. The v0.3.14-absence check (added this
+    round to close test-critic finding tautology::F2 -- the prior round
+    only ever ruled out v0.3.16, never v0.3.14, among the candidate wrong
+    tags) is window-scoped to the neighbourhood of a "since engine
+    v0.3.14"/"pre-v0.3.14 engine" match for exactly this reason: it must
+    tell "v0.3.14 wrongly attributed to #165" apart from "v0.3.14 correctly
+    attributed to #157", which a blanket `not in norm` cannot do.
+
+    RED (pre-fix, current WIP text): the docstring's "no_process_recorded"
+    section claimed `status` is only ever left unchanged or becomes
+    "stopped" on this no-op path (never "stop_incomplete"), said nothing
+    about `killed_pids`/`kill_orphans_may_help` there, and never mentioned
+    ticket #165, "concurrent_start_race", or "protect:incomplete" at all.
+    Separately -- and still RED even now that the WIP has added that
+    content -- every "since engine"/"pre-" claim tied to ticket #165 in the
+    WIP text names v0.3.16, not the verified v0.3.15.
+    """
+    mgr, fns, tools = _make_tool_fixtures(tmp_path)
+    doc = fns["environment_stop"].__doc__ or ""
+    norm = re.sub(r"\s+", " ", doc.replace("``", "").replace("**", "")).lower()
+
+    assert "165" in norm and "v0.3.15" in norm, (
+        "environment_stop docstring must cite ticket #165 and the "
+        "verified-introducing v0.3.15 engine release for the no-op-path "
+        "orphan sweep behaviour"
+    )
+
+    since_165_tags = re.findall(
+        r"since engine (v0\.3\.\d+)[^.]{0,60}ticket #165", norm
+    )
+    assert since_165_tags, (
+        "expected at least one 'since engine vX ... ticket #165' claim"
+    )
+    assert all(tag == "v0.3.15" for tag in since_165_tags), (
+        f"#165 'since engine' attribution(s) {since_165_tags} must all "
+        "name v0.3.15, the verified introducing release -- not v0.3.16 "
+        "(the newly-pinned tag, which merely still contains the fix) nor "
+        "v0.3.14 (the previously-pinned tag, which predates it)"
+    )
+
+    pre_engine_tags = re.findall(r"pre-(v0\.3\.\d+) engine", norm)
+    assert pre_engine_tags, (
+        "expected a 'pre-vX engine' comparison for the #165 no-op-path "
+        "change"
+    )
+    assert all(tag == "v0.3.15" for tag in pre_engine_tags), (
+        f"#165 'pre-vX engine' comparison(s) {pre_engine_tags} must all "
+        "name v0.3.15"
+    )
+
+    assert "since engine v0.3.16" not in norm, (
+        "the #165 attribution must not still name v0.3.16 -- it merely "
+        "still contains the fix, it did not introduce it"
+    )
+    assert "pre-v0.3.16 engine" not in norm, (
+        "the #165 no-op-path comparison must not still say 'pre-v0.3.16 "
+        "engine' -- the behaviour changed a release earlier, at v0.3.15"
+    )
+
+    # test-critic round 2, finding tautology::F2: the checks above only
+    # ever ruled out v0.3.16 among the candidate wrong tags -- v0.3.14 (the
+    # previously-pinned tag, which predates #165) was never checked at all.
+    # A blanket `"since engine v0.3.14" not in norm` would misfire on the
+    # legitimate, differently-ticketed #157 claim this same docstring
+    # carries elsewhere, so these are scoped to the neighbourhood of each
+    # match instead, checking specifically that it is not attributed to
+    # ticket #165.
+    for m in re.finditer(r"since engine v0\.3\.14\b", norm):
+        window = norm[max(0, m.start() - 120) : m.start() + 200]
+        assert "165" not in window, (
+            "found a 'since engine v0.3.14' claim in the neighbourhood of "
+            "ticket #165 -- v0.3.14 predates the #165 fix (verified via "
+            "git log -S/git tag --contains, see docstring above) and must "
+            "never be named as its introducing release"
+        )
+    for m in re.finditer(r"pre-v0\.3\.14 engine\b", norm):
+        window = norm[max(0, m.start() - 120) : m.start() + 200]
+        assert "165" not in window, (
+            "found a 'pre-v0.3.14 engine' comparison in the neighbourhood "
+            "of ticket #165 -- the #165 behaviour change is at v0.3.15, "
+            "not v0.3.14"
+        )
+
+    no_op_idx = norm.find("no_process_recorded")
+    assert no_op_idx != -1
+    no_op_window = norm[no_op_idx : no_op_idx + 2500]
+
+    # test-critic round 3, finding tautology::F1: a bare `"<token>" in
+    # no_op_window`/`in norm` check is satisfied by mere keyword
+    # co-presence -- a docstring that named all five tokens while
+    # describing the OPPOSITE relationship (e.g. "status can never become
+    # stop_incomplete on this path", "killed_pids remains always empty")
+    # would pass every one of those checks just as easily. Each check
+    # below instead requires a distinctive multi-word phrase tying the
+    # token to the actual affirmative relationship the real docstring
+    # states, so a same-vocabulary-but-opposite-meaning rewrite fails it.
+    #
+    # NAMED CONSISTENCY GUARD, NOT DRIVING-TEST PROOF (test-critic round 3,
+    # finding tautology::F3): phrase-anchoring closes the F1 gaming vector
+    # above but does not close every gaming vector -- a negation placed just
+    # outside the matched span (e.g. "never becomes stop_incomplete when
+    # the sweep could not verify every other tracked role") still satisfies
+    # the same regex while asserting the opposite meaning. No test that
+    # only inspects docstring text can rule that out, so these assertions
+    # -- like the tag-attribution ones above -- prove only that the
+    # docstring's own wording is internally coherent and resistant to bare
+    # keyword gaming, never that the engine actually behaves this way. The
+    # real proof is the developer's source-code cross-reference against
+    # `.venv`'s `lib_python_worktree` package, pasted into the PR body's
+    # R4/R5 evidence section (see the docstring above).
+    assert re.search(
+        r"stop_incomplete.{0,15}when the sweep could not verify", no_op_window
+    ), (
+        "the no_process_recorded no-op path's documentation must say "
+        "status freshly BECOMES stop_incomplete when the sweep could not "
+        "verify every other tracked role (ticket #165) -- not just "
+        "mention the word 'stop_incomplete' somewhere nearby"
+    )
+    assert re.search(
+        r"killed_pids.{0,20}no longer unconditionally.{0,10}\[\]"
+        r".{0,120}populated when kill_orphans=true",
+        no_op_window,
+    ), (
+        "the no-op path's documentation must say killed_pids is no "
+        "longer unconditionally empty there AND explain it becomes "
+        "populated when kill_orphans=true and the sweep finds an orphan "
+        "-- not just mention the word 'killed_pids' somewhere nearby"
+    )
+    assert re.search(
+        r"kill_orphans_may_help.{0,40}instead of an unconditional false"
+        r".{0,80}true when kill_orphans=false",
+        no_op_window,
+    ), (
+        "the no-op path's documentation must say kill_orphans_may_help "
+        "reflects the sweep's hint INSTEAD OF an unconditional False, "
+        "becoming True when kill_orphans=False and a live orphan was "
+        "found -- not just mention the word 'kill_orphans_may_help' "
+        "somewhere nearby"
+    )
+    assert re.search(
+        r"detected and reported as.{0,40}concurrent_start_race", norm
+    ), (
+        "environment_stop docstring must say a racing environment_start "
+        "is DETECTED AND REPORTED AS stop_detail.reason == "
+        "'concurrent_start_race' (ticket #165) -- not just mention the "
+        "phrase 'concurrent_start_race' somewhere"
+    )
+    assert re.search(r"could not verify.{0,150}protect:incomplete", norm), (
+        "environment_stop docstring must tie protect:incomplete to the "
+        "sweep being unable to verify every other tracked role before "
+        "scanning (ticket #165) -- not just mention the phrase "
+        "'protect:incomplete' somewhere"
+    )
+
+
 def test_environment_start_docstring_consolidates_three_addressing_outcomes(
     tmp_path: Path,
 ):
@@ -3167,7 +3442,7 @@ def test_environment_start_docstring_documents_start_log_path_role_casing(
         idx = m.start()
         window = norm[max(0, idx - 100) : idx + 900]
         if (
-            "seretos/lib-python-worktree#111" in window
+            "seretos-agents/lib-python-worktree#111" in window
             and ("lower" in window or "slug" in window)
             and "preserv" in window
             and "pids" in window

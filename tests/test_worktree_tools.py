@@ -2009,7 +2009,8 @@ def test_tool_environment_start_env_vars_reach_child(tmp_path: Path):
     repo_root.mkdir()
     _write_contract(
         repo_root,
-        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n",
+        "version: 1\nisolation: partial\nstart:\n  - run: start.sh\n"
+        "ports:\n  - name: web\n  - name: db\n",
     )
 
     worktree_id = "wt-env-test-12345678"
