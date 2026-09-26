@@ -1678,7 +1678,7 @@ def test_environment_start_misplaced_contract_shadowed_contract_on_pinned_engine
     rewrite this measurement grounds (worktree.py CAUTION and bullet tail).
     A future engine bump that changes this behaviour fails here.
     """
-    assert version("lib-python-worktree") == "0.3.14"
+    assert version("lib-python-worktree") == "0.3.16"
 
     if root_contract_removed:
         _write_contract(

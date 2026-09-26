@@ -8,8 +8,8 @@ from worktree_plugin.config import load_plugin_config
 
 # Pinned git-URL dependencies: distribution name -> expected version.
 PINS = {
-    "lib-python-worktree": "0.3.14",
-    "lib-python-config": "0.1.3",
+    "lib-python-worktree": "0.3.16",
+    "lib-python-config": "0.1.4",
 }
 
 
@@ -30,16 +30,23 @@ def test_dependency_pinned(name):
         pyproject = tomllib.load(f)
     deps = pyproject["project"]["dependencies"]
     pin = next(dep for dep in deps if dep.startswith(name))
-    assert pin.endswith(f"@v{expected}"), (
+    # Full-string match (not just an `@v{expected}` suffix check): a suffix-only
+    # check would pass even if the org/repo URL portion were wrong (e.g. a typo'd
+    # org name), as long as the version tag happened to match. Pinning the whole
+    # string catches a URL mismatch too (plan-critic round 1 note, #208).
+    expected_pin = (
+        f"{name} @ git+https://github.com/seretos-agents/{name}@v{expected}"
+    )
+    assert pin == expected_pin, (
         f"expected pyproject.toml's {name} dependency entry to "
-        f"end in '@v{expected}', got {pin!r}"
+        f"equal {expected_pin!r}, got {pin!r}"
     )
 
 
 def test_load_plugin_config_env_override_unpatched_on_pinned_config_lib(
     tmp_path, monkeypatch
 ):
-    """Installed lib-python-config is v0.1.3 AND parses WORKTREE_CONFIG, unpatched."""
+    """Installed lib-python-config is v0.1.4 AND parses WORKTREE_CONFIG, unpatched."""
     assert version("lib-python-config") == PINS["lib-python-config"]
 
     cfg_file = tmp_path / "elsewhere" / "custom.yml"
@@ -54,7 +61,7 @@ def test_load_plugin_config_env_override_unpatched_on_pinned_config_lib(
 def test_load_plugin_config_discovers_seretos_worktree_yml_unpatched(
     tmp_path, monkeypatch
 ):
-    """Installed lib-python-config is v0.1.3 AND discovers .seretos/worktree.yml
+    """Installed lib-python-config is v0.1.4 AND discovers .seretos/worktree.yml
     from a working directory (no env override), unpatched."""
     assert version("lib-python-config") == PINS["lib-python-config"]
 
